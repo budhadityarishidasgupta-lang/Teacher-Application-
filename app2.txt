@@ -177,7 +177,7 @@ def mastered_count(user_id, lesson_id):
     with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
         cur.execute(
             f"SELECT COUNT(*) FROM word_stats WHERE user_id=? AND mastered=1 AND headword IN ({qmarks})",
-            (user_id, *words)
+            (user_id, *words)   # <-- use the function argument here
         )
         (m,) = cur.fetchone()
 
@@ -221,74 +221,15 @@ def recent_stats(user_id, course_id, lesson_id, n=10):
             "avg_ms": float(np.mean([r[1] for r in rows]))}
 
 def choose_next_word(user_id, course_id, lesson_id, df_words):
-    """Adaptive next word selector (targets difficulty 1/2/3 based on recent accuracy & speed)."""
     stats = recent_stats(user_id, course_id, lesson_id, n=10)
     acc, avg = stats["accuracy"], stats["avg_ms"]
-    if acc >= 0.75 and avg <= 8000:
-        tgt = 3
-    elif acc <= 0.5 or avg >= 12000:
-        tgt = 1
-    else:
-        tgt = 2
-    candidates = df_words[df_words["difficulty"] == tgt]["headword"].tolist() or df_words["headword"].tolist()
+    if acc >= 0.75 and avg <= 8000: tgt = 3
+    elif acc <= 0.5 or avg >= 12000: tgt = 1
+    else: tgt = 2
+    candidates = df_words[df_words["difficulty"]==tgt]["headword"].tolist() or df_words["headword"].tolist()
     hist = st.session_state.get("asked_history", [])
     pool = [w for w in candidates if w not in hist[-3:]] or candidates
     return random.choice(pool)
-
-# ── Enhancements helpers ─────────────────────────────────────────────
-def course_progress(user_id: int, course_id: int):
-    """Return (completed, total, percent) for a course for this user."""
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute("""
-            SELECT w.headword
-            FROM lessons L
-            JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE L.course_id=?
-        """, (course_id,))
-        all_words = [r[0] for r in cur.fetchall()]
-    total = len(set(all_words))
-    if total == 0:
-        return (0, 0, 0)
-
-    qmarks = ",".join("?" for _ in set(all_words))
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            f"SELECT COUNT(*) FROM word_stats WHERE user_id=? AND mastered=1 AND headword IN ({qmarks})",
-            (user_id, *list(set(all_words)))
-        )
-        (completed,) = cur.fetchone()
-    percent = int(round(100 * completed / total))
-    return (completed, total, percent)
-
-def build_question_payload(headword: str, synonyms_str: str):
-    """
-    Build a stable 6-option question:
-      - 2 correct (first two synonyms if available; fall back to 1+variant)
-      - 4 distractors from a small pool (MVP)
-    Returns: dict with keys: headword, choices (list), correct (set)
-    """
-    syn_list = [s.strip() for s in str(synonyms_str).split(",") if s.strip()]
-    correct = syn_list[:2] if len(syn_list) >= 2 else syn_list[:1]
-    if len(correct) == 1:
-        correct = [correct[0], f"{correct[0]} (close)"]
-
-    distractor_pool = [
-        "banana","pencil","soccer","window","pizza","rainbow","kitten","tractor","marble","backpack",
-        "ladder","ocean","camera","blanket","sandwich","rocket","helmet","garden","notebook","button"
-    ]
-    pool = [d for d in distractor_pool if d.lower() not in {c.lower() for c in correct}]
-    rnd = random.Random(hash(headword) % (2**32))  # stable per word
-    distractors = []
-    while len(distractors) < 4 and pool:
-        cand = rnd.choice(pool)
-        pool.remove(cand)
-        if cand not in distractors:
-            distractors.append(cand)
-
-    choices = correct + distractors
-    rnd.shuffle(choices)  # shuffled once; stored in session so it doesn't change
-    return {"headword": headword, "choices": choices, "correct": set(correct)}
 
 def gpt_explain(headword, choices, correct_choice, user_choice):
     if not gpt_client:
@@ -495,28 +436,13 @@ if ROLE == "student":
             SELECT C.course_id, C.title
             FROM enrollments E JOIN courses C ON C.course_id=E.course_id
             WHERE E.user_id=?""", conn, params=(USER_ID,))
-
-    # Sidebar: My courses + completion %
-    with st.sidebar:
-        st.subheader("My courses")
-        if courses.empty:
-            st.info("No courses assigned yet.")
-        else:
-            labels = []
-            id_by_label = {}
-            for _, rowc in courses.iterrows():
-                c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
-                label = f"{rowc['title']} — {c_pct}%"
-                labels.append(label)
-                id_by_label[label] = int(rowc["course_id"])
-
-            selected_label = st.radio("Courses", labels, index=0, key="student_course_radio")
-            cid = id_by_label[selected_label]
-
     if courses.empty:
+        st.info("No courses assigned yet.")
         st.stop()
 
-    # Lessons for selected course
+    c_map = dict(zip(courses["course_id"], courses["title"]))
+    cid = st.selectbox("Course", list(c_map.keys()), format_func=lambda x: c_map[x], key="student_course_select")
+
     with closing(sqlite3.connect(DB_PATH)) as conn:
         lessons = pd.read_sql_query("SELECT lesson_id,title FROM lessons WHERE course_id=? ORDER BY sort_order", conn, params=(cid,))
     if lessons.empty:
@@ -533,109 +459,52 @@ if ROLE == "student":
         st.stop()
 
     # Progress header
-    if "asked_history" not in st.session_state:
-        st.session_state.asked_history = []
-    m, total = mastered_count(USER_ID, lid)
+    if "asked_history" not in st.session_state: st.session_state.asked_history=[]
+    m,total = mastered_count(USER_ID, lid)
     st.progress(min(m/max(total,1),1.0), text=f"Mastered {m}/{total} words")
 
-    # --- Active question state (stable across reruns) ---
-    if "active_word" not in st.session_state or st.session_state.get("active_lid") != lid:
-        st.session_state.active_lid = lid
+    # Active question
+    if "active_word" not in st.session_state:
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.q_started_at = time.time()
-        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-        st.session_state.selection = set()
 
     active = st.session_state.active_word
-    row = words_df[words_df["headword"] == active].iloc[0]
-    qdata = st.session_state.qdata
-    choices = qdata["choices"]
-    correct_set = qdata["correct"]
+    row = words_df[words_df["headword"]==active].iloc[0]
+    syn_list = [s.strip() for s in str(row["synonyms"]).split(",") if s.strip()]
+    correct = syn_list[0] if syn_list else ""
+    distractor_pool = ["banana","pencil","soccer","window","pizza","rainbow","kitten","tractor","marble","backpack"]
+    distractors = random.sample(distractor_pool, 2)
+    choices = [correct]+distractors
+    random.shuffle(choices)
 
     st.subheader(f"Word: **{active}**")
-    st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
-
-    # 3×2 grid of checkboxes (stable keys per word)
-    if "grid_keys" not in st.session_state or st.session_state.get("grid_for_word") != active:
-        st.session_state.grid_for_word = active
-        st.session_state.grid_keys = [f"opt_{active}_{i}" for i in range(len(choices))]
-    keys = st.session_state.grid_keys
-
-    row1 = st.columns(3)
-    row2 = st.columns(3)
-    grid_rows = [row1, row2]
-
-    for i, opt in enumerate(choices):
-        col = grid_rows[0][i] if i < 3 else grid_rows[1][i-3]
-        with col:
-            checked = opt in st.session_state.selection
-            new_val = st.checkbox(opt, value=checked, key=keys[i])
-        if new_val:
-            st.session_state.selection.add(opt)
-        else:
-            st.session_state.selection.discard(opt)
-
-       # Buttons: Submit + Next (side-by-side)
-    col_submit, col_next = st.columns([1, 1])
-    with col_submit:
-        submit = st.button("Submit", type="primary", key="student_submit_btn")
-    with col_next:
-        nextq = st.button("Next ▶", key="student_next_btn")
-
-    picked = list(st.session_state.selection)
-
-    if submit:
-        # Allow any number of picks
+    st.write("Pick the **synonym** (a word with a similar meaning).")
+    picked = st.radio("Your answer:", options=choices, index=None, key=f"pick_{active}")
+    if st.button("Submit", type="primary", key="student_submit_btn"):
         elapsed_ms = (time.time()-st.session_state.q_started_at)*1000
-        picked_set = set(picked)
-        is_correct = (picked_set == correct_set)
+        is_correct = (picked == correct)
+        update_after_attempt(USER_ID, cid, lid, active, is_correct, elapsed_ms, int(row["difficulty"]), picked, correct)
 
-        # Log attempt (store one correct choice for compatibility)
-        correct_choice_for_log = list(correct_set)[0]
-        update_after_attempt(
-            USER_ID, cid, lid, active,
-            is_correct, elapsed_ms, int(row["difficulty"]),
-            ", ".join(picked), correct_choice_for_log
-        )
+        with st.expander("Why is this the best choice?", expanded=True):
+            st.write(gpt_explain(active, choices, correct, picked))
 
-        # Reveal the correct answers
-        st.success("Correct! 🎉" if is_correct else "Nice try — check the correct answers below.")
-        with st.expander("Why are these the best choices?", expanded=True):
-            lines = []
-            for opt in choices:
-                if opt in correct_set and opt in picked_set:
-                    tag = "✅ correct (you picked)"
-                elif opt in correct_set:
-                    tag = "✅ correct"
-                elif opt in picked_set:
-                    tag = "❌ your pick"
-                else:
-                    tag = ""
-                lines.append(f"- **{opt}** {tag}")
-            st.markdown("\n".join(lines))
-            st.caption("Tip: pick all the options that mean almost the same as the main word.")
-
-        # Move to next question
         st.session_state.asked_history.append(active)
-        next_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.active_word = next_word
+        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.q_started_at = time.time()
-        next_row = words_df[words_df["headword"] == next_word].iloc[0]
-        st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-        st.session_state.selection = set()
-        st.session_state.grid_for_word = next_word
-        st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
 
-    elif nextq:
-        # Skip scoring; just load the next question fresh
-        st.session_state.asked_history.append(active)
-        next_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.active_word = next_word
-        st.session_state.q_started_at = time.time()
-        next_row = words_df[words_df["headword"] == next_word].iloc[0]
-        st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-        st.session_state.selection = set()
-        st.session_state.grid_for_word = next_word
-        st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
-
+    # Today’s review list
+    st.markdown("### Today’s Review")
+    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
+        cur.execute("SELECT headword,due_date,mastered FROM word_stats WHERE user_id=?", (USER_ID,))
+        rows = cur.fetchall()
+    due_words, now = [], datetime.utcnow()
+    for head, due, mastered in rows:
+        if mastered==1: continue
+        try:
+            if due is None: due_words.append(head)
+            else:
+                dt = datetime.strptime(due, "%Y-%m-%d %H:%M:%S")
+                if dt <= now: due_words.append(head)
+        except:
+            due_words.append(head)
+    st.write(", ".join(sorted(set(due_words))[:20]) or "You're all caught up today. 🎉")
