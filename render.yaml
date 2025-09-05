@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: teacher-application
+    env: python
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: ENABLE_GPT
+        value: "0"
+      - key: ADMIN_EMAIL
+        value: admin@example.com
+      - key: ADMIN_NAME
+        value: Admin
+      - key: ADMIN_PASSWORD
+        value: ChangeMe!123
+      - key: DB_PATH
+        value: /data/synquest.db
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
