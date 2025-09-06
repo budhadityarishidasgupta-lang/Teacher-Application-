@@ -4,3 +4,5 @@ numpy>=1.26.0
 python-dotenv>=1.0.1
 openai>=1.40.0
 passlib[bcrypt]>=1.7.4
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.32
