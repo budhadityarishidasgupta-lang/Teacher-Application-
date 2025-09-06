@@ -9,6 +9,20 @@ import streamlit as st
 from dotenv import load_dotenv
 from passlib.hash import bcrypt
 
+import os
+from sqlalchemy import create_engine, text
+import streamlit as st
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)
+
+# Create tables on startup (safe no-op if they already exist)
+try:
+    from init_db import init as init_db
+    init_db()
+except Exception as e:
+    st.sidebar.warning(f"DB init warning: {e}")
+
 # ── Config ───────────────────────────────────────────────────────────
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "synquest.db"
@@ -638,4 +652,5 @@ if ROLE == "student":
         st.session_state.selection = set()
         st.session_state.grid_for_word = next_word
         st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+
 
