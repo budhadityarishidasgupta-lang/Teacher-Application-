@@ -653,4 +653,13 @@ if ROLE == "student":
         st.session_state.grid_for_word = next_word
         st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
 
+# --- Health check (put here or at the very end) ---
+st.sidebar.header("Health")
+if st.sidebar.button("DB ping"):
+    try:
+        with engine.connect() as conn:
+            one = conn.execute(text("SELECT 1")).scalar()
+        st.sidebar.success(f"DB OK (result={one})")
+    except Exception as e:
+        st.sidebar.error(f"DB error: {e}")
 
