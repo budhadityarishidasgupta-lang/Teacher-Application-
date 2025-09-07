@@ -13,7 +13,38 @@ import os
 from sqlalchemy import create_engine, text
 import streamlit as st
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# --- Student-only mode (env or URL param) ---
+FORCE_STUDENT = os.getenv("FORCE_STUDENT_MODE", "0") == "1"
+try:
+    qp = st.query_params  # Streamlit ≥1.30
+except Exception:
+    qp = st.experimental_get_query_params()  # fallback for older versions
+
+def _first(qv):
+    if qv is None: return None
+    if isinstance(qv, list): return qv[0]
+    return qv
+
+_mode = (_first(qp.get("mode")) or "").strip().lower()
+if _mode == "student":
+    FORCE_STUDENT = True
+elif _mode == "admin":
+    FORCE_STUDENT = False
+
+# --- Normalize & validate DATABASE_URL (no other DB changes) ---
+_raw = os.environ.get("DATABASE_URL", "").strip()
+if not _raw:
+    st.error("DATABASE_URL is not set. In Render → Settings → Environment, add DATABASE_URL using your Postgres Internal Connection String.")
+    st.stop()
+
+def _normalize(url: str) -> str:
+    # Keep it minimal: fix deprecated scheme only
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+DATABASE_URL = _normalize(_raw)
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
 # Create tables on startup (safe no-op if they already exist)
@@ -331,24 +362,47 @@ ensure_admin()
 # ── Auth ─────────────────────────────────────────────────────────────
 def login_form():
     st.sidebar.subheader("Sign in")
-    mode = st.sidebar.radio("Login as", ["Admin","Student"], horizontal=True, key="login_mode")
+
+    # Force student UI when requested
+    if FORCE_STUDENT:
+        mode = "Student"
+    else:
+        mode = st.sidebar.radio("Login as", ["Admin","Student"], horizontal=True, key="login_mode")
+
     email = st.sidebar.text_input("Email", key="login_email")
     pwd   = st.sidebar.text_input("Password", type="password", key="login_pwd")
+
     if st.sidebar.button("Login", type="primary", key="btn_login"):
         u = user_by_email(email.strip().lower())
         if not u:
             st.sidebar.error("User not found.")
-        elif not u["is_active"]:
+            return
+        if not u["is_active"]:
             st.sidebar.error("Account disabled.")
-        elif not bcrypt.verify(pwd, u["password_hash"]):
+            return
+        if not bcrypt.verify(pwd, u["password_hash"]):
             st.sidebar.error("Wrong password.")
-        elif mode=="Admin" and u["role"]!="admin":
+            return
+
+        # Enforce role rules (student-only link cannot admit admins)
+        if mode == "Admin" and u["role"] != "admin":
             st.sidebar.error("Not an admin account.")
-        elif mode=="Student" and u["role"]!="student":
+            return
+        if mode == "Student" and u["role"] != "student":
+            if FORCE_STUDENT:
+                st.sidebar.error("This is a student-only link. Please use the admin URL.")
+                return
             st.sidebar.error("Not a student account.")
-        else:
-            st.session_state.auth = {"user_id":u["user_id"],"name":u["name"],"email":u["email"],"role":u["role"]}
-            st.sidebar.success(f"Welcome {u['name']}!")
+            return
+
+        st.session_state.auth = {
+            "user_id": u["user_id"],
+            "name": u["name"],
+            "email": u["email"],
+            "role": u["role"]
+        }
+        st.sidebar.success(f"Welcome {u['name']}!")
+
     if st.sidebar.button("Log out", key="btn_logout"):
         st.session_state.pop("auth", None)
 
@@ -562,7 +616,7 @@ if ROLE == "student":
         st.session_state.grid_for_word = st.session_state.active_word
         st.session_state.grid_keys = [f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
         st.session_state.selection = set()
-        # NEW: reset answered state when a new word loads
+        # reset answered state when a new word loads
         st.session_state.answered = False
         st.session_state.eval = None
 
