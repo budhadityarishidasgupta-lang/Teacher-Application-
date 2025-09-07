@@ -48,7 +48,7 @@ if ENABLE_GPT and OPENAI_API_KEY:
 
 st.set_page_config(page_title="Synonym Quest — Admin & Student", page_icon="📚", layout="wide")
 
-# ── DB schema ────────────────────────────────────────────────────────
+# ── DB schema (SQLite local) ─────────────────────────────────────────
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
         # users: role = admin | student
@@ -404,10 +404,11 @@ if ROLE == "admin":
     # Teacher Dashboard — upload files, create tests, assign tests
     with tab_teacher:
         st.subheader("Courses")
+        # FIX: remove unsupported key= from form_submit_button
         with st.form("create_course"):
             title = st.text_input("Course title", key="td_course_title")
             desc  = st.text_area("Description", "", key="td_course_desc")
-            ok = st.form_submit_button("Create course", key="td_course_create_btn")
+            ok = st.form_submit_button("Create course")  # ← fixed (no key)
             if ok and title.strip():
                 with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
                     cur.execute("INSERT INTO courses(title,description) VALUES(?,?)", (title,desc))
@@ -425,10 +426,11 @@ if ROLE == "admin":
                 format_func=lambda x: df_courses.loc[df_courses["course_id"]==x,"title"].values[0],
                 key="td_course_for_lessons"
             )
+            # FIX: remove unsupported key= from form_submit_button
             with st.form("create_lesson"):
                 lt = st.text_input("Lesson title", key="td_lesson_title")
                 order = st.number_input("Sort order", 0, 999, 0, key="td_lesson_order")
-                ok = st.form_submit_button("Create lesson", key="td_lesson_create_btn")
+                ok = st.form_submit_button("Create lesson")  # ← fixed (no key)
                 if ok and lt.strip():
                     with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
                         cur.execute("INSERT INTO lessons(course_id,title,sort_order) VALUES(?,?,?)", (cid_lessons, lt, int(order)))
@@ -590,7 +592,7 @@ if ROLE == "student":
         else:
             st.session_state.selection.discard(opt)
 
-       # Buttons: Submit + Next (side-by-side)
+    # Buttons: Submit + Next (side-by-side)
     col_submit, col_next = st.columns([1, 1])
     with col_submit:
         submit = st.button("Submit", type="primary", key="student_submit_btn")
@@ -662,4 +664,3 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
-
