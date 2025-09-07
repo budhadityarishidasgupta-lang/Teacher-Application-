@@ -692,53 +692,58 @@ if ROLE == "student":
             # Prevent advancing without submit
             st.warning("Please **Submit** your answer first, then click **Next**.")
 
-    # After Submit: show feedback + Next (outside the form), and ONLY Next advances
-    if st.session_state.answered and st.session_state.eval:
-        ev = st.session_state.eval
-        st.subheader(f"Word: **{active}**")
-        if ev["is_correct"]:
-            st.success("✅ Correct!")
-        else:
-            st.error("❌ Not quite. Check the correct answers below.")
+   # After Submit: show feedback + Next (outside the form), and ONLY Next advances
+if st.session_state.answered and st.session_state.eval:
+    ev = st.session_state.eval
+    st.subheader(f"Word: **{active}**")
+    if ev["is_correct"]:
+        st.success("✅ Correct!")
+    else:
+        st.error("❌ Not quite. Check the correct answers below.")
 
-        with st.expander("Why are these the best choices?", expanded=True):
-            lines = []
-            for opt in ev["choices"]:
-                if opt in ev["correct_set"] and opt in ev["picked_set"]:
-                    tag = "✅ correct (you picked)"
-                elif opt in ev["correct_set"]:
-                    tag = "✅ correct"
-                elif opt in ev["picked_set"]:
-                    tag = "❌ your pick"
-                else:
-                    tag = ""
-                lines.append(f"- **{opt}** {tag}")
-            st.markdown("\n".join(lines))
-            st.caption("Tip: pick all the options that mean almost the same as the main word.")
+    with st.expander("Why are these the best choices?", expanded=True):
+        lines = []
+        for opt in ev["choices"]:
+            if opt in ev["correct_set"] and opt in ev["picked_set"]:
+                tag = "✅ correct (you picked)"
+            elif opt in ev["correct_set"]:
+                tag = "✅ correct"
+            elif opt in ev["picked_set"]:
+                tag = "❌ your pick"
+            else:
+                tag = ""
+            lines.append(f"- **{opt}** {tag}")
+        st.markdown("\n".join(lines))
+        st.caption("Tip: pick all the options that mean almost the same as the main word.")
 
-        # Add GPT explanation + two examples
-try:
-    correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
-    why, examples = gpt_feedback_examples(active, correct_choice_for_text)
-    st.info(f"**Why:** {why}")
-    st.markdown(f"**Examples:**\n\n- {examples[0]}\n- {examples[1]}")
-except Exception:
-    pass
+    # Add GPT explanation + two examples (place OUTSIDE the expander, BEFORE Next)
+    try:
+        correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
+        why, examples = gpt_feedback_examples(active, correct_choice_for_text)
+        st.info(f"**Why:** {why}")
+        st.markdown(f"**Examples:**\n\n- {examples[0]}\n- {examples[1]}")
+    except Exception:
+        pass
 
-        # NEXT button (advances only after submit)
-        if st.button("Next ▶", use_container_width=True):
-            st.session_state.asked_history.append(active)
-            next_word = choose_next_word(USER_ID, cid, lid, words_df)
-            st.session_state.active_word = next_word
-            st.session_state.q_started_at = time.time()
-            next_row = words_df[words_df["headword"] == next_word].iloc[0]
+    # NEXT button (advances only after submit)
+    if st.button("Next ▶", use_container_width=True):
+        st.session_state.asked_history.append(active)
+        next_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.active_word = next_word
+        st.session_state.q_started_at = time.time()
+        next_row = words_df[words_df["headword"] == next_word].iloc[0]
+        # if you added GPT distractors earlier, keep your wb/qdata call here
+        try:
+            wb = get_course_wordbank(cid)
+            st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"], cid, wb)
+        except Exception:
             st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-            st.session_state.grid_for_word = next_word
-            st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
-            st.session_state.selection = set()
-            st.session_state.answered = False
-            st.session_state.eval = None
-            st.rerun()
+        st.session_state.grid_for_word = next_word
+        st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+        st.session_state.selection = set()
+        st.session_state.answered = False
+        st.session_state.eval = None
+        st.rerun()
 
 # --- Health check (put here or at the very end) ---
 st.sidebar.header("Health")
@@ -749,4 +754,5 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
