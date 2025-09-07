@@ -497,4 +497,192 @@ if ROLE == "admin":
                 FROM attempts A JOIN users U ON U.user_id=A.user_id
                 ORDER BY A.id DESC LIMIT 500
             """, conn)
-        st.dat
+        st.dataframe(attempts, use_container_width=True)
+        st.caption("Latest attempts across students. Filter/export via table menu.")
+
+# ── STUDENT EXPERIENCE ───────────────────────────────────────────────
+if ROLE == "student":
+    st.title("🎓 Student")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        courses = pd.read_sql_query("""
+            SELECT C.course_id, C.title
+            FROM enrollments E JOIN courses C ON C.course_id=E.course_id
+            WHERE E.user_id=?""", conn, params=(USER_ID,))
+
+    # Sidebar: My courses + completion %
+    with st.sidebar:
+        st.subheader("My courses")
+        if courses.empty:
+            st.info("No courses assigned yet.")
+        else:
+            labels = []
+            id_by_label = {}
+            for _, rowc in courses.iterrows():
+                c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
+                label = f"{rowc['title']} — {c_pct}%"
+                labels.append(label)
+                id_by_label[label] = int(rowc["course_id"])
+
+            selected_label = st.radio("Courses", labels, index=0, key="student_course_radio")
+            cid = id_by_label[selected_label]
+
+    if courses.empty:
+        st.stop()
+
+    # Lessons for selected course
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        lessons = pd.read_sql_query("SELECT lesson_id,title FROM lessons WHERE course_id=? ORDER BY sort_order", conn, params=(cid,))
+    if lessons.empty:
+        st.info("This course has no lessons yet.")
+        st.stop()
+
+    l_map = dict(zip(lessons["lesson_id"], lessons["title"]))
+    lid = st.selectbox("Lesson", list(l_map.keys()), format_func=lambda x: l_map[x], key="student_lesson_select")
+
+    # Load words for the selected lesson
+    words_df = lesson_words(cid, lid)
+    if words_df.empty:
+        st.info("This lesson has no words yet.")
+        st.stop()
+
+    # Progress header
+    if "asked_history" not in st.session_state:
+        st.session_state.asked_history = []
+    m, total = mastered_count(USER_ID, lid)
+    st.progress(min(m/max(total,1),1.0), text=f"Mastered {m}/{total} words")
+
+    # --- Active question state (stable across reruns) ---
+    new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
+    if new_word_needed:
+        st.session_state.active_lid = lid
+        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.q_started_at = time.time()
+        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+        st.session_state.grid_for_word = st.session_state.active_word
+        st.session_state.grid_keys = [f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+        st.session_state.selection = set()
+        # NEW: reset answered state when a new word loads
+        st.session_state.answered = False
+        st.session_state.eval = None
+
+    # ensure flags exist
+    if "answered" not in st.session_state:
+        st.session_state.answered = False
+    if "eval" not in st.session_state:
+        st.session_state.eval = None
+
+    active = st.session_state.active_word
+    row = words_df[words_df["headword"] == active].iloc[0]
+    qdata = st.session_state.qdata
+    choices = qdata["choices"]
+    correct_set = qdata["correct"]
+
+    # ----- QUIZ FORM (no auto-advance on Submit) -----
+    if not st.session_state.answered:
+        with st.form("quiz_form", clear_on_submit=False):
+            st.subheader(f"Word: **{active}**")
+            st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
+
+            # stable keys per word; reset selection when word changes already handled above
+            keys = st.session_state.grid_keys
+
+            row1 = st.columns(3)
+            row2 = st.columns(3)
+            grid_rows = [row1, row2]
+
+            temp_selection = set(st.session_state.selection)
+            for i, opt in enumerate(choices):
+                col = grid_rows[0][i] if i < 3 else grid_rows[1][i-3]
+                with col:
+                    checked = opt in temp_selection
+                    new_val = st.checkbox(opt, value=checked, key=keys[i])
+                if new_val:
+                    temp_selection.add(opt)
+                else:
+                    temp_selection.discard(opt)
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                submitted = st.form_submit_button("Submit", type="primary")
+            with c2:
+                nextq = st.form_submit_button("Next ▶")
+
+        # Commit temp selection after form interaction
+        st.session_state.selection = temp_selection
+
+        # Handle buttons
+        if submitted:
+            elapsed_ms = (time.time()-st.session_state.q_started_at)*1000
+            picked_set = set(list(st.session_state.selection))
+            is_correct = (picked_set == correct_set)
+
+            correct_choice_for_log = list(correct_set)[0]
+            update_after_attempt(
+                USER_ID, cid, lid, active,
+                is_correct, elapsed_ms, int(row["difficulty"]),
+                ", ".join(sorted(picked_set)), correct_choice_for_log
+            )
+
+            # Persist evaluation & freeze form until Next
+            st.session_state.answered = True
+            st.session_state.eval = {
+                "is_correct": bool(is_correct),
+                "picked_set": set(picked_set),
+                "correct_set": set(correct_set),
+                "choices": list(choices)
+            }
+            st.rerun()
+
+        elif nextq:
+            # Prevent advancing without submit
+            st.warning("Please **Submit** your answer first, then click **Next**.")
+
+    # After Submit: show feedback + Next (outside the form), and ONLY Next advances
+    if st.session_state.answered and st.session_state.eval:
+        ev = st.session_state.eval
+        st.subheader(f"Word: **{active}**")
+        if ev["is_correct"]:
+            st.success("✅ Correct!")
+        else:
+            st.error("❌ Not quite. Check the correct answers below.")
+
+        with st.expander("Why are these the best choices?", expanded=True):
+            lines = []
+            for opt in ev["choices"]:
+                if opt in ev["correct_set"] and opt in ev["picked_set"]:
+                    tag = "✅ correct (you picked)"
+                elif opt in ev["correct_set"]:
+                    tag = "✅ correct"
+                elif opt in ev["picked_set"]:
+                    tag = "❌ your pick"
+                else:
+                    tag = ""
+                lines.append(f"- **{opt}** {tag}")
+            st.markdown("\n".join(lines))
+            st.caption("Tip: pick all the options that mean almost the same as the main word.")
+
+        # NEXT button (advances only after submit)
+        if st.button("Next ▶", use_container_width=True):
+            st.session_state.asked_history.append(active)
+            next_word = choose_next_word(USER_ID, cid, lid, words_df)
+            st.session_state.active_word = next_word
+            st.session_state.q_started_at = time.time()
+            next_row = words_df[words_df["headword"] == next_word].iloc[0]
+            st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
+            st.session_state.grid_for_word = next_word
+            st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+            st.session_state.selection = set()
+            st.session_state.answered = False
+            st.session_state.eval = None
+            st.rerun()
+
+# --- Health check (put here or at the very end) ---
+st.sidebar.header("Health")
+if st.sidebar.button("DB ping"):
+    try:
+        with engine.connect() as conn:
+            one = conn.execute(text("SELECT 1")).scalar()
+        st.sidebar.success(f"DB OK (result={one})")
+    except Exception as e:
+        st.sidebar.error(f"DB error: {e}")
