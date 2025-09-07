@@ -416,6 +416,19 @@ ROLE = st.session_state.auth["role"]
 USER_ID = st.session_state.auth["user_id"]
 NAME = st.session_state.auth["name"]
 st.sidebar.caption(f"Signed in as **{NAME}** ({ROLE})")
+# --- Global safe defaults (harmless for Admin; avoids missing-key errors) ---
+_defaults = {
+    "answered": False,
+    "eval": None,
+    "active_word": None,
+    "active_lid": None,
+    "q_started_at": 0.0,
+    "selection": set(),
+    "asked_history": [],
+}
+for _k, _v in _defaults.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 # ── ADMIN EXPERIENCE ─────────────────────────────────────────────────
 if ROLE == "admin":
@@ -693,7 +706,7 @@ if ROLE == "student":
             st.warning("Please **Submit** your answer first, then click **Next**.")
 
    # After Submit: show feedback + Next (outside the form), and ONLY Next advances
-if st.session_state.answered and st.session_state.eval:
+if ROLE == "student" and st.session_state.get("answered") and st.session_state.get("eval"):
     ev = st.session_state.eval
     st.subheader(f"Word: **{active}**")
     if ev["is_correct"]:
@@ -754,5 +767,6 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
 
