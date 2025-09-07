@@ -404,11 +404,10 @@ if ROLE == "admin":
     # Teacher Dashboard — upload files, create tests, assign tests
     with tab_teacher:
         st.subheader("Courses")
-        # FIX: remove unsupported key= from form_submit_button
         with st.form("create_course"):
             title = st.text_input("Course title", key="td_course_title")
             desc  = st.text_area("Description", "", key="td_course_desc")
-            ok = st.form_submit_button("Create course")  # ← fixed (no key)
+            ok = st.form_submit_button("Create course")  # fixed: no key
             if ok and title.strip():
                 with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
                     cur.execute("INSERT INTO courses(title,description) VALUES(?,?)", (title,desc))
@@ -426,17 +425,15 @@ if ROLE == "admin":
                 format_func=lambda x: df_courses.loc[df_courses["course_id"]==x,"title"].values[0],
                 key="td_course_for_lessons"
             )
-            # FIX: remove unsupported key= from form_submit_button
             with st.form("create_lesson"):
                 lt = st.text_input("Lesson title", key="td_lesson_title")
                 order = st.number_input("Sort order", 0, 999, 0, key="td_lesson_order")
-                ok = st.form_submit_button("Create lesson")  # ← fixed (no key)
+                ok = st.form_submit_button("Create lesson")  # fixed: no key
                 if ok and lt.strip():
                     with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
                         cur.execute("INSERT INTO lessons(course_id,title,sort_order) VALUES(?,?,?)", (cid_lessons, lt, int(order)))
                     st.success("Lesson created.")
 
-            # Upload / attach words
             st.markdown("**Upload CSV of words (headword,synonyms)**")
             f = st.file_uploader("Upload CSV", type=["csv"], key="td_upload_csv")
             if f:
@@ -569,45 +566,49 @@ if ROLE == "student":
     choices = qdata["choices"]
     correct_set = qdata["correct"]
 
-    st.subheader(f"Word: **{active}**")
-    st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
+    # ----- QUIZ FORM (prevents auto-rerun on checkbox toggles) -----
+    with st.form("quiz_form", clear_on_submit=False):
+        st.subheader(f"Word: **{active}**")
+        st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
 
-    # 3×2 grid of checkboxes (stable keys per word)
-    if "grid_keys" not in st.session_state or st.session_state.get("grid_for_word") != active:
-        st.session_state.grid_for_word = active
-        st.session_state.grid_keys = [f"opt_{active}_{i}" for i in range(len(choices))]
-    keys = st.session_state.grid_keys
+        # Ensure stable keys per word; reset selection when word changes
+        if "grid_keys" not in st.session_state or st.session_state.get("grid_for_word") != active:
+            st.session_state.grid_for_word = active
+            st.session_state.grid_keys = [f"opt_{active}_{i}" for i in range(len(choices))]
+            st.session_state.selection = set()
+        keys = st.session_state.grid_keys
 
-    row1 = st.columns(3)
-    row2 = st.columns(3)
-    grid_rows = [row1, row2]
+        row1 = st.columns(3)
+        row2 = st.columns(3)
+        grid_rows = [row1, row2]
 
-    for i, opt in enumerate(choices):
-        col = grid_rows[0][i] if i < 3 else grid_rows[1][i-3]
-        with col:
-            checked = opt in st.session_state.selection
-            new_val = st.checkbox(opt, value=checked, key=keys[i])
-        if new_val:
-            st.session_state.selection.add(opt)
-        else:
-            st.session_state.selection.discard(opt)
+        # Work on a temp selection inside the form (committed after submit)
+        temp_selection = set(st.session_state.selection)
+        for i, opt in enumerate(choices):
+            col = grid_rows[0][i] if i < 3 else grid_rows[1][i-3]
+            with col:
+                checked = opt in temp_selection
+                new_val = st.checkbox(opt, value=checked, key=keys[i])
+            if new_val:
+                temp_selection.add(opt)
+            else:
+                temp_selection.discard(opt)
 
-    # Buttons: Submit + Next (side-by-side)
-    col_submit, col_next = st.columns([1, 1])
-    with col_submit:
-        submit = st.button("Submit", type="primary", key="student_submit_btn")
-    with col_next:
-        nextq = st.button("Next ▶", key="student_next_btn")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            submitted = st.form_submit_button("Submit", type="primary")
+        with c2:
+            nextq = st.form_submit_button("Next ▶")
 
+    # Commit the temp selection after the form interaction
+    st.session_state.selection = temp_selection
     picked = list(st.session_state.selection)
 
-    if submit:
-        # Allow any number of picks
+    if submitted:
         elapsed_ms = (time.time()-st.session_state.q_started_at)*1000
         picked_set = set(picked)
         is_correct = (picked_set == correct_set)
 
-        # Log attempt (store one correct choice for compatibility)
         correct_choice_for_log = list(correct_set)[0]
         update_after_attempt(
             USER_ID, cid, lid, active,
@@ -615,7 +616,6 @@ if ROLE == "student":
             ", ".join(picked), correct_choice_for_log
         )
 
-        # Reveal the correct answers
         st.success("Correct! 🎉" if is_correct else "Nice try — check the correct answers below.")
         with st.expander("Why are these the best choices?", expanded=True):
             lines = []
@@ -632,28 +632,28 @@ if ROLE == "student":
             st.markdown("\n".join(lines))
             st.caption("Tip: pick all the options that mean almost the same as the main word.")
 
-        # Move to next question
+        # Advance to next word after submit
         st.session_state.asked_history.append(active)
         next_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.active_word = next_word
         st.session_state.q_started_at = time.time()
         next_row = words_df[words_df["headword"] == next_word].iloc[0]
         st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-        st.session_state.selection = set()
         st.session_state.grid_for_word = next_word
         st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+        st.session_state.selection = set()
 
     elif nextq:
-        # Skip scoring; just load the next question fresh
+        # Skip scoring; just load the next word
         st.session_state.asked_history.append(active)
         next_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.active_word = next_word
         st.session_state.q_started_at = time.time()
         next_row = words_df[words_df["headword"] == next_word].iloc[0]
         st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-        st.session_state.selection = set()
         st.session_state.grid_for_word = next_word
         st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+        st.session_state.selection = set()
 
 # --- Health check (put here or at the very end) ---
 st.sidebar.header("Health")
