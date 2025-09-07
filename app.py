@@ -716,6 +716,15 @@ if ROLE == "student":
             st.markdown("\n".join(lines))
             st.caption("Tip: pick all the options that mean almost the same as the main word.")
 
+        # Add GPT explanation + two examples
+try:
+    correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
+    why, examples = gpt_feedback_examples(active, correct_choice_for_text)
+    st.info(f"**Why:** {why}")
+    st.markdown(f"**Examples:**\n\n- {examples[0]}\n- {examples[1]}")
+except Exception:
+    pass
+
         # NEXT button (advances only after submit)
         if st.button("Next ▶", use_container_width=True):
             st.session_state.asked_history.append(active)
@@ -740,3 +749,4 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
