@@ -38,9 +38,11 @@ if not _raw:
     st.stop()
 
 def _normalize(url: str) -> str:
-    # Keep it minimal: fix deprecated scheme only
+    # Minimal normalization; SQLAlchemy works best with 'postgresql+psycopg2://'
     if url.startswith("postgres://"):
-        return "postgresql://" + url[len("postgres://"):]
+        return "postgresql+psycopg2://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://"):]
     return url
 
 DATABASE_URL = _normalize(_raw)
@@ -79,191 +81,240 @@ if ENABLE_GPT and OPENAI_API_KEY:
 
 st.set_page_config(page_title="Synonym Quest — Admin & Student", page_icon="📚", layout="wide")
 
-# ── DB schema (SQLite local) ─────────────────────────────────────────
+# ── DB schema (Postgres via SQLAlchemy) ───────────────────────────────
+from sqlalchemy import text
+
 def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-        # users: role = admin | student
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-          user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL,
-          email TEXT UNIQUE NOT NULL,
+    # Create tables in Postgres (idempotent)
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+          user_id    SERIAL PRIMARY KEY,
+          name       TEXT NOT NULL,
+          email      TEXT UNIQUE NOT NULL,
           password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK(role IN ('admin','student')),
-          is_active INTEGER NOT NULL DEFAULT 1,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS courses(
-          course_id INTEGER PRIMARY KEY AUTOINCREMENT,
-          title TEXT NOT NULL,
+          role       TEXT NOT NULL CHECK (role IN ('admin','student')),
+          is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS courses (
+          course_id  SERIAL PRIMARY KEY,
+          title      TEXT NOT NULL,
           description TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS lessons(
-          lesson_id INTEGER PRIMARY KEY AUTOINCREMENT,
-          course_id INTEGER NOT NULL,
-          title TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lessons (
+          lesson_id  SERIAL PRIMARY KEY,
+          course_id  INTEGER NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+          title      TEXT NOT NULL,
           sort_order INTEGER DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY(course_id) REFERENCES courses(course_id)
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS words(
-          word_id INTEGER PRIMARY KEY AUTOINCREMENT,
-          headword TEXT NOT NULL,
-          synonyms TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS words (
+          word_id    SERIAL PRIMARY KEY,
+          headword   TEXT NOT NULL,
+          synonyms   TEXT NOT NULL,
           difficulty INTEGER DEFAULT 2
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS lesson_words(
-          lesson_id INTEGER,
-          word_id INTEGER,
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lesson_words (
+          lesson_id  INTEGER NOT NULL REFERENCES lessons(lesson_id) ON DELETE CASCADE,
+          word_id    INTEGER NOT NULL REFERENCES words(word_id)   ON DELETE CASCADE,
           sort_order INTEGER DEFAULT 0,
-          PRIMARY KEY(lesson_id, word_id),
-          FOREIGN KEY(lesson_id) REFERENCES lessons(lesson_id),
-          FOREIGN KEY(word_id) REFERENCES words(word_id)
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS enrollments(
-          user_id INTEGER,
-          course_id INTEGER,
-          PRIMARY KEY(user_id, course_id),
-          FOREIGN KEY(user_id) REFERENCES users(user_id),
-          FOREIGN KEY(course_id) REFERENCES courses(course_id)
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS attempts(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id INTEGER, course_id INTEGER, lesson_id INTEGER,
-          headword TEXT, is_correct INTEGER, response_ms INTEGER,
-          chosen TEXT, correct_choice TEXT,
-          ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS word_stats(
-          user_id INTEGER, headword TEXT,
-          correct_streak INTEGER DEFAULT 0,
-          total_attempts INTEGER DEFAULT 0,
+          PRIMARY KEY (lesson_id, word_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS enrollments (
+          user_id   INTEGER NOT NULL REFERENCES users(user_id)   ON DELETE CASCADE,
+          course_id INTEGER NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+          PRIMARY KEY (user_id, course_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS attempts (
+          id         BIGSERIAL PRIMARY KEY,
+          user_id    INTEGER,
+          course_id  INTEGER,
+          lesson_id  INTEGER,
+          headword   TEXT,
+          is_correct BOOLEAN,
+          response_ms INTEGER,
+          chosen     TEXT,
+          correct_choice TEXT,
+          ts         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS word_stats (
+          user_id          INTEGER NOT NULL,
+          headword         TEXT    NOT NULL,
+          correct_streak   INTEGER DEFAULT 0,
+          total_attempts   INTEGER DEFAULT 0,
           correct_attempts INTEGER DEFAULT 0,
-          last_seen TIMESTAMP,
-          mastered INTEGER DEFAULT 0,
-          difficulty INTEGER DEFAULT 2,
-          due_date TIMESTAMP,
+          last_seen        TIMESTAMPTZ,
+          mastered         BOOLEAN DEFAULT FALSE,
+          difficulty       INTEGER DEFAULT 2,
+          due_date         TIMESTAMPTZ,
           PRIMARY KEY (user_id, headword)
-        );""")
+        );
+        """
+    ]
+    with engine.begin() as conn:
+        for q in ddl:
+            conn.execute(text(q))
 
 def create_user(name, email, password, role):
     h = bcrypt.hash(password)
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-        cur.execute("INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)",
-                    (name, email, h, role))
-        return cur.lastrowid
+    with engine.begin() as conn:
+        user_id = conn.execute(
+            text("""INSERT INTO users(name,email,password_hash,role)
+                    VALUES (:n,:e, :p, :r)
+                    ON CONFLICT (email) DO NOTHING
+                    RETURNING user_id"""),
+            {"n": name, "e": email, "p": h, "r": role}
+        ).scalar()
+        if user_id is None:
+            user_id = conn.execute(text("SELECT user_id FROM users WHERE email=:e"), {"e": email}).scalar()
+        return user_id
 
 def user_by_email(email):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute("SELECT user_id,name,email,password_hash,role,is_active FROM users WHERE email=?", (email,))
-        r = cur.fetchone()
-    return None if not r else dict(user_id=r[0], name=r[1], email=r[2], password_hash=r[3], role=r[4], is_active=r[5])
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""SELECT user_id,name,email,password_hash,role,is_active
+                    FROM users WHERE email=:e"""),
+            {"e": email}
+        ).mappings().fetchone()
+    return dict(row) if row else None
 
 def ensure_admin():
-    """Create the admin account if it doesn't exist."""
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute("SELECT user_id FROM users WHERE role='admin' LIMIT 1")
-        row = cur.fetchone()
-    if row: return
+    with engine.begin() as conn:
+        exists = conn.execute(text("SELECT 1 FROM users WHERE role='admin' LIMIT 1")).scalar()
+    if exists:
+        return
     try:
         create_user(ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASSWORD, "admin")
-    except sqlite3.IntegrityError:
+    except Exception:
         pass
 
 def set_user_active(user_id, active: bool):
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-        cur.execute("UPDATE users SET is_active=? WHERE user_id=?", (1 if active else 0, user_id))
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE users SET is_active=:a WHERE user_id=:u"),
+                     {"a": bool(active), "u": user_id})
 
 def all_students_df():
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        df_users = pd.read_sql_query("SELECT user_id,name,email,is_active FROM users WHERE role='student'", conn)
-        df_stats = pd.read_sql_query("""
+    df_users = pd.read_sql(
+        text("SELECT user_id,name,email,is_active FROM users WHERE role='student'"),
+        con=engine
+    )
+    df_stats = pd.read_sql(
+        text("""
             SELECT user_id,
                    SUM(correct_attempts) AS correct_total,
                    SUM(total_attempts)   AS attempts_total,
-                   SUM(mastered)         AS mastered_count,
+                   SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
                    MAX(last_seen)        AS last_active
             FROM word_stats GROUP BY user_id
-        """, conn)
+        """),
+        con=engine
+    )
     df = df_users.merge(df_stats, on="user_id", how="left")
-    for c in ["correct_total","attempts_total","mastered_count"]: df[c]=df[c].fillna(0).astype(int)
+    for c in ["correct_total","attempts_total","mastered_count"]:
+        df[c] = df[c].fillna(0).astype(int)
     return df.sort_values("name")
 
 def lesson_words(course_id, lesson_id):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        q = """
+    sql = """
         SELECT w.headword, w.synonyms, w.difficulty
-        FROM lesson_words lw JOIN words w ON w.word_id=lw.word_id
-        WHERE lw.lesson_id=? AND EXISTS (SELECT 1 FROM lessons L WHERE L.lesson_id=lw.lesson_id AND L.course_id=?)
+        FROM lesson_words lw
+        JOIN words   w ON w.word_id = lw.word_id
+        JOIN lessons l ON l.lesson_id = lw.lesson_id
+        WHERE lw.lesson_id = :lid AND l.course_id = :cid
         ORDER BY lw.sort_order
-        """
-        return pd.read_sql_query(q, conn, params=(lesson_id, course_id))
+    """
+    return pd.read_sql(text(sql), con=engine, params={"lid": int(lesson_id), "cid": int(course_id)})
 
 def mastered_count(user_id, lesson_id):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            "SELECT w.headword FROM lesson_words lw JOIN words w USING(word_id) WHERE lw.lesson_id=?",
-            (lesson_id,)
-        )
-        words = [r[0] for r in cur.fetchall()]
-
+    words = pd.read_sql(
+        text("""
+            SELECT w.headword
+            FROM lesson_words lw
+            JOIN words w ON w.word_id=lw.word_id
+            WHERE lw.lesson_id=:lid
+        """),
+        con=engine, params={"lid": int(lesson_id)}
+    )["headword"].tolist()
     if not words:
         return 0, 0
-
-    qmarks = ",".join("?" for _ in words)
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            f"SELECT COUNT(*) FROM word_stats WHERE user_id=? AND mastered=1 AND headword IN ({qmarks})",
-            (user_id, *words)
-        )
-        (m,) = cur.fetchone()
-
-    return m, len(words)
+    m = pd.read_sql(
+        text("""
+            SELECT COUNT(*) AS c
+            FROM word_stats
+            WHERE user_id=:u AND mastered=TRUE AND headword = ANY(:arr)
+        """),
+        con=engine,
+        params={"u": int(user_id), "arr": words}
+    )["c"].iloc[0]
+    return int(m), len(words)
 
 def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, response_ms, difficulty, chosen, correct_choice):
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-        cur.execute("SELECT correct_streak FROM word_stats WHERE user_id=? AND headword=?", (user_id, headword))
-        row = cur.fetchone()
-        prior = row[0] if row else 0
+    with engine.begin() as conn:
+        prior = conn.execute(
+            text("SELECT correct_streak FROM word_stats WHERE user_id=:u AND headword=:h"),
+            {"u": user_id, "h": headword}
+        ).scalar()
+        prior = int(prior or 0)
         new_streak = prior + 1 if is_correct else 0
-        mastered = 1 if new_streak >= 3 else 0
-        add_days = 3 if (is_correct and new_streak >= 3) else (1 if is_correct else 0)
-        due = (datetime.utcnow() + timedelta(days=add_days)).strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("""
+        mastered = new_streak >= 3
+        add_days = 3 if (is_correct and mastered) else (1 if is_correct else 0)
+        due = datetime.utcnow() + timedelta(days=add_days)
+
+        conn.execute(text("""
             INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, last_seen, mastered, difficulty, due_date)
-            VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, ?, ?, ?)
-            ON CONFLICT(user_id, headword) DO UPDATE SET
-                correct_streak=?,
-                total_attempts=word_stats.total_attempts+1,
-                correct_attempts=word_stats.correct_attempts + (?),
-                last_seen=CURRENT_TIMESTAMP,
-                mastered=CASE WHEN ?=1 THEN 1 ELSE word_stats.mastered END,
-                difficulty=?,
-                due_date=?""",
-            (user_id, headword, new_streak, 1 if is_correct else 0, mastered, difficulty, due,
-             new_streak, 1 if is_correct else 0, mastered, difficulty, due))
-        cur.execute("""
+            VALUES (:u, :h, :cs, 1, :ca, CURRENT_TIMESTAMP, :m, :d, :due)
+            ON CONFLICT (user_id, headword) DO UPDATE SET
+                correct_streak   = EXCLUDED.correct_streak,
+                total_attempts   = word_stats.total_attempts + 1,
+                correct_attempts = word_stats.correct_attempts + (:ca),
+                last_seen        = CURRENT_TIMESTAMP,
+                mastered         = CASE WHEN :m THEN TRUE ELSE word_stats.mastered END,
+                difficulty       = :d,
+                due_date         = :due
+        """), {
+            "u": user_id, "h": headword, "cs": new_streak,
+            "ca": 1 if is_correct else 0,
+            "m": mastered, "d": int(difficulty), "due": due
+        })
+
+        conn.execute(text("""
             INSERT INTO attempts(user_id,course_id,lesson_id,headword,is_correct,response_ms,chosen,correct_choice)
-            VALUES(?,?,?,?,?,?,?,?)""",
-            (user_id, course_id, lesson_id, headword, 1 if is_correct else 0, int(response_ms), chosen, correct_choice))
+            VALUES (:u,:c,:l,:h,:ok,:ms,:ch,:cc)
+        """), {
+            "u": user_id, "c": course_id, "l": lesson_id, "h": headword,
+            "ok": bool(is_correct), "ms": int(response_ms),
+            "ch": chosen, "cc": correct_choice
+        })
 
 def recent_stats(user_id, course_id, lesson_id, n=10):
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute("""SELECT is_correct, response_ms FROM attempts
-                       WHERE user_id=? AND course_id=? AND lesson_id=?
-                       ORDER BY id DESC LIMIT ?""", (user_id, course_id, lesson_id, n))
-        rows = cur.fetchall()
-    if not rows: return {"accuracy":0.0,"avg_ms":15000.0}
-    return {"accuracy": float(np.mean([r[0] for r in rows])),
-            "avg_ms": float(np.mean([r[1] for r in rows]))}
+    df = pd.read_sql(
+        text("""
+            SELECT is_correct::int AS is_correct, response_ms
+            FROM attempts
+            WHERE user_id=:u AND course_id=:c AND lesson_id=:l
+            ORDER BY id DESC LIMIT :n
+        """),
+        con=engine, params={"u": user_id, "c": course_id, "l": lesson_id, "n": int(n)}
+    )
+    if df.empty:
+        return {"accuracy": 0.0, "avg_ms": 15000.0}
+    return {"accuracy": float(df["is_correct"].mean()), "avg_ms": float(df["response_ms"].mean())}
 
 def choose_next_word(user_id, course_id, lesson_id, df_words):
     """Adaptive next word selector (targets difficulty 1/2/3 based on recent accuracy & speed)."""
@@ -283,28 +334,30 @@ def choose_next_word(user_id, course_id, lesson_id, df_words):
 # ── Enhancements helpers ─────────────────────────────────────────────
 def course_progress(user_id: int, course_id: int):
     """Return (completed, total, percent) for a course for this user."""
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute("""
+    all_words = pd.read_sql(
+        text("""
             SELECT w.headword
             FROM lessons L
             JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
             JOIN words w ON w.word_id = lw.word_id
-            WHERE L.course_id=?
-        """, (course_id,))
-        all_words = [r[0] for r in cur.fetchall()]
+            WHERE L.course_id=:c
+        """),
+        con=engine, params={"c": int(course_id)}
+    )["headword"].tolist()
     total = len(set(all_words))
     if total == 0:
         return (0, 0, 0)
 
-    qmarks = ",".join("?" for _ in set(all_words))
-    with closing(sqlite3.connect(DB_PATH)) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            f"SELECT COUNT(*) FROM word_stats WHERE user_id=? AND mastered=1 AND headword IN ({qmarks})",
-            (user_id, *list(set(all_words)))
-        )
-        (completed,) = cur.fetchone()
+    completed = pd.read_sql(
+        text("""
+            SELECT COUNT(*) AS c
+            FROM word_stats
+            WHERE user_id=:u AND mastered=TRUE AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "arr": list(set(all_words))}
+    )["c"].iloc[0]
     percent = int(round(100 * completed / total))
-    return (completed, total, percent)
+    return (int(completed), total, percent)
 
 def build_question_payload(headword: str, synonyms_str: str):
     """
@@ -354,6 +407,39 @@ def gpt_explain(headword, choices, correct_choice, user_choice):
         return resp.choices[0].message.content.strip()
     except Exception:
         return "Tip: pick the choice that means almost the same as the word."
+
+# NEW: GPT helper to return 2 simple examples + a brief why
+def gpt_feedback_examples(headword: str, correct_word: str):
+    if not (ENABLE_GPT and gpt_client):
+        why = f"'{correct_word}' is a good synonym for '{headword}' because they mean nearly the same thing."
+        return why, [
+            f"The {headword} kid felt {correct_word} all day.",
+            f"After the news, she was {correct_word}—truly {headword}!"
+        ]
+    try:
+        prompt = f"""
+        You are a friendly tutor for kids 7–10.
+        Word: "{headword}", correct synonym: "{correct_word}".
+        1) Give a one-sentence kid-friendly reason why "{correct_word}" fits as a synonym.
+        2) Give TWO short example sentences (<= 12 words each) using "{headword}" or "{correct_word}".
+        Reply as JSON:
+        {{"why": "...", "examples": ["...", "..."]}}
+        """
+        resp = gpt_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role":"system","content":"Be concise, friendly, and age-appropriate."},
+                      {"role":"user","content":prompt}],
+            temperature=0.4, max_tokens=180)
+        import json
+        data = json.loads(resp.choices[0].message.content)
+        why = str(data.get("why","")).strip() or f"'{correct_word}' is close in meaning to '{headword}'."
+        exs = [str(x).strip() for x in (data.get("examples") or []) if str(x).strip()]
+        while len(exs) < 2:
+            exs.append(f"I feel {correct_word} today.")
+        return why, exs[:2]
+    except Exception:
+        return (f"'{correct_word}' is close in meaning to '{headword}'.",
+                [f"She felt {correct_word} after the good news.", f"His mood was {headword} all morning."])
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 init_db()
@@ -476,12 +562,11 @@ if ROLE == "admin":
             desc  = st.text_area("Description", "", key="td_course_desc")
             ok = st.form_submit_button("Create course")  # fixed: no key
             if ok and title.strip():
-                with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-                    cur.execute("INSERT INTO courses(title,description) VALUES(?,?)", (title,desc))
+                with engine.begin() as conn:
+                    conn.execute(text("INSERT INTO courses(title,description) VALUES(:t,:d)"), {"t": title, "d": desc})
                 st.success("Course created.")
 
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            df_courses = pd.read_sql_query("SELECT course_id,title,description FROM courses ORDER BY course_id DESC", conn)
+        df_courses = pd.read_sql(text("SELECT course_id,title,description FROM courses ORDER BY course_id DESC"), con=engine)
         st.dataframe(df_courses, use_container_width=True)
 
         st.subheader("Lessons")
@@ -497,8 +582,11 @@ if ROLE == "admin":
                 order = st.number_input("Sort order", 0, 999, 0, key="td_lesson_order")
                 ok = st.form_submit_button("Create lesson")  # fixed: no key
                 if ok and lt.strip():
-                    with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-                        cur.execute("INSERT INTO lessons(course_id,title,sort_order) VALUES(?,?,?)", (cid_lessons, lt, int(order)))
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("INSERT INTO lessons(course_id,title,sort_order) VALUES(:c,:t,:o)"),
+                            {"c": int(cid_lessons), "t": lt, "o": int(order)}
+                        )
                     st.success("Lesson created.")
 
             st.markdown("**Upload CSV of words (headword,synonyms)**")
@@ -506,8 +594,11 @@ if ROLE == "admin":
             if f:
                 df_up = pd.read_csv(f)
                 st.dataframe(df_up.head(), use_container_width=True)
-                with closing(sqlite3.connect(DB_PATH)) as conn:
-                    df_less = pd.read_sql_query("SELECT lesson_id,title FROM lessons WHERE course_id=? ORDER BY sort_order", conn, params=(cid_lessons,))
+
+                df_less = pd.read_sql(
+                    text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
+                    con=engine, params={"c": int(cid_lessons)}
+                )
                 if df_less.empty:
                     st.warning("Create a lesson first.")
                 else:
@@ -519,22 +610,39 @@ if ROLE == "admin":
                     )
                     if st.button("Import words", key="td_import_words_btn"):
                         n=0
-                        with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
+                        with engine.begin() as conn:
                             for _,r in df_up.iterrows():
                                 hw = str(r["headword"]).strip()
                                 syns = str(r["synonyms"]).strip()
                                 if not hw or not syns: continue
                                 syn_list=[s.strip() for s in syns.split(",") if s.strip()]
                                 diff = 1 if (len(hw)<=6 and len(syn_list)<=3) else (2 if len(hw)<=8 and len(syn_list)<=5 else 3)
-                                cur.execute("INSERT INTO words(headword,synonyms,difficulty) VALUES(?,?,?)",(hw,", ".join(syn_list),diff))
-                                wid = cur.lastrowid
-                                cur.execute("INSERT OR IGNORE INTO lesson_words(lesson_id,word_id,sort_order) VALUES(?,?,?)",(lid_upload,wid,n)); n+=1
+
+                                wid = conn.execute(
+                                    text("""INSERT INTO words(headword,synonyms,difficulty)
+                                            VALUES(:h,:s,:d)
+                                            ON CONFLICT DO NOTHING
+                                            RETURNING word_id"""),
+                                    {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}
+                                ).scalar()
+                                if wid is None:
+                                    wid = conn.execute(
+                                        text("SELECT word_id FROM words WHERE headword=:h AND synonyms=:s"),
+                                        {"h": hw, "s": ", ".join(syn_list)}
+                                    ).scalar()
+
+                                conn.execute(
+                                    text("""INSERT INTO lesson_words(lesson_id,word_id,sort_order)
+                                            VALUES(:l,:w,:o)
+                                            ON CONFLICT (lesson_id,word_id) DO NOTHING"""),
+                                    {"l": int(lid_upload), "w": int(wid), "o": int(n)}
+                                )
+                                n+=1
                         st.success(f"Imported {n} words.")
 
         st.subheader("Assign courses to students")
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            students = pd.read_sql_query("SELECT user_id,name FROM users WHERE role='student' AND is_active=1 ORDER BY name", conn)
-            df_courses_assign = pd.read_sql_query("SELECT course_id,title FROM courses ORDER BY title", conn)
+        students = pd.read_sql(text("SELECT user_id,name FROM users WHERE role='student' AND is_active=TRUE ORDER BY name"), con=engine)
+        df_courses_assign = pd.read_sql(text("SELECT course_id,title FROM courses ORDER BY title"), con=engine)
         if students.empty or df_courses_assign.empty:
             st.info("Create students and courses first.")
         else:
@@ -551,30 +659,40 @@ if ROLE == "admin":
                 key="assign_course"
             )
             if st.button("Enroll", key="assign_enroll_btn"):
-                with closing(sqlite3.connect(DB_PATH)) as conn, conn, closing(conn.cursor()) as cur:
-                    cur.execute("INSERT OR IGNORE INTO enrollments(user_id,course_id) VALUES(?,?)", (sid_assign,cid_assign))
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("""INSERT INTO enrollments(user_id,course_id)
+                                VALUES(:u,:c)
+                                ON CONFLICT (user_id,course_id) DO NOTHING"""),
+                        {"u": int(sid_assign), "c": int(cid_assign)}
+                    )
                 st.success("Enrolled.")
 
     # Student Dashboard — class overview
     with tab_student:
         st.subheader("Student Overview")
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            attempts = pd.read_sql_query("""
+        attempts = pd.read_sql(
+            text("""
                 SELECT U.name, A.course_id, A.lesson_id, A.headword, A.is_correct, A.response_ms, A.ts
                 FROM attempts A JOIN users U ON U.user_id=A.user_id
                 ORDER BY A.id DESC LIMIT 500
-            """, conn)
+            """),
+            con=engine
+        )
         st.dataframe(attempts, use_container_width=True)
         st.caption("Latest attempts across students. Filter/export via table menu.")
 
 # ── STUDENT EXPERIENCE ───────────────────────────────────────────────
 if ROLE == "student":
     st.title("🎓 Student")
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        courses = pd.read_sql_query("""
+    courses = pd.read_sql(
+        text("""
             SELECT C.course_id, C.title
             FROM enrollments E JOIN courses C ON C.course_id=E.course_id
-            WHERE E.user_id=?""", conn, params=(USER_ID,))
+            WHERE E.user_id=:u
+        """),
+        con=engine, params={"u": USER_ID}
+    )
 
     # Sidebar: My courses + completion %
     with st.sidebar:
@@ -597,8 +715,10 @@ if ROLE == "student":
         st.stop()
 
     # Lessons for selected course
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        lessons = pd.read_sql_query("SELECT lesson_id,title FROM lessons WHERE course_id=? ORDER BY sort_order", conn, params=(cid,))
+    lessons = pd.read_sql(
+        text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
+        con=engine, params={"c": cid}
+    )
     if lessons.empty:
         st.info("This course has no lessons yet.")
         st.stop()
@@ -705,7 +825,7 @@ if ROLE == "student":
             # Prevent advancing without submit
             st.warning("Please **Submit** your answer first, then click **Next**.")
 
-   # After Submit: show feedback + Next (outside the form), and ONLY Next advances
+# After Submit: show feedback + Next (outside the form), and ONLY Next advances
 if ROLE == "student" and st.session_state.get("answered") and st.session_state.get("eval"):
     ev = st.session_state.eval
     st.subheader(f"Word: **{active}**")
@@ -729,7 +849,7 @@ if ROLE == "student" and st.session_state.get("answered") and st.session_state.g
         st.markdown("\n".join(lines))
         st.caption("Tip: pick all the options that mean almost the same as the main word.")
 
-    # Add GPT explanation + two examples (place OUTSIDE the expander, BEFORE Next)
+    # Add GPT explanation + two examples (outside the expander, before Next)
     try:
         correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
         why, examples = gpt_feedback_examples(active, correct_choice_for_text)
@@ -745,12 +865,8 @@ if ROLE == "student" and st.session_state.get("answered") and st.session_state.g
         st.session_state.active_word = next_word
         st.session_state.q_started_at = time.time()
         next_row = words_df[words_df["headword"] == next_word].iloc[0]
-        # if you added GPT distractors earlier, keep your wb/qdata call here
-        try:
-            wb = get_course_wordbank(cid)
-            st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"], cid, wb)
-        except Exception:
-            st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
+        # Keep current payload builder; (optional) advanced GPT version can be dropped in later
+        st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
         st.session_state.grid_for_word = next_word
         st.session_state.grid_keys = [f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
         st.session_state.selection = set()
@@ -767,6 +883,3 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
-
-
-
