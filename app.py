@@ -171,8 +171,13 @@ def init_db():
         for q in ddl:
             conn.execute(text(q))
 
-# --- One-time schema + data patch for legacy 'users' table ---
-def patch_users_table():
+# --- One-time schema patch for legacy 'courses' / 'lessons' / 'words' ---
+def patch_courses_table():
+    with engine.begin() as conn:
+        # Add columns that older schemas might be missing (idempotent)
+        conn.execute(text("ALTER TABLE courses ADD COLUMN IF NOT EXISTS description TEXT"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE words   ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 2"))
     # 1) Ensure missing columns exist (safe if they already exist)
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
@@ -567,10 +572,10 @@ def gpt_feedback_examples(headword: str, correct_word: str):
                 [f"She felt {correct_word} after the good news.", f"His mood was {headword} all morning."])
 
 # ── Bootstrap ────────────────────────────────────────────────────────
-init_db()    # create tables
-patch_users_table()    # add any missing columns + backfill
-ensure_admin()   # make sure an admin exists
-
+init_db()             # create tables if missing
+patch_users_table()   # add missing cols / backfill users
+patch_courses_table() # add description/sort_order/difficulty if missing
+ensure_admin()        # ensure default admin exists
 # ── Auth ─────────────────────────────────────────────────────────────
 def login_form():
     st.sidebar.subheader("Sign in")
@@ -1009,5 +1014,6 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
 
