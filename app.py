@@ -85,6 +85,46 @@ st.set_page_config(page_title="Synonym Quest — Admin & Student", page_icon="�
 from sqlalchemy import text
 
 def init_db():
+    # --- One-time schema + data patch for legacy 'users' table ---
+def patch_users_table():
+    # 1) Ensure missing columns exist (idempotent)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
+
+    # 2) Backfill role if missing (admin for ADMIN_EMAIL, student otherwise)
+    admin_email_lc = ADMIN_EMAIL.lower()
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE users SET role='admin' WHERE role IS NULL AND lower(email)=:e"),
+            {"e": admin_email_lc}
+        )
+        conn.execute(
+            text("UPDATE users SET role='student' WHERE role IS NULL AND lower(email)<>:e"),
+            {"e": admin_email_lc}
+        )
+        conn.execute(text("UPDATE users SET is_active=TRUE WHERE is_active IS NULL"))
+
+    # 3) Backfill password hashes where missing (admin uses ADMIN_PASSWORD, students get a default)
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT user_id, email, COALESCE(role,'student') AS role
+                FROM users
+                WHERE password_hash IS NULL OR password_hash=''
+            """)
+        ).mappings().all()
+
+    if rows:
+        with engine.begin() as conn:
+            for r in rows:
+                raw_pwd = ADMIN_PASSWORD if r["role"] == "admin" else "Learn123!"
+                conn.execute(
+                    text("UPDATE users SET password_hash=:p WHERE user_id=:u"),
+                    {"p": bcrypt.hash(raw_pwd), "u": r["user_id"]}
+                )
+
     # Create tables in Postgres (idempotent)
     ddl = [
         """
@@ -443,6 +483,7 @@ def gpt_feedback_examples(headword: str, correct_word: str):
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 init_db()
+patch_users_table()   # << add this line
 ensure_admin()
 
 # ── Auth ─────────────────────────────────────────────────────────────
@@ -883,3 +924,4 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
