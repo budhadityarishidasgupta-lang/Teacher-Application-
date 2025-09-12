@@ -85,6 +85,53 @@ st.set_page_config(page_title="Synonym Quest â€” Admin & Student", page_icon="ðŸ
 from sqlalchemy import text
 
 def init_db():
+    # --- One-time schema + data patch for legacy 'users' table ---
+def patch_users_table():
+    # 1) Ensure missing columns exist (idempotent)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
+
+    # 2) Backfill role/is_active for existing rows
+    admin_email_lc = ADMIN_EMAIL.lower()
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE users SET role='admin' WHERE role IS NULL AND lower(email)=:e"),
+            {"e": admin_email_lc}
+        )
+        conn.execute(
+            text("UPDATE users SET role='student' WHERE role IS NULL AND lower(email)<>:e"),
+            {"e": admin_email_lc}
+        )
+        conn.execute(text("UPDATE users SET is_active=TRUE WHERE is_active IS NULL"))
+
+    # 3) Backfill password hashes where missing
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT user_id, email, COALESCE(role,'student') AS role
+                FROM users
+                WHERE password_hash IS NULL OR password_hash=''
+            """)
+        ).mappings().all()
+
+    if rows:
+        with engine.begin() as conn:
+            for r in rows:
+                raw_pwd = ADMIN_PASSWORD if r["role"] == "admin" else "Learn123!"
+                conn.execute(
+                    text("UPDATE users SET password_hash=:p WHERE user_id=:u"),
+                    {"p": bcrypt.hash(raw_pwd), "u": r["user_id"]}
+                )
+
+# --- One-time schema patch for legacy 'courses' / 'lessons' / 'words' ---
+def patch_courses_table():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE courses ADD COLUMN IF NOT EXISTS description TEXT"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE words   ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 2"))
+
     """Create all tables if they don't exist (idempotent)."""
     ddl = [
         """
@@ -1014,6 +1061,7 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
 
 
