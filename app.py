@@ -85,15 +85,101 @@ st.set_page_config(page_title="Synonym Quest — Admin & Student", page_icon="�
 from sqlalchemy import text
 
 def init_db():
-    # --- One-time schema + data patch for legacy 'users' table ---
+    """Create all tables if they don't exist (idempotent)."""
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+          user_id    SERIAL PRIMARY KEY,
+          name       TEXT NOT NULL,
+          email      TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          role       TEXT NOT NULL CHECK (role IN ('admin','student')),
+          is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS courses (
+          course_id  SERIAL PRIMARY KEY,
+          title      TEXT NOT NULL,
+          description TEXT,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lessons (
+          lesson_id  SERIAL PRIMARY KEY,
+          course_id  INTEGER NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+          title      TEXT NOT NULL,
+          sort_order INTEGER DEFAULT 0,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS words (
+          word_id    SERIAL PRIMARY KEY,
+          headword   TEXT NOT NULL,
+          synonyms   TEXT NOT NULL,
+          difficulty INTEGER DEFAULT 2
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lesson_words (
+          lesson_id  INTEGER NOT NULL REFERENCES lessons(lesson_id) ON DELETE CASCADE,
+          word_id    INTEGER NOT NULL REFERENCES words(word_id)   ON DELETE CASCADE,
+          sort_order INTEGER DEFAULT 0,
+          PRIMARY KEY (lesson_id, word_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS enrollments (
+          user_id   INTEGER NOT NULL REFERENCES users(user_id)   ON DELETE CASCADE,
+          course_id INTEGER NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+          PRIMARY KEY (user_id, course_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS attempts (
+          id         BIGSERIAL PRIMARY KEY,
+          user_id    INTEGER,
+          course_id  INTEGER,
+          lesson_id  INTEGER,
+          headword   TEXT,
+          is_correct BOOLEAN,
+          response_ms INTEGER,
+          chosen     TEXT,
+          correct_choice TEXT,
+          ts         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS word_stats (
+          user_id          INTEGER NOT NULL,
+          headword         TEXT    NOT NULL,
+          correct_streak   INTEGER DEFAULT 0,
+          total_attempts   INTEGER DEFAULT 0,
+          correct_attempts INTEGER DEFAULT 0,
+          last_seen        TIMESTAMPTZ,
+          mastered         BOOLEAN DEFAULT FALSE,
+          difficulty       INTEGER DEFAULT 2,
+          due_date         TIMESTAMPTZ,
+          PRIMARY KEY (user_id, headword)
+        );
+        """
+    ]
+    with engine.begin() as conn:
+        for q in ddl:
+            conn.execute(text(q))
+
+# --- One-time schema + data patch for legacy 'users' table ---
 def patch_users_table():
-    # 1) Ensure missing columns exist (idempotent)
+    # 1) Ensure missing columns exist (safe if they already exist)
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
 
-    # 2) Backfill role if missing (admin for ADMIN_EMAIL, student otherwise)
+    # 2) Backfill missing role/is_active
     admin_email_lc = ADMIN_EMAIL.lower()
     with engine.begin() as conn:
         conn.execute(
@@ -106,7 +192,7 @@ def patch_users_table():
         )
         conn.execute(text("UPDATE users SET is_active=TRUE WHERE is_active IS NULL"))
 
-    # 3) Backfill password hashes where missing (admin uses ADMIN_PASSWORD, students get a default)
+    # 3) Backfill password hashes where missing
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
@@ -124,7 +210,6 @@ def patch_users_table():
                     text("UPDATE users SET password_hash=:p WHERE user_id=:u"),
                     {"p": bcrypt.hash(raw_pwd), "u": r["user_id"]}
                 )
-
     # Create tables in Postgres (idempotent)
     ddl = [
         """
@@ -482,9 +567,9 @@ def gpt_feedback_examples(headword: str, correct_word: str):
                 [f"She felt {correct_word} after the good news.", f"His mood was {headword} all morning."])
 
 # ── Bootstrap ────────────────────────────────────────────────────────
-init_db()
-patch_users_table()   # << add this line
-ensure_admin()
+init_db()    # create tables
+patch_users_table()    # add any missing columns + backfill
+ensure_admin()   # make sure an admin exists
 
 # ── Auth ─────────────────────────────────────────────────────────────
 def login_form():
@@ -924,4 +1009,5 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
