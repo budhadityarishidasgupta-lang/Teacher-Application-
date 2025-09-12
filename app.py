@@ -428,37 +428,87 @@ def build_question_payload(headword: str, synonyms_str: str):
     return {"headword": headword, "choices": choices, "correct": set(correct)}
 
 def gpt_feedback_examples(headword: str, correct_word: str):
-    """Return (why, [ex1, ex2]) using GPT when available; otherwise fall back."""
-    if not (ENABLE_GPT and gpt_client):
-        why = f"'{correct_word}' is a good synonym for '{headword}' because they mean nearly the same thing."
+    """
+    Returns (why, [ex1, ex2]) with kid-friendly, spoken-English sentences.
+    Uses GPT when enabled; otherwise a simple fallback.
+    """
+    def _fallback():
+        why = f"'{correct_word}' is a good synonym for '{headword}' because they mean almost the same thing."
         return why, [
-            f"The {headword} kid felt {correct_word} all day.",
-            f"After the news, she was {correct_word}—truly {headword}!"
+            f"I felt {correct_word} when I won the game.",
+            f"Our teacher was {correct_word} about our project."
         ]
+
+    if not (ENABLE_GPT and gpt_client):
+        return _fallback()
+
     try:
         prompt = f"""
-        You are a friendly tutor for kids 7–10.
-        Word: "{headword}", correct synonym: "{correct_word}".
-        1) Give a one-sentence kid-friendly reason why "{correct_word}" fits as a synonym.
-        2) Give TWO short example sentences (<= 12 words each) using "{headword}" or "{correct_word}".
-        Reply as JSON:
-        {{"why": "...", "examples": ["...", "..."]}}
-        """
+You are a tutor for ages 7–10. Write natural, spoken-English output.
+
+HEADWORD: "{headword}"
+CORRECT SYNONYM (use this in examples): "{correct_word}"
+
+Output JSON only: {{"why": "...", "examples": ["...", "..."]}}
+
+Rules:
+- "why": 1 short sentence (≤ 16 words) in kid-friendly language explaining why "{correct_word}" matches "{headword}".
+- "examples": TWO different everyday sentences a child might say/hear (home, school, friends, play).
+- Use "{correct_word}" **exactly once** in each example. Prefer NOT to use "{headword}" unless it sounds natural.
+- 8–12 words each, simple present/past, no semicolons/dashes/quotes. Avoid rare words and odd pairings.
+- No proper names, brands, or metaphors. Keep it positive and clear.
+- Return valid JSON only. No extra text.
+"""
         resp = gpt_client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"system","content":"Be concise, friendly, and age-appropriate."},
-                      {"role":"user","content":prompt}],
-            temperature=0.4, max_tokens=180)
+            messages=[
+                {"role": "system", "content": "Be concise, clear, and age-appropriate. Return only JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=220,
+        )
+
         import json
-        data = json.loads(resp.choices[0].message.content)
-        why = (data.get("why") or "").strip() or f"'{correct_word}' is close in meaning to '{headword}'."
-        exs = [str(x).strip() for x in (data.get("examples") or []) if str(x).strip()]
-        while len(exs) < 2:
-            exs.append(f"I feel {correct_word} today.")
-        return why, exs[:2]
+        payload = json.loads(resp.choices[0].message.content)
+
+        why = (payload.get("why") or "").strip()
+        examples = [str(x).strip() for x in (payload.get("examples") or []) if str(x).strip()]
+
+        # --- light validation/sanitization ---
+        def _clean(s: str) -> str:
+            s = s.replace("—", "-").replace(";", ",").replace('"', "").replace("'", "")
+            s = " ".join(s.split())  # collapse whitespace
+            if s and s[0].islower():
+                s = s[0].upper() + s[1:]
+            if s and s[-1] not in ".!?":
+                s += "."
+            return s
+
+        ok_examples = []
+        for s in examples[:2]:
+            w = s.lower().split()
+            # must contain the correct word, avoid super short/long, and avoid using both headword+correct_word together
+            if (correct_word.lower() in w) and (7 <= len(w) <= 13) and (headword.lower() not in w):
+                ok_examples.append(_clean(s))
+        # backfill if GPT returned weak examples
+        while len(ok_examples) < 2:
+            ok_examples.append(_clean(
+                random.choice([
+                    f"I feel {correct_word} when my team wins.",
+                    f"My friend was {correct_word} after the good news.",
+                    f"The class grew {correct_word} during the fun activity.",
+                    f"Dad looked {correct_word} when he saw my drawing.",
+                ])
+            ))
+
+        if not why:
+            why = f"'{correct_word}' means nearly the same as '{headword}', so it fits here."
+
+        return why, ok_examples[:2]
+
     except Exception:
-        return (f"'{correct_word}' is close in meaning to '{headword}'.",
-                [f"She felt {correct_word} after the good news.", f"His mood was {headword} all morning."])
+        return _fallback()
 
 # Ensure a default admin exists
 ensure_admin()
@@ -879,3 +929,4 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
