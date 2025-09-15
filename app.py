@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text
 # ─────────────────────────────────────────────────────────────────────
 # Basic config
 # ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Synonym Quest — Admin & Student", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Learning English Made Easy", page_icon="📚", layout="wide")
 
 APP_DIR = Path(__file__).parent
 load_dotenv(APP_DIR / ".env", override=True)
@@ -551,7 +551,7 @@ def login_form():
 
 if "auth" not in st.session_state:
     login_form()
-    st.title("Synonym Quest — Admin & Student")
+    st.title("Learning English Made Easy")
     st.write("Sign in as **Admin** to manage students, courses and tests; or as **Student** to learn and take tests.")
     st.sidebar.header("Health")
     if st.sidebar.button("DB ping"):
@@ -929,4 +929,5 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
