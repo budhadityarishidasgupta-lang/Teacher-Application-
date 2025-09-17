@@ -453,10 +453,10 @@ Output JSON only: {{"why": "...", "examples": ["...", "..."]}}
 
 Rules:
 - "why": 1 short sentence (≤ 16 words) in kid-friendly language explaining why "{correct_word}" matches "{headword}".
-- "examples": TWO different everyday sentences a child might say/hear (home, school, friends, play).
+- "examples": Act as a english teacher teaching children age group of 7 to 11. Create TWO different sentences that is often used by english speaking people and that makes perfect gramatical sense.
 - Use "{correct_word}" **exactly once** in each example. Prefer NOT to use "{headword}" unless it sounds natural.
 - 8–12 words each, simple present/past, no semicolons/dashes/quotes. Avoid rare words and odd pairings.
-- No proper names, brands, or metaphors. Keep it positive and clear.
+- No proper names, brands, profanity, bias or metaphors. Keep it positive and clear.
 - Return valid JSON only. No extra text.
 """
         resp = gpt_client.chat.completions.create(
@@ -929,5 +929,6 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+
 
 
