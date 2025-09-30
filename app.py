@@ -1023,6 +1023,53 @@ if "auth" in st.session_state and st.session_state.get("auth", {}).get("role") =
                     _prev = st.session_state[_trail_key].pop()  # last word
                     _restore_question(_prev)
                     st.rerun()
+# ─────────────────────────────────────────────────────────────────────
+# Option A: Attempted-aware sidebar progress (append-only override)
+# Shows % Attempted until any words are Mastered; then shows % Mastered.
+# Returns (mastered_count, total_words, percent_for_sidebar)
+# ─────────────────────────────────────────────────────────────────────
+def course_progress(user_id: int, course_id: int):
+    # All unique headwords in this course
+    all_words = pd.read_sql(
+        text("""
+            SELECT w.headword
+            FROM lessons L
+            JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE L.course_id=:c
+        """),
+        con=engine, params={"c": int(course_id)}
+    )["headword"].tolist()
+    unique_words = list(set(all_words))
+    total = len(unique_words)
+    if total == 0:
+        return (0, 0, 0)
+
+    # Mastered words in this course for this user
+    mastered = pd.read_sql(
+        text("""
+            SELECT COUNT(*) AS c
+            FROM word_stats
+            WHERE user_id=:u AND mastered=TRUE AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "arr": unique_words}
+    )["c"].iloc[0]
+
+    # Attempted at least once (distinct headwords) for this course
+    attempted = pd.read_sql(
+        text("""
+            SELECT COUNT(DISTINCT headword) AS c
+            FROM attempts
+            WHERE user_id=:u AND course_id=:c AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "c": int(course_id), "arr": unique_words}
+    )["c"].iloc[0]
+
+    # Sidebar percent logic: if no mastered yet, show attempted %
+    numerator = mastered if mastered > 0 else attempted
+    percent = int(round(100 * numerator / total))
+    return (int(mastered), total, percent)
+
 
 
 
