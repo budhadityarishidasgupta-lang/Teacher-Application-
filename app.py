@@ -793,8 +793,8 @@ if ROLE == "student":
 
     if "asked_history" not in st.session_state:
         st.session_state.asked_history = []
-    m, total = mastered_count(USER_ID, lid)
-    st.progress(min(m / max(total, 1), 1.0), text=f"Mastered {m}/{total} words")
+    #m, total = mastered_count(USER_ID, lid)
+    #st.progress(min(m / max(total, 1), 1.0), text=f"Mastered {m}/{total} words")
 
     # Active question state
     new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
@@ -1023,6 +1023,7 @@ if "auth" in st.session_state and st.session_state.get("auth", {}).get("role") =
                     _prev = st.session_state[_trail_key].pop()  # last word
                     _restore_question(_prev)
                     st.rerun()
+
 
 
 
