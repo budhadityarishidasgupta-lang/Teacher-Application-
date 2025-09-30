@@ -929,6 +929,101 @@ if st.sidebar.button("DB ping"):
         st.sidebar.success(f"DB OK (result={one})")
     except Exception as e:
         st.sidebar.error(f"DB error: {e}")
+# ─────────────────────────────────────────────────────────────────────
+# Tweaks requested on 2025-09-30 (append-only patch)
+# - Custom titles for Admin/Student pages
+# - Back button for previous question
+# - Word counter: X of N completed in current lesson
+# ─────────────────────────────────────────────────────────────────────
+
+def _hide_default_h1_and_set(title_text: str):
+    # Hide the first-level Streamlit title (h1) and set our own
+    st.markdown("""
+        <style>
+        h1 {display:none;}
+        </style>
+    """, unsafe_allow_html=True)
+    st.title(title_text)
+
+# 1) Custom headline per role (post-login pages)
+if "auth" in st.session_state:
+    _role = st.session_state.get("auth", {}).get("role")
+    if _role == "admin":
+        _hide_default_h1_and_set("welcome to English Learning made easy - Teacher Console")
+    elif _role == "student":
+        _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
+
+# 2) Student-only enhancements: Back button + word counter
+if "auth" in st.session_state and st.session_state.get("auth", {}).get("role") == "student":
+    # Safety: ensure required vars exist (these are defined above in the student block)
+    _cid = locals().get("cid", None)
+    _lid = locals().get("lid", None)
+    _words_df = locals().get("words_df", pd.DataFrame())
+    _active = st.session_state.get("active_word", None)
+
+    # --- Word counter state (unique words completed in this lesson) ---
+    # We count a word as "completed" when the student has submitted an answer for it.
+    if _lid is not None:
+        _attempt_key = f"__attempted_words_{_lid}"
+        if _attempt_key not in st.session_state:
+            st.session_state[_attempt_key] = set()
+
+        # When a submission just happened (answered True) record it once per word
+        if st.session_state.get("answered") and st.session_state.get("eval"):
+            _record_flag_key = "__last_recorded_word"
+            if st.session_state.get(_record_flag_key) != st.session_state.get("active_word"):
+                st.session_state[_attempt_key].add(st.session_state.get("active_word"))
+                st.session_state[_record_flag_key] = st.session_state.get("active_word")
+
+        # Compute X of N
+        _total_words = int(_words_df.shape[0]) if isinstance(_words_df, pd.DataFrame) else 0
+        _completed_words = len(st.session_state[_attempt_key])
+        # Show a compact counter just under the page title area
+        st.caption(f"Lesson progress: **{_completed_words} / {_total_words} words completed**")
+
+    # --- Back button support ---
+    # We keep a lightweight trail of previously shown questions (by headword) to step back.
+    _trail_key = "__q_trail"
+    if _trail_key not in st.session_state:
+        st.session_state[_trail_key] = []
+
+    # Detect forward navigation (active_word changed): push previous word to trail
+    _last_seen_key = "__last_active_word"
+    _last_active = st.session_state.get(_last_seen_key)
+    if _active and _last_active and _active != _last_active:
+        # push last question onto trail
+        st.session_state[_trail_key].append(_last_active)
+    # Update last active tracker
+    if _active:
+        st.session_state[_last_seen_key] = _active
+
+    # Render a Back button (works whether the current question is answered or not)
+    def _restore_question(prev_word: str):
+        """Restore the previous question payload and reset state without logging a new attempt."""
+        if prev_word is None or _words_df.empty:
+            return
+        row_prev = _words_df[_words_df["headword"] == prev_word]
+        if row_prev.empty:
+            return
+        st.session_state.active_word = prev_word
+        st.session_state.q_started_at = time.time()
+        st.session_state.qdata = build_question_payload(prev_word, row_prev.iloc[0]["synonyms"])
+        st.session_state.grid_for_word = prev_word
+        st.session_state.grid_keys = [f"opt_{prev_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
+        st.session_state.selection = set()    # clear selections on restore to avoid stale checks
+        st.session_state.answered = False     # ensure they must submit again
+        st.session_state.eval = None
+
+    # Place the Back button below feedback area (or near the bottom otherwise)
+    with st.container():
+        c_back, _ = st.columns([1, 5])
+        with c_back:
+            if st.button("◀ Back", key="btn_back_to_prev"):
+                if st.session_state[_trail_key]:
+                    _prev = st.session_state[_trail_key].pop()  # last word
+                    _restore_question(_prev)
+                    st.rerun()
+
 
 
 
