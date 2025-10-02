@@ -921,14 +921,14 @@ if ROLE == "student" and st.session_state.get("answered") and st.session_state.g
         st.rerun()
 
 # Sidebar health
-st.sidebar.header("Health")
-if st.sidebar.button("DB ping"):
-    try:
-        with engine.connect() as conn:
-            one = conn.execute(text("SELECT 1")).scalar()
-        st.sidebar.success(f"DB OK (result={one})")
-    except Exception as e:
-        st.sidebar.error(f"DB error: {e}")
+#st.sidebar.header("Health")
+#if st.sidebar.button("DB ping"):
+ #   try:
+  #      with engine.connect() as conn:
+   #         one = conn.execute(text("SELECT 1")).scalar()
+    #    st.sidebar.success(f"DB OK (result={one})")
+    #except Exception as e:
+     #   st.sidebar.error(f"DB error: {e}")
 # ─────────────────────────────────────────────────────────────────────
 # Tweaks requested on 2025-09-30 (append-only patch)
 # - Custom titles for Admin/Student pages
@@ -1069,6 +1069,7 @@ def course_progress(user_id: int, course_id: int):
     numerator = mastered if mastered > 0 else attempted
     percent = int(round(100 * numerator / total))
     return (int(mastered), total, percent)
+
 
 
 
