@@ -604,10 +604,15 @@ def login_form():
     if auth:
         with st.sidebar.expander("Forgot password?"):
             fp_email = st.text_input("Your email", key="fp_email", value=email)
-            if st.button("Email me a reset link", key="btn_forgot_send"):
+            if st.sidebar.button("Email me a reset link", key="btn_forgot_send"):
                 base_url = os.getenv("APP_BASE_URL", "")
                 ok, msg = auth.email_password_reset(fp_email, base_url)
-                st.info(msg) if ok else st.error(msg)
+
+    # Be explicit: always render on the SIDEBAR and cast to str
+                if ok:
+                    st.sidebar.success(str(msg))
+                else:
+                    st.sidebar.error(str(msg))
 
     if st.sidebar.button("Log out", key="btn_logout"):
         st.session_state.pop("auth", None)
@@ -1215,6 +1220,7 @@ if auth and "auth" in st.session_state and st.session_state["auth"]["role"] == "
         if st.button("Reopen +365 days", key="btn_reopen_365"):
             ok, msg = auth.reopen_student(int(_sel), days=365)
             st.success(msg) if ok else st.error(msg)
+
 
 
 
