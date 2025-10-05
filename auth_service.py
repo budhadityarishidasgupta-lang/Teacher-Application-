@@ -2,12 +2,19 @@
 # Modular authentication/service layer for the Synonym app.
 # Uses existing SQLAlchemy engine; safe, idempotent schema patches.
 
+import os
+import smtplib
+import ssl
+from email.message import EmailMessage
+from urllib.parse import urlencode
+
 from datetime import datetime, timedelta
 import secrets
 from typing import Optional, Tuple, Dict
 
 from passlib.hash import bcrypt
 from sqlalchemy import text
+
 
 class AuthService:
     def __init__(self, engine):
@@ -38,7 +45,7 @@ class AuthService:
                 SET expires_at = CURRENT_TIMESTAMP + INTERVAL '365 days'
                 WHERE role = 'student' AND (expires_at IS NULL)
             """))
-            # Optionally give admins a long horizon to avoid accidental lockout
+            # Give admins a long horizon to avoid accidental lockout
             conn.execute(text("""
                 UPDATE users
                 SET expires_at = CURRENT_TIMESTAMP + INTERVAL '36500 days'
@@ -63,7 +70,6 @@ class AuthService:
         exp = user.get("expires_at")
         if exp is None:
             return False  # treated as not expired; we already backfill
-        # Rely on DB clock (UTC). Compare as naive via ISO strings if needed.
         try:
             # When coming from SQLAlchemy, exp may be a datetime already
             return exp < datetime.utcnow()
@@ -113,13 +119,14 @@ class AuthService:
 
     def request_password_reset(self, email: str, ttl_minutes: int = 60) -> Tuple[bool, str, Optional[str]]:
         """
-        Generates a one-time reset token. Stores only the hash; returns the plain token
-        so the caller can email it or display it once. Returns (ok, message, token|None).
+        Generates a one-time reset token. Stores only the hash; returns the plain token.
+        UI should NOT display the token; prefer using email_password_reset() to send it.
+        Returns (ok, message, token|None).
         """
         user = self._user_by_email(email)
         if not user:
             # For privacy, respond generically but do nothing.
-            return True, "If the email exists, a reset code has been generated.", None
+            return True, "If the email exists, a reset link has been prepared.", None
 
         token = secrets.token_urlsafe(32)
         token_hash = bcrypt.hash(token)
@@ -130,7 +137,7 @@ class AuthService:
                     reset_token_expires_at = CURRENT_TIMESTAMP + (:mins || ' minutes')::interval
                 WHERE user_id=:u
             """), {"h": token_hash, "mins": int(ttl_minutes), "u": int(user["user_id"])})
-        return True, "Password reset code generated.", token
+        return True, "Reset link prepared.", token
 
     def reset_password_with_token(self, email: str, token: str, new_password: str) -> Tuple[bool, str]:
         user = self._user_by_email(email)
@@ -144,15 +151,15 @@ class AuthService:
             """), {"u": int(user["user_id"])}).mappings().fetchone()
 
             if not row or not row["reset_token_hash"] or not row["reset_token_expires_at"]:
-                return False, "No valid reset code. Please request a new one."
+                return False, "No valid reset link. Please request a new one."
 
             # Check expiry
             if row["reset_token_expires_at"] < datetime.utcnow():
-                return False, "Reset code has expired. Please request a new one."
+                return False, "Reset link has expired. Please request a new one."
 
             # Verify token
             if not bcrypt.verify(token, row["reset_token_hash"]):
-                return False, "Invalid reset code."
+                return False, "Invalid reset link."
 
             # Update password & clear token
             conn.execute(text("""
@@ -164,6 +171,55 @@ class AuthService:
                 WHERE user_id=:u
             """), {"ph": bcrypt.hash(new_password), "u": int(user["user_id"])})
         return True, "Password has been reset."
+
+    # ─────────────────────────────────────────────────────────────────
+    # Email-based reset (no codes shown in UI)
+    # ─────────────────────────────────────────────────────────────────
+    def email_password_reset(self, email: str, app_base_url: str = None, ttl_minutes: int = 60) -> Tuple[bool, str]:
+        """
+        Generates a one-time reset token and emails a reset link to the user.
+        We do NOT return or display the token. Requires APP_BASE_URL and SMTP_* envs.
+        Returns (ok, message).
+        """
+        ok, _, token = self.request_password_reset(email, ttl_minutes)
+        if not ok:
+            return False, "Could not create reset link."
+
+        app_base_url = app_base_url or os.getenv("APP_BASE_URL", "")
+        if not app_base_url:
+            return True, "Reset link created. Set APP_BASE_URL & SMTP_* to enable emails."
+
+        # Build link: https://app...?reset_email=...&reset_token=...
+        params = urlencode({"reset_email": email, "reset_token": token})
+        link = f"{app_base_url}?{params}"
+
+        host = os.getenv("SMTP_HOST")
+        port = int(os.getenv("SMTP_PORT", "587"))
+        user = os.getenv("SMTP_USER")
+        pwd  = os.getenv("SMTP_PASS")
+        sender = os.getenv("SMTP_FROM", user or "")
+
+        if not (host and port and user and pwd and sender):
+            return True, "Reset link created. Configure SMTP_* to send emails."
+
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = "Password reset — English Learning Made Easy"
+            msg["From"] = sender
+            msg["To"] = email
+            msg.set_content(
+                f"Click to reset your password (valid {ttl_minutes} minutes):\n{link}\n\n"
+                "If you didn't request this, you can ignore this email."
+            )
+            context = ssl.create_default_context()
+            with smtplib.SMTP(host, port) as server:
+                server.starttls(context=context)
+                server.login(user, pwd)
+                server.send_message(msg)
+            return True, "Reset link emailed."
+        except Exception as e:
+            # Don’t fail hard: link exists in DB; user can request again.
+            return True, f"Reset link generated, but email delivery failed: {e}"
 
     # ─────────────────────────────────────────────────────────────────
     # Optional: lockout helpers (not strictly required, but handy)
@@ -215,7 +271,7 @@ class AuthService:
             """), {"u": int(user_id), "d": int(days)})
         return True, "Student access reopened."
 
-    # (Optional) Authenticate helper if you prefer one place to verify secrets.
+    # (Optional) One-place authentication check
     def authenticate(self, email: str, password: str) -> Tuple[bool, str, Optional[Dict]]:
         user = self._user_by_email(email)
         if not user:
@@ -225,18 +281,15 @@ class AuthService:
         if self.is_locked(user):
             return False, "Too many failed attempts. Try again later.", None
         if not bcrypt.verify(password, user.get("password_hash") or ""):
-            # Side effect: raise failed counter (best-effort, non-fatal)
             try:
                 self.mark_login_failed(user["user_id"])
             except Exception:
                 pass
             return False, "Wrong password.", None
-        # Success: clear any lock and counters
         try:
             self.mark_login_success(user["user_id"])
         except Exception:
             pass
-        # Expiry check (block only students)
         if self.is_student_expired(user) and user.get("role") == "student":
             return False, "Account expired. Ask your teacher to reopen access.", user
         return True, "OK", user
