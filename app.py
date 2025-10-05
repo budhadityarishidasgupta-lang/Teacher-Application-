@@ -514,11 +514,55 @@ Rules:
 ensure_admin()
 
 # ─────────────────────────────────────────────────────────────────────
-# Auth UI
+# Auth UI (replaces your existing login_form)
 # ─────────────────────────────────────────────────────────────────────
 def login_form():
+    # Lazy-init auth so this works even if AuthService is only defined later.
+    global auth
+    try:
+        auth  # noqa: F401
+    except NameError:
+        try:
+            from auth_service import AuthService
+            auth = AuthService(engine)
+        except Exception:
+            auth = None
+
     st.sidebar.subheader("Sign in")
-    mode = "Student" if FORCE_STUDENT else st.sidebar.radio("Login as", ["Admin","Student"], horizontal=True, key="login_mode")
+
+    # Handle password reset via URL params: ?reset_email=...&reset_token=...
+    try:
+        qp = st.query_params  # Streamlit ≥1.30
+    except Exception:
+        qp = st.experimental_get_query_params()
+
+    def _first(qv):
+        if qv is None: return None
+        if isinstance(qv, list): return qv[0]
+        return qv
+
+    reset_email = (_first(qp.get("reset_email")) or "").strip().lower()
+    reset_token = (_first(qp.get("reset_token")) or "").strip()
+
+    # If a reset link was opened, show reset form (pre-login) in the sidebar
+    if auth and reset_email and reset_token:
+        st.sidebar.markdown("**Reset your password**")
+        npw1 = st.sidebar.text_input("New password", type="password", key="rpw1")
+        npw2 = st.sidebar.text_input("Confirm new password", type="password", key="rpw2")
+        if st.sidebar.button("Set new password", key="btn_set_new_pw"):
+            if not npw1 or npw1 != npw2:
+                st.sidebar.error("Passwords must match and not be empty.")
+            else:
+                ok, msg = auth.reset_password_with_token(reset_email, reset_token, npw1)
+                if ok:
+                    st.sidebar.success("Password reset. Please log in.")
+                else:
+                    st.sidebar.error(msg)
+        st.sidebar.markdown("---")
+
+    mode = "Student" if FORCE_STUDENT else st.sidebar.radio(
+        "Login as", ["Admin", "Student"], horizontal=True, key="login_mode"
+    )
     email = st.sidebar.text_input("Email", key="login_email")
     pwd   = st.sidebar.text_input("Password", type="password", key="login_pwd")
 
@@ -531,12 +575,22 @@ def login_form():
         if not bcrypt.verify(pwd, u["password_hash"]):
             st.sidebar.error("Wrong password."); return
 
+        # Role enforcement
         if mode == "Admin" and u["role"] != "admin":
             st.sidebar.error("Not an admin account."); return
         if mode == "Student" and u["role"] != "student":
             if FORCE_STUDENT:
                 st.sidebar.error("This is a student-only link. Please use the admin URL."); return
             st.sidebar.error("Not a student account."); return
+
+        # Expiry enforcement for students
+        if auth and u["role"] == "student":
+            try:
+                if auth.is_student_expired(u):
+                    st.sidebar.error("Your account has expired. Ask your teacher to reopen access.")
+                    return
+            except Exception:
+                pass
 
         st.session_state.auth = {
             "user_id": u["user_id"],
@@ -545,6 +599,15 @@ def login_form():
             "role": u["role"],
         }
         st.sidebar.success(f"Welcome {u['name']}!")
+
+    # Pre-login "Forgot password?" (emails reset link; no codes shown)
+    if auth:
+        with st.sidebar.expander("Forgot password?"):
+            fp_email = st.text_input("Your email", key="fp_email", value=email)
+            if st.button("Email me a reset link", key="btn_forgot_send"):
+                base_url = os.getenv("APP_BASE_URL", "")
+                ok, msg = auth.email_password_reset(fp_email, base_url)
+                st.info(msg) if ok else st.error(msg)
 
     if st.sidebar.button("Log out", key="btn_logout"):
         st.session_state.pop("auth", None)
@@ -1152,6 +1215,7 @@ if auth and "auth" in st.session_state and st.session_state["auth"]["role"] == "
         if st.button("Reopen +365 days", key="btn_reopen_365"):
             ok, msg = auth.reopen_student(int(_sel), days=365)
             st.success(msg) if ok else st.error(msg)
+
 
 
 
