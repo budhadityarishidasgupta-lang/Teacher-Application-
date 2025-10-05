@@ -1069,6 +1069,90 @@ def course_progress(user_id: int, course_id: int):
     numerator = mastered if mastered > 0 else attempted
     percent = int(round(100 * numerator / total))
     return (int(mastered), total, percent)
+# ─────────────────────────────────────────────────────────────────────
+# AUTH INTEGRATION (append-only)
+# - init AuthService
+# - enforce student expiry (auto sign-out + rerun)
+# - sidebar "Account" → change password
+# - admin tool: reopen student (+365 days)
+# ─────────────────────────────────────────────────────────────────────
+try:
+    from auth_service import AuthService
+    auth = AuthService(engine)
+except Exception as _e:
+    auth = None
+    st.sidebar.warning("Auth service not initialized. Check auth_service.py")
+
+# 1) Enforce expiry AFTER any login; if expired, immediately log out and rerun
+if auth and "auth" in st.session_state and st.session_state["auth"].get("role") == "student":
+    try:
+        _u = user_by_email(st.session_state["auth"]["email"])
+        if auth.is_student_expired(_u):
+            st.sidebar.error("Your account has expired. Ask your teacher to reopen access.")
+            st.session_state.pop("auth", None)
+            st.rerun()
+    except Exception:
+        pass
+
+# 2) Post-login: Sidebar "Account" to change password (for Admin and Student)
+if auth and "auth" in st.session_state:
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Account"):
+        # Show student expiry info
+        if st.session_state["auth"]["role"] == "student":
+            try:
+                with engine.begin() as _conn:
+                    _exp = _conn.execute(text("SELECT expires_at FROM users WHERE user_id=:u"),
+                                         {"u": int(st.session_state["auth"]["user_id"])}).scalar()
+                if _exp:
+                    st.caption(f"Access until: {str(_exp)}")
+            except Exception:
+                pass
+
+        _old = st.text_input("Old password", type="password", key="acct_old_pw")
+        _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
+        _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
+        if st.button("Change password", key="acct_change_pw_btn"):
+            if _new1 != _new2:
+                st.warning("New passwords do not match.")
+            elif not _old or not _new1:
+                st.warning("Please fill all fields.")
+            else:
+                ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1)
+                st.success(msg) if ok else st.error(msg)
+
+        # Optional: also email a reset link while logged in
+        if st.button("Email me a reset link", key="acct_send_reset"):
+            base_url = os.getenv("APP_BASE_URL", "")
+            ok, msg = auth.email_password_reset(st.session_state["auth"]["email"], base_url)
+            st.info(msg) if ok else st.error(msg)
+
+# 3) Admin-only: quick tool to Reopen student (+365d)
+if auth and "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
+    st.markdown("---")
+    st.subheader("Admin: Account Tools")
+
+    _adm_df = pd.read_sql(
+        text("SELECT user_id, name, email, expires_at, is_active FROM users WHERE role='student' ORDER BY name"),
+        con=engine
+    )
+    if _adm_df.empty:
+        st.info("No students yet.")
+    else:
+        _sel = st.selectbox(
+            "Select student",
+            _adm_df["user_id"].tolist(),
+            format_func=lambda x: f"{_adm_df.loc[_adm_df['user_id']==x,'name'].values[0]}  "
+                                  f"({_adm_df.loc[_adm_df['user_id']==x,'email'].values[0]})",
+            key="admin_tools_student"
+        )
+        _row = _adm_df[_adm_df["user_id"]==_sel].iloc[0]
+        st.caption(f"Status: {'Active' if _row['is_active'] else 'Disabled'} • Expires at: {str(_row['expires_at'])}")
+
+        if st.button("Reopen +365 days", key="btn_reopen_365"):
+            ok, msg = auth.reopen_student(int(_sel), days=365)
+            st.success(msg) if ok else st.error(msg)
+
 
 
 
