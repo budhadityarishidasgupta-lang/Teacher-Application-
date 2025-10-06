@@ -1220,6 +1220,34 @@ if auth and "auth" in st.session_state and st.session_state["auth"]["role"] == "
         if st.button("Reopen +365 days", key="btn_reopen_365"):
             ok, msg = auth.reopen_student(int(_sel), days=365)
             st.success(msg) if ok else st.error(msg)
+# Admin-only: SMTP diagnostics
+if "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
+    with st.expander("Email / SMTP Diagnostics"):
+        import ssl, smtplib
+        from email.message import EmailMessage
+        host = os.getenv("SMTP_HOST"); port = os.getenv("SMTP_PORT")
+        user = os.getenv("SMTP_USER"); pwd = os.getenv("SMTP_PASS")
+        sender = os.getenv("SMTP_FROM"); base = os.getenv("APP_BASE_URL")
+        st.write(f"APP_BASE_URL: {base or '(empty)'}")
+        st.write(f"SMTP_HOST: {host or '(empty)'}")
+        st.write(f"SMTP_PORT: {port or '(empty)'}")
+        st.write(f"SMTP_USER: {user or '(empty)'}")
+        st.write(f"SMTP_FROM: {sender or '(empty)'}")
+        to_addr = st.text_input("Send a test email to:", value=(sender or ""))
+        if st.button("Send SMTP test"):
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = "SMTP test — English Learning Made Easy"
+                msg["From"] = sender; msg["To"] = to_addr
+                msg.set_content("If you see this, SMTP is working from Render.")
+                with smtplib.SMTP(host, int(port)) as s:
+                    s.starttls(context=ssl.create_default_context())
+                    s.login(user, pwd)
+                    s.send_message(msg)
+                st.success("✅ Test email sent. Check inbox and SendGrid → Email Activity.")
+            except Exception as e:
+                st.error(f"❌ SMTP error: {e}")
+
 
 
 
