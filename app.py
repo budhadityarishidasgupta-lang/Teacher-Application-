@@ -545,20 +545,21 @@ def login_form():
     reset_token = (_first(qp.get("reset_token")) or "").strip()
 
     # If a reset link was opened, show reset form (pre-login) in the sidebar
-    if auth and reset_email and reset_token:
-        st.sidebar.markdown("**Reset your password**")
-        npw1 = st.sidebar.text_input("New password", type="password", key="rpw1")
-        npw2 = st.sidebar.text_input("Confirm new password", type="password", key="rpw2")
-        if st.sidebar.button("Set new password", key="btn_set_new_pw"):
-            if not npw1 or npw1 != npw2:
-                st.sidebar.error("Passwords must match and not be empty.")
-            else:
-                ok, msg = auth.reset_password_with_token(reset_email, reset_token, npw1)
-                if ok:
-                    st.sidebar.success("Password reset. Please log in.")
-                else:
-                    st.sidebar.error(msg)
-        st.sidebar.markdown("---")
+    # --- EMAIL RESET DISABLED (URL form) ---
+    #if auth and reset_email and reset_token:
+    #    st.sidebar.markdown("**Reset your password**")
+    #    npw1 = st.sidebar.text_input("New password", type="password", key="rpw1")
+    #    npw2 = st.sidebar.text_input("Confirm new password", type="password", key="rpw2")
+    #    if st.sidebar.button("Set new password", key="btn_set_new_pw"):
+    #        if not npw1 or npw1 != npw2:
+    #            st.sidebar.error("Passwords must match and not be empty.")
+    #        else:
+    #            ok, msg = auth.reset_password_with_token(reset_email, reset_token, npw1)
+    #            if ok:
+    #                st.sidebar.success("Password reset. Please log in.")
+    #            else:
+    #                st.sidebar.error(msg)
+    #    st.sidebar.markdown("---")
 
     mode = "Student" if FORCE_STUDENT else st.sidebar.radio(
         "Login as", ["Admin", "Student"], horizontal=True, key="login_mode"
@@ -600,19 +601,20 @@ def login_form():
         }
         st.sidebar.success(f"Welcome {u['name']}!")
 
-    # Pre-login "Forgot password?" (emails reset link; no codes shown)
-    if auth:
-        with st.sidebar.expander("Forgot password?"):
-            fp_email = st.text_input("Your email", key="fp_email", value=email)
-            if st.sidebar.button("Email me a reset link", key="btn_forgot_send"):
-                base_url = os.getenv("APP_BASE_URL", "")
-                ok, msg = auth.email_password_reset(fp_email, base_url)
+   # Pre-login "Forgot password?" (emails reset link; no codes shown)
+    # --- EMAIL RESET DISABLED (pre-login) ---
+    #if auth:
+    #    with st.sidebar.expander("Forgot password?"):
+    #        fp_email = st.text_input("Your email", key="fp_email", value=email)
+    #        if st.sidebar.button("Email me a reset link", key="btn_forgot_send"):
+    #            base_url = os.getenv("APP_BASE_URL", "")
+    #            ok, msg = auth.email_password_reset(fp_email, base_url)
 
     # Be explicit: always render on the SIDEBAR and cast to str
-                if ok:
-                    st.sidebar.success(str(msg))
-                else:
-                    st.sidebar.error(str(msg))
+    #            if ok:
+    #                st.sidebar.success(str(msg))
+    #            else:
+    #                st.sidebar.error(str(msg))
 
     if st.sidebar.button("Log out", key="btn_logout"):
         st.session_state.pop("auth", None)
@@ -1190,10 +1192,11 @@ if auth and "auth" in st.session_state:
                 st.success(msg) if ok else st.error(msg)
 
         # Optional: also email a reset link while logged in
-        if st.button("Email me a reset link", key="acct_send_reset"):
-            base_url = os.getenv("APP_BASE_URL", "")
-            ok, msg = auth.email_password_reset(st.session_state["auth"]["email"], base_url)
-            st.info(msg) if ok else st.error(msg)
+        # --- EMAIL RESET DISABLED (post-login helper) ---
+        #if st.button("Email me a reset link", key="acct_send_reset"):
+        #    base_url = os.getenv("APP_BASE_URL", "")
+        #    ok, msg = auth.email_password_reset(st.session_state["auth"]["email"], base_url)
+        #    st.info(msg) if ok else st.error(msg)
 
 # 3) Admin-only: quick tool to Reopen student (+365d)
 if auth and "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
@@ -1247,6 +1250,7 @@ if "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
                 st.success("✅ Test email sent. Check inbox and SendGrid → Email Activity.")
             except Exception as e:
                 st.error(f"❌ SMTP error: {e}")
+
 
 
 
