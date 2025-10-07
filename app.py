@@ -1525,6 +1525,26 @@ def teacher_manage_ui():
                                 st.rerun()
                         except Exception as e:
                             st.error(f"Import failed: {e}")
+# --- Bulk import for entire course (append/refresh multiple lessons) ---
+with st.form("td2_course_bulk_import"):
+    st.markdown("**Bulk import entire course (multi-lesson CSV)**")
+    st.caption("CSV columns: lesson_title, headword, synonyms  (optional: sort_order)")
+    f2 = st.file_uploader("Course CSV", type=["csv"], key="td2_course_csv")
+    refresh_course = st.checkbox("Refresh matching lessons (clear words first)", value=False, key="td2_course_refresh")
+    create_missing = st.checkbox("Create missing lessons automatically", value=True, key="td2_course_create")
+    go2 = st.form_submit_button("Import course CSV")
+    if go2:
+        if f2 is None:
+            st.error("Choose a CSV file.")
+        else:
+            try:
+                df_bulk = pd.read_csv(f2)
+                n_words, n_lessons = td2_import_course_csv(int(cid_sel), df_bulk, refresh_course, create_missing)
+                td2_invalidate()
+                st.success(f"Imported {n_words} words; created {n_lessons} new lessons.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Bulk import failed: {e}")
 
     # COL 3 — Assign to students
     with c3:
@@ -1584,6 +1604,7 @@ def render_teacher_dashboard_v2():
     sub_create, sub_manage = st.tabs(["Create", "Manage"])
     with sub_create: teacher_create_ui()
     with sub_manage: teacher_manage_ui()
+
 
 
 
