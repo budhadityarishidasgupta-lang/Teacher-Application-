@@ -1250,6 +1250,341 @@ if "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
                 st.success("✅ Test email sent. Check inbox and SendGrid → Email Activity.")
             except Exception as e:
                 st.error(f"❌ SMTP error: {e}")
+# ─────────────────────────────────────────────────────────────────────
+# TEACHER UI V2 (append-only, safe to ship disabled)
+# Toggle with env var: TEACHER_UI_V2=1  (default off)
+# ─────────────────────────────────────────────────────────────────────
+import os
+
+TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
+
+# ---------- Small cached readers ----------
+@st.cache_data(ttl=10)
+def td2_get_courses():
+    return pd.read_sql(text("SELECT course_id, title, description FROM courses ORDER BY title"), con=engine)
+
+@st.cache_data(ttl=10)
+def td2_get_lessons(course_id: int):
+    return pd.read_sql(text("""
+        SELECT lesson_id, title, sort_order
+        FROM lessons WHERE course_id=:c ORDER BY sort_order, lesson_id
+    """), con=engine, params={"c": int(course_id)})
+
+@st.cache_data(ttl=10)
+def td2_get_active_students():
+    return pd.read_sql(text("""
+        SELECT user_id, name, email FROM users
+        WHERE role='student' AND is_active=TRUE
+        ORDER BY name
+    """), con=engine)
+
+@st.cache_data(ttl=10)
+def td2_get_enrollments_for_course(course_id: int):
+    return pd.read_sql(text("""
+        SELECT E.user_id, U.name, U.email
+        FROM enrollments E JOIN users U ON U.user_id=E.user_id
+        WHERE E.course_id=:c ORDER BY U.name
+    """), con=engine, params={"c": int(course_id)})
+
+def td2_invalidate():
+    st.cache_data.clear()
+
+# ---------- CREATE TAB ----------
+def teacher_create_ui():
+    st.subheader("Create")
+    c1, c2 = st.columns(2)
+
+    # New Course
+    with c1, st.form("td2_create_course"):
+        st.markdown("**New course**")
+        title = st.text_input("Title", key="td2_new_course_title")
+        desc  = st.text_area("Description", key="td2_new_course_desc")
+        if st.form_submit_button("Create course", type="primary"):
+            if title.strip():
+                with engine.begin() as conn:
+                    conn.execute(text("INSERT INTO courses(title, description) VALUES(:t,:d)"),
+                                 {"t": title.strip(), "d": desc.strip()})
+                td2_invalidate()
+                st.success("Course created.")
+                st.rerun()
+            else:
+                st.error("Title is required.")
+
+    # New Lesson
+    with c2, st.form("td2_create_lesson"):
+        st.markdown("**New lesson**")
+        dfc = td2_get_courses()
+        if dfc.empty:
+            st.info("Create a course first.")
+        else:
+            cid = st.selectbox("Course", dfc["course_id"].tolist(),
+                               format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                               key="td2_lesson_course")
+            lt  = st.text_input("Lesson title", key="td2_lesson_title")
+            so  = st.number_input("Sort order", 0, 999, 0, key="td2_lesson_sort")
+            if st.form_submit_button("Create lesson", type="primary"):
+                if lt.strip():
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO lessons(course_id, title, sort_order)
+                            VALUES(:c,:t,:o)
+                        """), {"c": int(cid), "t": lt.strip(), "o": int(so)})
+                    td2_invalidate()
+                    st.success("Lesson created.")
+                    st.rerun()
+                else:
+                    st.error("Lesson title is required.")
+
+# ---------- helpers for MANAGE ----------
+def td2_save_course_edits(df):
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(text("""
+                UPDATE courses SET title=:t, description=:d WHERE course_id=:c
+            """), {"t": str(r["title"]).strip(), "d": str(r.get("description") or "").strip(),
+                   "c": int(r["course_id"])})
+
+def td2_save_lesson_edits(course_id: int, df):
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(text("""
+                UPDATE lessons SET title=:t, sort_order=:o
+                WHERE lesson_id=:l AND course_id=:c
+            """), {"t": str(r["title"]).strip(), "o": int(r.get("sort_order") or 0),
+                   "l": int(r["lesson_id"]), "c": int(course_id)})
+
+def td2_delete_course(course_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM courses WHERE course_id=:c"), {"c": int(course_id)})
+
+def td2_delete_lesson(lesson_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM lessons WHERE lesson_id=:l"), {"l": int(lesson_id)})
+
+def td2_import_words_csv(lesson_id: int, df_csv: pd.DataFrame, replace: bool):
+    # Replace: clear links
+    with engine.begin() as conn:
+        if replace:
+            conn.execute(text("DELETE FROM lesson_words WHERE lesson_id=:l"), {"l": int(lesson_id)})
+
+        n = 0
+        for _, r in df_csv.iterrows():
+            hw = str(r.get("headword") or "").strip()
+            syns = str(r.get("synonyms") or "").strip()
+            if not hw or not syns:
+                continue
+            syn_list = [s.strip() for s in syns.split(",") if s.strip()]
+            diff = 1 if (len(hw) <= 6 and len(syn_list) <= 3) else (2 if len(hw) <= 8 and len(syn_list) <= 5 else 3)
+
+            wid = conn.execute(text("""
+                INSERT INTO words(headword, synonyms, difficulty)
+                VALUES(:h,:s,:d)
+                ON CONFLICT DO NOTHING
+                RETURNING word_id
+            """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
+            if wid is None:
+                wid = conn.execute(text("""
+                    SELECT word_id FROM words WHERE headword=:h AND synonyms=:s
+                """), {"h": hw, "s": ", ".join(syn_list)}).scalar()
+                if wid is None:
+                    continue  # safety
+
+            conn.execute(text("""
+                INSERT INTO lesson_words(lesson_id, word_id, sort_order)
+                VALUES(:l,:w,:o)
+                ON CONFLICT (lesson_id, word_id) DO NOTHING
+            """), {"l": int(lesson_id), "w": int(wid), "o": int(n)})
+            n += 1
+    return n
+
+# ---------- MANAGE TAB ----------
+def teacher_manage_ui():
+    st.subheader("Manage")
+    dfc = td2_get_courses()
+    c1, c2, c3 = st.columns([1.2, 1.4, 1.2])
+
+    # COL 1 — Courses list + inline edit + delete
+    with c1:
+        st.markdown("**Courses**")
+        if dfc.empty:
+            st.info("No courses yet.")
+        else:
+            q = st.text_input("Search", key="td2_course_q")
+            dfc_view = dfc.copy()
+            if q.strip():
+                m = dfc_view["title"].str.contains(q, case=False, na=False) | dfc_view["description"].fillna("").str.contains(q, case=False, na=False)
+                dfc_view = dfc_view[m]
+
+            edited = st.data_editor(
+                dfc_view[["course_id", "title", "description"]].reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+                key="td2_courses_editor",
+                column_config={
+                    "course_id": st.column_config.NumberColumn("ID", disabled=True),
+                    "title": st.column_config.TextColumn("Title"),
+                    "description": st.column_config.TextColumn("Description"),
+                }
+            )
+            if st.button("Save course edits", key="td2_save_courses"):
+                td2_save_course_edits(edited)
+                td2_invalidate()
+                st.success("Courses updated.")
+                st.rerun()
+
+            with st.expander("Delete a course"):
+                cid_del = st.selectbox("Course", dfc["course_id"].tolist(),
+                                       format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                                       key="td2_course_delete_sel")
+                confirm = st.text_input("Type DELETE to confirm", key="td2_course_delete_confirm")
+                if st.button("Delete course", type="secondary", key="td2_course_delete_btn"):
+                    if confirm.strip().upper() == "DELETE":
+                        td2_delete_course(cid_del)
+                        td2_invalidate()
+                        st.success("Course deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Please type DELETE to confirm.")
+
+    # COL 2 — Lessons for selected course + upload/replace
+    with c2:
+        st.markdown("**Lessons**")
+        if dfc.empty:
+            st.info("Create a course first.")
+        else:
+            cid_sel = st.selectbox("Course", dfc["course_id"].tolist(),
+                                   format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                                   key="td2_lessons_course_sel")
+            dfl = td2_get_lessons(cid_sel)
+            if dfl.empty:
+                st.info("No lessons yet for this course.")
+            else:
+                edited_l = st.data_editor(
+                    dfl[["lesson_id", "title", "sort_order"]].reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                    key="td2_lessons_editor",
+                    column_config={
+                        "lesson_id": st.column_config.NumberColumn("ID", disabled=True),
+                        "title": st.column_config.TextColumn("Title"),
+                        "sort_order": st.column_config.NumberColumn("Order", min_value=0, step=1),
+                    }
+                )
+                if st.button("Save lesson edits", key="td2_save_lessons"):
+                    td2_save_lesson_edits(cid_sel, edited_l)
+                    td2_invalidate()
+                    st.success("Lessons updated.")
+                    st.rerun()
+
+            with st.expander("Delete a lesson"):
+                # refresh lessons list for delete
+                dfl_del = td2_get_lessons(cid_sel)
+                if dfl_del.empty:
+                    st.caption("No lessons.")
+                else:
+                    lid_del = st.selectbox("Lesson", dfl_del["lesson_id"].tolist(),
+                                           format_func=lambda x: dfl_del.loc[dfl_del["lesson_id"]==x, "title"].values[0],
+                                           key="td2_lesson_delete_sel")
+                    confirm_l = st.text_input("Type DELETE to confirm", key="td2_lesson_delete_confirm")
+                    if st.button("Delete lesson", type="secondary", key="td2_lesson_delete_btn"):
+                        if confirm_l.strip().upper() == "DELETE":
+                            td2_delete_lesson(lid_del)
+                            td2_invalidate()
+                            st.success("Lesson deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Please type DELETE to confirm.")
+
+            # Upload CSV (append/replace)
+            with st.form("td2_upload_csv_form"):
+                st.markdown("**Upload words CSV (headword,synonyms)**")
+                f = st.file_uploader("CSV file", type=["csv"], key="td2_upload_csv")
+                replace = st.checkbox("Replace existing words in this lesson", value=False, key="td2_replace_mode")
+                lid_target = None
+                dfl2 = td2_get_lessons(cid_sel)
+                if not dfl2.empty:
+                    lid_target = st.selectbox("Target lesson", dfl2["lesson_id"].tolist(),
+                                              format_func=lambda x: dfl2.loc[dfl2["lesson_id"]==x, "title"].values[0],
+                                              key="td2_upload_lesson_sel")
+                submit = st.form_submit_button("Import words")
+                if submit:
+                    if f is None or lid_target is None:
+                        st.error("Please choose a CSV file and a lesson.")
+                    else:
+                        try:
+                            df_csv = pd.read_csv(f)
+                            ok_cols = set([c.lower().strip() for c in df_csv.columns])
+                            if not {"headword","synonyms"}.issubset(ok_cols):
+                                st.error("CSV must have columns: headword, synonyms")
+                            else:
+                                # normalize column names
+                                df_csv.columns = [c.lower().strip() for c in df_csv.columns]
+                                n = td2_import_words_csv(int(lid_target), df_csv, replace)
+                                td2_invalidate()
+                                st.success(f"Imported {n} words.")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Import failed: {e}")
+
+    # COL 3 — Assign to students
+    with c3:
+        st.markdown("**Assign to students**")
+        if dfc.empty:
+            st.info("Create a course first.")
+            return
+        cid_assign = st.selectbox("Course", dfc["course_id"].tolist(),
+                                  format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                                  key="td2_assign_course_sel")
+        df_students = td2_get_active_students()
+        df_enrolled = td2_get_enrollments_for_course(cid_assign)
+
+        enrolled_ids = set(df_enrolled["user_id"].tolist())
+        choices = df_students[~df_students["user_id"].isin(enrolled_ids)]
+
+        add_ids = st.multiselect(
+            "Add students",
+            choices["user_id"].tolist(),
+            format_func=lambda x: f"{choices.loc[choices['user_id']==x,'name'].values[0]} "
+                                  f"({choices.loc[choices['user_id']==x,'email'].values[0]})",
+            key="td2_assign_add"
+        )
+        if st.button("Enroll selected", key="td2_assign_add_btn"):
+            with engine.begin() as conn:
+                for sid in add_ids:
+                    conn.execute(text("""
+                        INSERT INTO enrollments(user_id,course_id)
+                        VALUES(:u,:c) ON CONFLICT (user_id,course_id) DO NOTHING
+                    """), {"u": int(sid), "c": int(cid_assign)})
+            td2_invalidate()
+            st.success("Enrolled.")
+            st.rerun()
+
+        st.markdown("**Currently enrolled**")
+        if df_enrolled.empty:
+            st.caption("None yet.")
+        else:
+            to_remove = st.multiselect(
+                "Remove students",
+                df_enrolled["user_id"].tolist(),
+                format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id']==x,'name'].values[0]} "
+                                      f"({df_enrolled.loc[df_enrolled['user_id']==x,'email'].values[0]})",
+                key="td2_assign_remove"
+            )
+            if st.button("Remove selected", key="td2_assign_remove_btn"):
+                with engine.begin() as conn:
+                    for sid in to_remove:
+                        conn.execute(text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
+                                     {"u": int(sid), "c": int(cid_assign)})
+                td2_invalidate()
+                st.success("Removed.")
+                st.rerun()
+
+# ---------- ACTIVATION HOOK ----------
+def render_teacher_dashboard_v2():
+    sub_create, sub_manage = st.tabs(["Create", "Manage"])
+    with sub_create: teacher_create_ui()
+    with sub_manage: teacher_manage_ui()
+
 
 
 
