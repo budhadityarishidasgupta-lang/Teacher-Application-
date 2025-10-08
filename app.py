@@ -11,13 +11,18 @@ from passlib.hash import bcrypt
 from sqlalchemy import create_engine, text
 
 import streamlit as st
+import builtins
 
-# Disable Streamlit help rendering globally (optional debug kill switch)
+# Disable all help renderers (prevents the login_page methods panel)
 try:
     st.help = lambda *args, **kwargs: None
 except Exception:
     pass
 
+try:
+    builtins.help = lambda *args, **kwargs: None
+except Exception:
+    pass
     
 # ─────────────────────────────────────────────────────────────────────
 # Basic config
@@ -1429,6 +1434,7 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
