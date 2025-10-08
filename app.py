@@ -1068,19 +1068,22 @@ if auth and st.session_state["auth"]["role"] == "student":
         pass
 
 # Sidebar account tools (change password, optional email reset)
-with st.sidebar.expander("Account"):
-    _old = st.text_input("Old password", type="password", key="acct_old_pw")
-    _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
-    _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
-    if st.button("Change password", key="acct_change_pw_btn"):
-        if _new1 != _new2:
-            st.warning("New passwords do not match.")
-        elif not _old or not _new1:
-            st.warning("Please fill all fields.")
-        else:
-            ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1)
-            st.success(msg) if ok else st.error(msg)
-
+# Sidebar account tools (change password only after login)
+if auth and "auth" in st.session_state:
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Account"):
+        _old = st.text_input("Old password", type="password", key="acct_old_pw")
+        _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
+        _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
+        if st.button("Change password", key="acct_change_pw_btn"):
+            if _new1 != _new2:
+                st.warning("New passwords do not match.")
+            elif not _old or not _new1:
+                st.warning("Please fill all fields.")
+            else:
+                ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1)
+                st.success(msg) if ok else st.error(msg)
+#-----------------------------------------------------------------------------------------------------
 # Admin-only: reopen student (+365 days)
 if auth and st.session_state["auth"]["role"] == "admin":
     st.markdown("---")
@@ -1134,27 +1137,54 @@ if st.session_state["auth"]["role"] == "admin":
                 st.error(f"❌ SMTP error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────
-# App routing by role
-# ─────────────────────────────────────────────────────────────────────
-df_row = pd.read_sql(
-    text("""
-        SELECT
-          SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
-          SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
-        FROM word_stats
-        WHERE user_id = :u AND headword = ANY(:arr)
-    """),
-    con=engine, params={"u": int(user_id), "arr": list(set(all_words))}
-)
+# Course Progress
+#---------------------------------------------------------------------
+def course_progress(user_id: int, course_id: int):
+    """
+    Attempted-aware progress for the sidebar.
+    - If the user has mastered ≥1 word, show mastered% (mastered/total).
+    - Otherwise show attempted% (attempted/total).
+    Returns: (mastered_count, total_words, percent_int)
+    """
+    all_words = pd.read_sql(
+        text("""
+            SELECT w.headword
+            FROM lessons L
+            JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE L.course_id = :c
+        """),
+        con=engine, params={"c": int(course_id)}
+    )["headword"].tolist()
 
-if df_row.empty:
-    mastered = attempted = 0
-else:
-    mastered  = int(df_row.iloc[0]["mastered_count"] or 0)
-    attempted = int(df_row.iloc[0]["attempted_count"] or 0)
+    total = len(set(all_words))
+    if total == 0:
+        return (0, 0, 0)
+
+    df_row = pd.read_sql(
+        text("""
+            SELECT
+              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
+              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
+            FROM word_stats
+            WHERE user_id = :u AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "arr": list(set(all_words))}
+    )
+
+    if df_row.empty:
+        mastered = 0
+        attempted = 0
+    else:
+        mastered  = int(df_row.iloc[0]["mastered_count"]  or 0)
+        attempted = int(df_row.iloc[0]["attempted_count"] or 0)
+
     basis = mastered if mastered > 0 else attempted
     percent = int(round(100 * min(basis, total) / total))
     return (mastered, total, percent)
+#--------------------------------------------------------------------------
+# App routing by role
+# ─────────────────────────────────────────────────────────────────────
 
 if st.session_state["auth"]["role"] == "admin":
     _hide_default_h1_and_set("welcome to English Learning made easy - Teacher Console")
@@ -1389,5 +1419,6 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
