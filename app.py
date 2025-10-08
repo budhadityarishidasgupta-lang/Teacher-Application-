@@ -979,9 +979,11 @@ def login_form():
             st.session_state.auth_service = None
     
     auth_svc = st.session_state.auth_service
-        except Exception:
-            auth = None
-
+    
+    # Optional: Add a warning if auth service isn't available
+    if not auth_svc:
+        st.sidebar.warning("Authentication service unavailable")
+    
     st.sidebar.subheader("Sign in")
 
     try:
@@ -1437,6 +1439,7 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
