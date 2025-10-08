@@ -55,6 +55,9 @@ ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@example.com").strip().lower()
 ADMIN_NAME     = os.getenv("ADMIN_NAME", "Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe!123")
 
+# Feature flags (define early!)
+TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
+
 # ─────────────────────────────────────────────────────────────────────
 # Database (Postgres via SQLAlchemy)
 # ─────────────────────────────────────────────────────────────────────
@@ -88,6 +91,7 @@ def init_db():
           password_hash TEXT NOT NULL,
           role          TEXT NOT NULL CHECK (role IN ('admin','student')),
           is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+          expires_at    TIMESTAMPTZ,
           created_at    TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
         """,
@@ -115,6 +119,9 @@ def init_db():
           synonyms   TEXT NOT NULL,
           difficulty INTEGER DEFAULT 2
         );
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS words_uniq ON words(headword, synonyms);
         """,
         """
         CREATE TABLE IF NOT EXISTS lesson_words (
@@ -166,13 +173,12 @@ def init_db():
 
 def patch_users_table():
     """Ensure legacy users table has required cols/data; backfill if needed."""
-    # Add columns if missing
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"))
 
-    # Backfill role/is_active
     admin_email_lc = ADMIN_EMAIL.lower()
     with engine.begin() as conn:
         conn.execute(text("UPDATE users SET role='admin'   WHERE role IS NULL AND lower(email)=:e"),
@@ -181,7 +187,6 @@ def patch_users_table():
                      {"e": admin_email_lc})
         conn.execute(text("UPDATE users SET is_active=TRUE WHERE is_active IS NULL"))
 
-    # Backfill password hashes where missing
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
@@ -200,7 +205,6 @@ def patch_users_table():
                 )
 
 def patch_courses_table():
-    """Ensure legacy courses/lessons/words have required columns."""
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE courses ADD COLUMN IF NOT EXISTS description TEXT"))
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0"))
@@ -231,7 +235,7 @@ def create_user(name, email, password, role):
 def user_by_email(email):
     with engine.begin() as conn:
         row = conn.execute(
-            text("""SELECT user_id,name,email,password_hash,role,is_active
+            text("""SELECT user_id,name,email,password_hash,role,is_active,expires_at
                     FROM users WHERE email=:e"""),
             {"e": email}
         ).mappings().fetchone()
@@ -373,32 +377,6 @@ def choose_next_word(user_id, course_id, lesson_id, df_words):
     pool = [w for w in candidates if w not in hist[-3:]] or candidates
     return random.choice(pool)
 
-def course_progress(user_id: int, course_id: int):
-    """Return (completed, total, percent) for a course for this user."""
-    all_words = pd.read_sql(
-        text("""
-            SELECT w.headword
-            FROM lessons L
-            JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE L.course_id=:c
-        """),
-        con=engine, params={"c": int(course_id)}
-    )["headword"].tolist()
-    total = len(set(all_words))
-    if total == 0:
-        return (0, 0, 0)
-    completed = pd.read_sql(
-        text("""
-            SELECT COUNT(*) AS c
-            FROM word_stats
-            WHERE user_id=:u AND mastered=TRUE AND headword = ANY(:arr)
-        """),
-        con=engine, params={"u": int(user_id), "arr": list(set(all_words))}
-    )["c"].iloc[0]
-    percent = int(round(100 * completed / total)) if total else 0
-    return (int(completed), total, percent)
-
 def build_question_payload(headword: str, synonyms_str: str):
     """
     Build a 6-option question:
@@ -475,10 +453,9 @@ Rules:
         why = (payload.get("why") or "").strip()
         examples = [str(x).strip() for x in (payload.get("examples") or []) if str(x).strip()]
 
-        # --- light validation/sanitization ---
         def _clean(s: str) -> str:
             s = s.replace("—", "-").replace(";", ",").replace('"', "").replace("'", "")
-            s = " ".join(s.split())  # collapse whitespace
+            s = " ".join(s.split())
             if s and s[0].islower():
                 s = s[0].upper() + s[1:]
             if s and s[-1] not in ".!?":
@@ -488,10 +465,8 @@ Rules:
         ok_examples = []
         for s in examples[:2]:
             w = s.lower().split()
-            # must contain the correct word, avoid super short/long, and avoid using both headword+correct_word together
             if (correct_word.lower() in w) and (7 <= len(w) <= 13) and (headword.lower() not in w):
                 ok_examples.append(_clean(s))
-        # backfill if GPT returned weak examples
         while len(ok_examples) < 2:
             ok_examples.append(_clean(
                 random.choice([
@@ -514,13 +489,474 @@ Rules:
 ensure_admin()
 
 # ─────────────────────────────────────────────────────────────────────
-# Auth UI (replaces your existing login_form)
+# Tweaks requested — safe helpers
+# ─────────────────────────────────────────────────────────────────────
+def _hide_default_h1_and_set(title_text: str):
+    # Hide the first-level Streamlit title (h1) and set our own
+    st.markdown("""
+        <style>
+        h1 {display:none;}
+        </style>
+    """, unsafe_allow_html=True)
+    st.title(title_text)
+
+# ─────────────────────────────────────────────────────────────────────
+# Teacher UI V2 helpers (caching + CRUD)
+# ─────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=10)
+def td2_get_courses():
+    return pd.read_sql(text("SELECT course_id, title, description FROM courses ORDER BY title"), con=engine)
+
+@st.cache_data(ttl=10)
+def td2_get_lessons(course_id: int):
+    return pd.read_sql(text("""
+        SELECT lesson_id, title, sort_order
+        FROM lessons WHERE course_id=:c ORDER BY sort_order, lesson_id
+    """), con=engine, params={"c": int(course_id)})
+
+@st.cache_data(ttl=10)
+def td2_get_active_students():
+    return pd.read_sql(text("""
+        SELECT user_id, name, email FROM users
+        WHERE role='student' AND is_active=TRUE
+        ORDER BY name
+    """), con=engine)
+
+@st.cache_data(ttl=10)
+def td2_get_enrollments_for_course(course_id: int):
+    return pd.read_sql(text("""
+        SELECT E.user_id, U.name, U.email
+        FROM enrollments E JOIN users U ON U.user_id=E.user_id
+        WHERE E.course_id=:c ORDER BY U.name
+    """), con=engine, params={"c": int(course_id)})
+
+def td2_invalidate():
+    st.cache_data.clear()
+
+def td2_save_course_edits(df):
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(text("""
+                UPDATE courses SET title=:t, description=:d WHERE course_id=:c
+            """), {"t": str(r["title"]).strip(), "d": str(r.get("description") or "").strip(),
+                   "c": int(r["course_id"])})
+
+def td2_save_lesson_edits(course_id: int, df):
+    with engine.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(text("""
+                UPDATE lessons SET title=:t, sort_order=:o
+                WHERE lesson_id=:l AND course_id=:c
+            """), {"t": str(r["title"]).strip(), "o": int(r.get("sort_order") or 0),
+                   "l": int(r["lesson_id"]), "c": int(course_id)})
+
+def td2_delete_course(course_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM courses WHERE course_id=:c"), {"c": int(course_id)})
+
+def td2_delete_lesson(lesson_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM lessons WHERE lesson_id=:l"), {"l": int(lesson_id)})
+
+def td2_import_words_csv(lesson_id: int, df_csv: pd.DataFrame, replace: bool):
+    with engine.begin() as conn:
+        if replace:
+            conn.execute(text("DELETE FROM lesson_words WHERE lesson_id=:l"), {"l": int(lesson_id)})
+
+        n = 0
+        for _, r in df_csv.iterrows():
+            hw = str(r.get("headword") or "").strip()
+            syns = str(r.get("synonyms") or "").strip()
+            if not hw or not syns:
+                continue
+            syn_list = [s.strip() for s in syns.split(",") if s.strip()]
+            diff = 1 if (len(hw) <= 6 and len(syn_list) <= 3) else (2 if len(hw) <= 8 and len(syn_list) <= 5 else 3)
+
+            wid = conn.execute(text("""
+                INSERT INTO words(headword, synonyms, difficulty)
+                VALUES(:h,:s,:d)
+                ON CONFLICT DO NOTHING
+                RETURNING word_id
+            """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
+            if wid is None:
+                wid = conn.execute(text("""
+                    SELECT word_id FROM words WHERE headword=:h AND synonyms=:s
+                """), {"h": hw, "s": ", ".join(syn_list)}).scalar()
+                if wid is None:
+                    continue
+
+            conn.execute(text("""
+                INSERT INTO lesson_words(lesson_id, word_id, sort_order)
+                VALUES(:l,:w,:o)
+                ON CONFLICT (lesson_id, word_id) DO NOTHING
+            """), {"l": int(lesson_id), "w": int(wid), "o": int(n)})
+            n += 1
+    return n
+
+def td2_import_course_csv(course_id: int, df_csv: pd.DataFrame,
+                          refresh: bool, create_missing_lessons: bool = True):
+    """
+    Bulk course import: CSV columns lesson_title, headword, synonyms[, sort_order]
+    refresh=True → clears words for lessons present in the file before importing (per-lesson refresh)
+    """
+    if df_csv is None or df_csv.empty:
+        return 0, 0
+    df = df_csv.copy()
+    df.columns = [str(c).lower().strip() for c in df.columns]
+
+    required = {"lesson_title", "headword", "synonyms"}
+    if not required.issubset(set(df.columns)):
+        raise ValueError("CSV must have columns: lesson_title, headword, synonyms (optional: sort_order)")
+
+    df["lesson_title"] = df["lesson_title"].astype(str).str.strip()
+    df["headword"]     = df["headword"].astype(str).str.strip()
+    df["synonyms"]     = df["synonyms"].astype(str).str.strip()
+    if "sort_order" not in df.columns:
+        df["sort_order"] = 0
+
+    df_less = pd.read_sql(
+        text("SELECT lesson_id, title FROM lessons WHERE course_id=:c"),
+        con=engine, params={"c": int(course_id)}
+    )
+    title_to_id = {t.strip().lower(): int(lid) for lid, t in zip(df_less["lesson_id"], df_less["title"])}
+
+    words_imported = 0
+    lessons_created = 0
+    pos_by_lid = {}
+
+    with engine.begin() as conn:
+        if refresh:
+            titles_in_file = sorted(set(df["lesson_title"].str.lower()))
+            lids_to_clear = [title_to_id.get(t) for t in titles_in_file if title_to_id.get(t) is not None]
+            for lid in lids_to_clear:
+                conn.execute(text("DELETE FROM lesson_words WHERE lesson_id=:l"), {"l": int(lid)})
+
+        for _, r in df.iterrows():
+            lt = r["lesson_title"]
+            if not lt:
+                continue
+            key = lt.lower()
+            lid = title_to_id.get(key)
+
+            if lid is None and create_missing_lessons:
+                so = int(r.get("sort_order") or 0)
+                lid = conn.execute(
+                    text("INSERT INTO lessons(course_id,title,sort_order) VALUES(:c,:t,:o) RETURNING lesson_id"),
+                    {"c": int(course_id), "t": lt, "o": so}
+                ).scalar()
+                title_to_id[key] = lid
+                lessons_created += 1
+                pos_by_lid[lid] = 0
+
+            if lid is None:
+                continue
+
+            hw, syns = r["headword"], r["synonyms"]
+            if not hw or not syns:
+                continue
+
+            syn_list = [s.strip() for s in syns.split(",") if s.strip()]
+            diff = 1 if (len(hw) <= 6 and len(syn_list) <= 3) else (2 if len(hw) <= 8 and len(syn_list) <= 5 else 3)
+
+            wid = conn.execute(text("""
+                INSERT INTO words(headword, synonyms, difficulty)
+                VALUES(:h,:s,:d)
+                ON CONFLICT DO NOTHING
+                RETURNING word_id
+            """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
+
+            if wid is None:
+                wid = conn.execute(
+                    text("SELECT word_id FROM words WHERE headword=:h AND synonyms=:s"),
+                    {"h": hw, "s": ", ".join(syn_list)}
+                ).scalar()
+                if wid is None:
+                    continue
+
+            pos_by_lid.setdefault(lid, 0)
+            conn.execute(text("""
+                INSERT INTO lesson_words(lesson_id, word_id, sort_order)
+                VALUES(:l,:w,:o)
+                ON CONFLICT (lesson_id, word_id) DO NOTHING
+            """), {"l": int(lid), "w": int(wid), "o": int(pos_by_lid[lid])})
+            pos_by_lid[lid] += 1
+            words_imported += 1
+
+    return words_imported, lessons_created
+
+# ─────────────────────────────────────────────────────────────────────
+# Teacher UI V2 — Create / Manage
+# ─────────────────────────────────────────────────────────────────────
+def teacher_create_ui():
+    st.subheader("Create")
+    c1, c2 = st.columns(2)
+
+    # New Course
+    with c1, st.form("td2_create_course"):
+        st.markdown("**New course**")
+        title = st.text_input("Title", key="td2_new_course_title")
+        desc  = st.text_area("Description", key="td2_new_course_desc")
+        if st.form_submit_button("Create course", type="primary"):
+            if title.strip():
+                with engine.begin() as conn:
+                    conn.execute(text("INSERT INTO courses(title, description) VALUES(:t,:d)"),
+                                 {"t": title.strip(), "d": desc.strip()})
+                td2_invalidate()
+                st.success("Course created.")
+                st.rerun()
+            else:
+                st.error("Title is required.")
+
+    # New Lesson
+    with c2, st.form("td2_create_lesson"):
+        st.markdown("**New lesson**")
+        dfc = td2_get_courses()
+        if dfc.empty:
+            st.info("Create a course first.")
+        else:
+            cid = st.selectbox("Course", dfc["course_id"].tolist(),
+                               format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                               key="td2_lesson_course")
+            lt  = st.text_input("Lesson title", key="td2_lesson_title")
+            so  = st.number_input("Sort order", 0, 999, 0, key="td2_lesson_sort")
+            if st.form_submit_button("Create lesson", type="primary"):
+                if lt.strip():
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO lessons(course_id, title, sort_order)
+                            VALUES(:c,:t,:o)
+                        """), {"c": int(cid), "t": lt.strip(), "o": int(so)})
+                    td2_invalidate()
+                    st.success("Lesson created.")
+                    st.rerun()
+                else:
+                    st.error("Lesson title is required.")
+
+def teacher_manage_ui():
+    st.subheader("Manage")
+    dfc = td2_get_courses()
+    c1, c2, c3 = st.columns([1.2, 1.4, 1.2])
+
+    # COL 1 — Courses list + inline edit + delete
+    with c1:
+        st.markdown("**Courses**")
+        if dfc.empty:
+            st.info("No courses yet.")
+        else:
+            q = st.text_input("Search", key="td2_course_q")
+            dfc_view = dfc.copy()
+            if q.strip():
+                m = dfc_view["title"].str.contains(q, case=False, na=False) | dfc_view["description"].fillna("").str.contains(q, case=False, na=False)
+                dfc_view = dfc_view[m]
+
+            edited = st.data_editor(
+                dfc_view[["course_id", "title", "description"]].reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+                key="td2_courses_editor",
+                column_config={
+                    "course_id": st.column_config.NumberColumn("ID", disabled=True),
+                    "title": st.column_config.TextColumn("Title"),
+                    "description": st.column_config.TextColumn("Description"),
+                }
+            )
+            if st.button("Save course edits", key="td2_save_courses"):
+                td2_save_course_edits(edited)
+                td2_invalidate()
+                st.success("Courses updated.")
+                st.rerun()
+
+            with st.expander("Delete a course"):
+                cid_del = st.selectbox("Course", dfc["course_id"].tolist(),
+                                       format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                                       key="td2_course_delete_sel")
+                confirm = st.text_input("Type DELETE to confirm", key="td2_course_delete_confirm")
+                if st.button("Delete course", type="secondary", key="td2_course_delete_btn"):
+                    if confirm.strip().upper() == "DELETE":
+                        td2_delete_course(cid_del)
+                        td2_invalidate()
+                        st.success("Course deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Please type DELETE to confirm.")
+
+    # COL 2 — Lessons for selected course + upload/replace + BULK IMPORT
+    with c2:
+        st.markdown("**Lessons**")
+        if dfc.empty:
+            st.info("Create a course first.")
+            cid_sel = None
+        else:
+            cid_sel = st.selectbox("Course", dfc["course_id"].tolist(),
+                                   format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                                   key="td2_lessons_course_sel")
+
+        if cid_sel is not None:
+            dfl = td2_get_lessons(cid_sel)
+            if dfl.empty:
+                st.info("No lessons yet for this course.")
+            else:
+                edited_l = st.data_editor(
+                    dfl[["lesson_id", "title", "sort_order"]].reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                    key="td2_lessons_editor",
+                    column_config={
+                        "lesson_id": st.column_config.NumberColumn("ID", disabled=True),
+                        "title": st.column_config.TextColumn("Title"),
+                        "sort_order": st.column_config.NumberColumn("Order", min_value=0, step=1),
+                    }
+                )
+                if st.button("Save lesson edits", key="td2_save_lessons"):
+                    td2_save_lesson_edits(cid_sel, edited_l)
+                    td2_invalidate()
+                    st.success("Lessons updated.")
+                    st.rerun()
+
+            with st.expander("Delete a lesson"):
+                dfl_del = td2_get_lessons(cid_sel)
+                if dfl_del.empty:
+                    st.caption("No lessons.")
+                else:
+                    lid_del = st.selectbox("Lesson", dfl_del["lesson_id"].tolist(),
+                                           format_func=lambda x: dfl_del.loc[dfl_del["lesson_id"]==x, "title"].values[0],
+                                           key="td2_lesson_delete_sel")
+                    confirm_l = st.text_input("Type DELETE to confirm", key="td2_lesson_delete_confirm")
+                    if st.button("Delete lesson", type="secondary", key="td2_lesson_delete_btn"):
+                        if confirm_l.strip().upper() == "DELETE":
+                            td2_delete_lesson(lid_del)
+                            td2_invalidate()
+                            st.success("Lesson deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Please type DELETE to confirm.")
+
+            # Upload CSV (append/replace) — per lesson
+            with st.form("td2_upload_csv_form_single"):
+                st.markdown("**Upload words CSV (headword,synonyms)**")
+                f = st.file_uploader("CSV file", type=["csv"], key="td2_upload_csv")
+                replace = st.checkbox("Replace existing words in this lesson", value=False, key="td2_replace_mode")
+                lid_target = None
+                dfl2 = td2_get_lessons(cid_sel) if cid_sel is not None else pd.DataFrame()
+                if not dfl2.empty:
+                    lid_target = st.selectbox("Target lesson", dfl2["lesson_id"].tolist(),
+                                              format_func=lambda x: dfl2.loc[dfl2["lesson_id"]==x, "title"].values[0],
+                                              key="td2_upload_lesson_sel")
+                submit = st.form_submit_button("Import words")
+                if submit:
+                    if f is None or lid_target is None:
+                        st.error("Please choose a CSV file and a lesson.")
+                    else:
+                        try:
+                            df_csv = pd.read_csv(f)
+                            ok_cols = set([c.lower().strip() for c in df_csv.columns])
+                            if not {"headword","synonyms"}.issubset(ok_cols):
+                                st.error("CSV must have columns: headword, synonyms")
+                            else:
+                                df_csv.columns = [c.lower().strip() for c in df_csv.columns]
+                                n = td2_import_words_csv(int(lid_target), df_csv, replace)
+                                td2_invalidate()
+                                st.success(f"Imported {n} words.")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Import failed: {e}")
+
+            # --- Bulk import for entire course (multi-lesson) ---
+            with st.form("td2_course_bulk_import"):
+                st.markdown("**Bulk import entire course (multi-lesson CSV)**")
+                st.caption("CSV columns: lesson_title, headword, synonyms  (optional: sort_order)")
+                f2 = st.file_uploader("Course CSV", type=["csv"], key="td2_course_csv")
+                refresh_course = st.checkbox("Refresh matching lessons (clear words first)", value=False, key="td2_course_refresh")
+                create_missing = st.checkbox("Create missing lessons automatically", value=True, key="td2_course_create")
+                go2 = st.form_submit_button("Import course CSV")
+                if go2:
+                    if f2 is None:
+                        st.error("Choose a CSV file.")
+                    else:
+                        try:
+                            df_bulk = pd.read_csv(f2)
+                            n_words, n_lessons = td2_import_course_csv(int(cid_sel), df_bulk, refresh_course, create_missing)
+                            td2_invalidate()
+                            st.success(f"Imported {n_words} words; created {n_lessons} new lessons.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Bulk import failed: {e}")
+
+    # COL 3 — Assign / remove students for selected course
+    with c3:
+        st.markdown("**Assign students**")
+        if dfc.empty:
+            st.info("Create a course first.")
+        else:
+            cid_assign = st.selectbox("Course", dfc["course_id"].tolist(),
+                                      format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
+                                      key="td2_assign_course_sel")
+
+            df_students = td2_get_active_students()
+            if df_students.empty:
+                st.caption("No active students.")
+            else:
+                sid_assign = st.selectbox(
+                    "Student",
+                    df_students["user_id"].tolist(),
+                    format_func=lambda x: f"{df_students.loc[df_students['user_id']==x,'name'].values[0]} "
+                                          f"({df_students.loc[df_students['user_id']==x,'email'].values[0]})",
+                    key="td2_assign_student_sel"
+                )
+                if st.button("Enroll", key="td2_assign_enroll_btn"):
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO enrollments(user_id,course_id)
+                            VALUES(:u,:c)
+                            ON CONFLICT (user_id,course_id) DO NOTHING
+                        """), {"u": int(sid_assign), "c": int(cid_assign)})
+                    td2_invalidate()
+                    st.success("Enrolled.")
+
+            st.markdown("**Currently enrolled**")
+            df_enrolled = td2_get_enrollments_for_course(cid_assign)
+            if df_enrolled.empty:
+                st.caption("None yet.")
+            else:
+                to_remove = st.multiselect(
+                    "Remove students",
+                    df_enrolled["user_id"].tolist(),
+                    format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id']==x,'name'].values[0]} "
+                                          f"({df_enrolled.loc[df_enrolled['user_id']==x,'email'].values[0]})",
+                    key="td2_assign_remove"
+                )
+                if st.button("Remove selected", key="td2_assign_remove_btn"):
+                    with engine.begin() as conn:
+                        for sid in to_remove:
+                            conn.execute(text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
+                                         {"u": int(sid), "c": int(cid_assign)})
+                    td2_invalidate()
+                    st.success("Removed.")
+                    st.rerun()
+
+def render_teacher_dashboard_v2():
+    sub_create, sub_manage = st.tabs(["Create", "Manage"])
+    with sub_create: teacher_create_ui()
+    with sub_manage: teacher_manage_ui()
+
+# ─────────────────────────────────────────────────────────────────────
+# AUTH INTEGRATION (optional / append-only)
+# ─────────────────────────────────────────────────────────────────────
+try:
+    from auth_service import AuthService
+    auth = AuthService(engine)
+except Exception as _e:
+    auth = None
+    st.sidebar.warning("Auth service not initialized. Check auth_service.py")
+
+# ─────────────────────────────────────────────────────────────────────
+# Login / Session
 # ─────────────────────────────────────────────────────────────────────
 def login_form():
     # Lazy-init auth so this works even if AuthService is only defined later.
     global auth
     try:
-        auth  # noqa: F401
+        auth  # noqa
     except NameError:
         try:
             from auth_service import AuthService
@@ -530,9 +966,8 @@ def login_form():
 
     st.sidebar.subheader("Sign in")
 
-    # Handle password reset via URL params: ?reset_email=...&reset_token=...
     try:
-        qp = st.query_params  # Streamlit ≥1.30
+        qp = st.query_params
     except Exception:
         qp = st.experimental_get_query_params()
 
@@ -541,25 +976,9 @@ def login_form():
         if isinstance(qv, list): return qv[0]
         return qv
 
-    reset_email = (_first(qp.get("reset_email")) or "").strip().lower()
-    reset_token = (_first(qp.get("reset_token")) or "").strip()
-
-    # If a reset link was opened, show reset form (pre-login) in the sidebar
-    # --- EMAIL RESET DISABLED (URL form) ---
-    #if auth and reset_email and reset_token:
-    #    st.sidebar.markdown("**Reset your password**")
-    #    npw1 = st.sidebar.text_input("New password", type="password", key="rpw1")
-    #    npw2 = st.sidebar.text_input("Confirm new password", type="password", key="rpw2")
-    #    if st.sidebar.button("Set new password", key="btn_set_new_pw"):
-    #        if not npw1 or npw1 != npw2:
-    #            st.sidebar.error("Passwords must match and not be empty.")
-    #        else:
-    #            ok, msg = auth.reset_password_with_token(reset_email, reset_token, npw1)
-    #            if ok:
-    #                st.sidebar.success("Password reset. Please log in.")
-    #            else:
-    #                st.sidebar.error(msg)
-    #    st.sidebar.markdown("---")
+    # (Reset by URL disabled for now)
+    # reset_email = (_first(qp.get("reset_email")) or "").strip().lower()
+    # reset_token = (_first(qp.get("reset_token")) or "").strip()
 
     mode = "Student" if FORCE_STUDENT else st.sidebar.radio(
         "Login as", ["Admin", "Student"], horizontal=True, key="login_mode"
@@ -601,24 +1020,14 @@ def login_form():
         }
         st.sidebar.success(f"Welcome {u['name']}!")
 
-   # Pre-login "Forgot password?" (emails reset link; no codes shown)
-    # --- EMAIL RESET DISABLED (pre-login) ---
-    #if auth:
-    #    with st.sidebar.expander("Forgot password?"):
-    #        fp_email = st.text_input("Your email", key="fp_email", value=email)
-    #        if st.sidebar.button("Email me a reset link", key="btn_forgot_send"):
-    #            base_url = os.getenv("APP_BASE_URL", "")
-    #            ok, msg = auth.email_password_reset(fp_email, base_url)
-
-    # Be explicit: always render on the SIDEBAR and cast to str
-    #            if ok:
-    #                st.sidebar.success(str(msg))
-    #            else:
-    #                st.sidebar.error(str(msg))
+    # Forgot password — email flow disabled for this release
+    # with st.sidebar.expander("Forgot password?"):
+    #     ...
 
     if st.sidebar.button("Log out", key="btn_logout"):
         st.session_state.pop("auth", None)
 
+# Gate: not logged in yet
 if "auth" not in st.session_state:
     login_form()
     st.title("Learning English Made Easy")
@@ -633,12 +1042,12 @@ if "auth" not in st.session_state:
             st.sidebar.error(f"DB error: {e}")
     st.stop()
 
+# Session basics
 ROLE   = st.session_state.auth["role"]
 USER_ID= st.session_state.auth["user_id"]
 NAME   = st.session_state.auth["name"]
 st.sidebar.caption(f"Signed in as **{NAME}** ({ROLE})")
 
-# Safe defaults for session (prevents admin crashes)
 _defaults = {
     "answered": False, "eval": None, "active_word": None, "active_lid": None,
     "q_started_at": 0.0, "selection": set(), "asked_history": [],
@@ -647,11 +1056,140 @@ for _k, _v in _defaults.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+# Enforce expiry AFTER any login (auto sign-out)
+if auth and st.session_state["auth"]["role"] == "student":
+    try:
+        _u = user_by_email(st.session_state["auth"]["email"])
+        if auth.is_student_expired(_u):
+            st.sidebar.error("Your account has expired. Ask your teacher to reopen access.")
+            st.session_state.pop("auth", None)
+            st.rerun()
+    except Exception:
+        pass
+
+# Sidebar account tools (change password, optional email reset)
+if auth and "auth" in st.session_state:
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Account"):
+        if st.session_state["auth"]["role"] == "student":
+            try:
+                with engine.begin() as _conn:
+                    _exp = _conn.execute(text("SELECT expires_at FROM users WHERE user_id=:u"),
+                                         {"u": int(st.session_state["auth"]["user_id"])}).scalar()
+                if _exp:
+                    st.caption(f"Access until: {str(_exp)}")
+            except Exception:
+                pass
+
+        _old = st.text_input("Old password", type="password", key="acct_old_pw")
+        _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
+        _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
+        if st.button("Change password", key="acct_change_pw_btn"):
+            if _new1 != _new2:
+                st.warning("New passwords do not match.")
+            elif not _old or not _new1:
+                st.warning("Please fill all fields.")
+            else:
+                ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1) if auth else (False, "Auth disabled")
+                st.success(msg) if ok else st.error(msg)
+
+# Admin-only: reopen student (+365 days)
+if auth and st.session_state["auth"]["role"] == "admin":
+    st.markdown("---")
+    st.subheader("Admin: Account Tools")
+    _adm_df = pd.read_sql(
+        text("SELECT user_id, name, email, expires_at, is_active FROM users WHERE role='student' ORDER BY name"),
+        con=engine
+    )
+    if _adm_df.empty:
+        st.info("No students yet.")
+    else:
+        _sel = st.selectbox(
+            "Select student",
+            _adm_df["user_id"].tolist(),
+            format_func=lambda x: f"{_adm_df.loc[_adm_df['user_id']==x,'name'].values[0]}  "
+                                  f"({_adm_df.loc[_adm_df['user_id']==x,'email'].values[0]})",
+            key="admin_tools_student"
+        )
+        _row = _adm_df[_adm_df["user_id"]==_sel].iloc[0]
+        st.caption(f"Status: {'Active' if _row['is_active'] else 'Disabled'} • Expires at: {str(_row['expires_at'])}")
+        if st.button("Reopen +365 days", key="btn_reopen_365"):
+            ok, msg = auth.reopen_student(int(_sel), days=365) if auth else (False, "Auth disabled")
+            st.success(msg) if ok else st.error(msg)
+
+# Optional: SMTP diagnostics (keep as-is)
+if st.session_state["auth"]["role"] == "admin":
+    with st.expander("Email / SMTP Diagnostics"):
+        import ssl, smtplib
+        from email.message import EmailMessage
+        host = os.getenv("SMTP_HOST"); port = os.getenv("SMTP_PORT")
+        user = os.getenv("SMTP_USER"); pwd = os.getenv("SMTP_PASS")
+        sender = os.getenv("SMTP_FROM"); base = os.getenv("APP_BASE_URL")
+        st.write(f"APP_BASE_URL: {base or '(empty)'}")
+        st.write(f"SMTP_HOST: {host or '(empty)'}")
+        st.write(f"SMTP_PORT: {port or '(empty)'}")
+        st.write(f"SMTP_USER: {user or '(empty)'}")
+        st.write(f"SMTP_FROM: {sender or '(empty)'}")
+        to_addr = st.text_input("Send a test email to:", value=(sender or ""))
+        if st.button("Send SMTP test"):
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = "SMTP test — English Learning Made Easy"
+                msg["From"] = sender; msg["To"] = to_addr
+                msg.set_content("If you see this, SMTP is working from Render.")
+                with smtplib.SMTP(host, int(port)) as s:
+                    s.starttls(context=ssl.create_default_context())
+                    s.login(user, pwd)
+                    s.send_message(msg)
+                st.success("✅ Test email sent. Check inbox and SendGrid → Email Activity.")
+            except Exception as e:
+                st.error(f"❌ SMTP error: {e}")
+
 # ─────────────────────────────────────────────────────────────────────
-# Admin experience
+# App routing by role
 # ─────────────────────────────────────────────────────────────────────
-if ROLE == "admin":
-    st.title("🛠️ Admin Console")
+def course_progress(user_id: int, course_id: int):
+    """
+    Attempted-aware progress for the sidebar.
+    - If the user has mastered ≥1 word, show mastered% (mastered/total).
+    - Otherwise show attempted% (attempted/total).
+    Returns: (mastered_count, total_words, percent_int)
+    """
+    all_words = pd.read_sql(
+        text("""
+            SELECT w.headword
+            FROM lessons L
+            JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE L.course_id = :c
+        """),
+        con=engine, params={"c": int(course_id)}
+    )["headword"].tolist()
+
+    total = len(set(all_words))
+    if total == 0:
+        return (0, 0, 0)
+
+    row = pd.read_sql(
+        text("""
+            SELECT
+              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
+              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
+            FROM word_stats
+            WHERE user_id = :u AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "arr": list(set(all_words))}
+    ).mappings().fetchone()
+
+    mastered  = int((row or {}).get("mastered_count")  or 0)
+    attempted = int((row or {}).get("attempted_count") or 0)
+
+    basis = mastered if mastered > 0 else attempted
+    percent = int(round(100 * min(basis, total) / total))
+    return (mastered, total, percent)
+
+if st.session_state["auth"]["role"] == "admin":
+    _hide_default_h1_and_set("welcome to English Learning made easy - Teacher Console")
     tab_admin, tab_teacher, tab_student = st.tabs(["Admin Section","Teacher Dashboard","Student Dashboard"])
 
     # Admin Section — manage student accounts
@@ -686,122 +1224,14 @@ if ROLE == "admin":
             if st.button("Apply status", key="admin_apply_status"):
                 set_user_active(sid, active=="Enable"); st.success("Updated.")
 
-    # Teacher Dashboard — courses/lessons/words/enrollments
+    # Teacher Dashboard
     with tab_teacher:
-        st.subheader("Courses")
-        with st.form("create_course"):
-            title = st.text_input("Course title", key="td_course_title")
-            desc  = st.text_area("Description", "", key="td_course_desc")
-            ok = st.form_submit_button("Create course")
-            if ok and title.strip():
-                with engine.begin() as conn:
-                    conn.execute(text("INSERT INTO courses(title,description) VALUES(:t,:d)"),
-                                 {"t": title, "d": desc})
-                st.success("Course created.")
-
-        df_courses = pd.read_sql(text("SELECT course_id,title,description FROM courses ORDER BY course_id DESC"), con=engine)
-        st.dataframe(df_courses, use_container_width=True)
-
-        st.subheader("Lessons")
-        if not df_courses.empty:
-            cid_lessons = st.selectbox(
-                "Course",
-                df_courses["course_id"].tolist(),
-                format_func=lambda x: df_courses.loc[df_courses["course_id"]==x,"title"].values[0],
-                key="td_course_for_lessons"
-            )
-            with st.form("create_lesson"):
-                lt = st.text_input("Lesson title", key="td_lesson_title")
-                order = st.number_input("Sort order", 0, 999, 0, key="td_lesson_order")
-                ok = st.form_submit_button("Create lesson")
-                if ok and lt.strip():
-                    with engine.begin() as conn:
-                        conn.execute(
-                            text("INSERT INTO lessons(course_id,title,sort_order) VALUES(:c,:t,:o)"),
-                            {"c": int(cid_lessons), "t": lt, "o": int(order)}
-                        )
-                    st.success("Lesson created.")
-
-            st.markdown("**Upload CSV of words (headword,synonyms)**")
-            f = st.file_uploader("Upload CSV", type=["csv"], key="td_upload_csv")
-            if f:
-                df_up = pd.read_csv(f)
-                st.dataframe(df_up.head(), use_container_width=True)
-
-                df_less = pd.read_sql(
-                    text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
-                    con=engine, params={"c": int(cid_lessons)}
-                )
-                if df_less.empty:
-                    st.warning("Create a lesson first.")
-                else:
-                    lid_upload = st.selectbox(
-                        "Target lesson",
-                        df_less["lesson_id"].tolist(),
-                        format_func=lambda x: df_less.loc[df_less["lesson_id"]==x,"title"].values[0],
-                        key="td_lesson_upload"
-                    )
-                    if st.button("Import words", key="td_import_words_btn"):
-                        n=0
-                        with engine.begin() as conn:
-                            for _,r in df_up.iterrows():
-                                hw = str(r["headword"]).strip()
-                                syns = str(r["synonyms"]).strip()
-                                if not hw or not syns: continue
-                                syn_list=[s.strip() for s in syns.split(",") if s.strip()]
-                                diff = 1 if (len(hw)<=6 and len(syn_list)<=3) else (2 if len(hw)<=8 and len(syn_list)<=5 else 3)
-
-                                wid = conn.execute(
-                                    text("""INSERT INTO words(headword,synonyms,difficulty)
-                                            VALUES(:h,:s,:d)
-                                            ON CONFLICT DO NOTHING
-                                            RETURNING word_id"""),
-                                    {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}
-                                ).scalar()
-                                if wid is None:
-                                    wid = conn.execute(
-                                        text("SELECT word_id FROM words WHERE headword=:h AND synonyms=:s"),
-                                        {"h": hw, "s": ", ".join(syn_list)}
-                                    ).scalar()
-
-                                conn.execute(
-                                    text("""INSERT INTO lesson_words(lesson_id,word_id,sort_order)
-                                            VALUES(:l,:w,:o)
-                                            ON CONFLICT (lesson_id,word_id) DO NOTHING"""),
-                                    {"l": int(lid_upload), "w": int(wid), "o": int(n)}
-                                )
-                                n+=1
-                        st.success(f"Imported {n} words.")
-
-        st.subheader("Assign courses to students")
-        students = pd.read_sql(text("SELECT user_id,name FROM users WHERE role='student' AND is_active=TRUE ORDER BY name"), con=engine)
-        df_courses_assign = pd.read_sql(text("SELECT course_id,title FROM courses ORDER BY title"), con=engine)
-        if students.empty or df_courses_assign.empty:
-            st.info("Create students and courses first.")
+        if TEACHER_UI_V2:
+            render_teacher_dashboard_v2()
         else:
-            sid_assign = st.selectbox(
-                "Student",
-                students["user_id"].tolist(),
-                format_func=lambda x: students.loc[students["user_id"]==x,"name"].values[0],
-                key="assign_student"
-            )
-            cid_assign = st.selectbox(
-                "Course",
-                df_courses_assign["course_id"].tolist(),
-                format_func=lambda x: df_courses_assign.loc[df_courses_assign["course_id"]==x,"title"].values[0],
-                key="assign_course"
-            )
-            if st.button("Enroll", key="assign_enroll_btn"):
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""INSERT INTO enrollments(user_id,course_id)
-                                VALUES(:u,:c)
-                                ON CONFLICT (user_id,course_id) DO NOTHING"""),
-                        {"u": int(sid_assign), "c": int(cid_assign)}
-                    )
-                st.success("Enrolled.")
+            st.info("Legacy Teacher UI is disabled in this version. Set TEACHER_UI_V2=1 to enable V2.")
 
-    # Student Dashboard — class overview
+    # Student Dashboard — admin visibility
     with tab_student:
         st.subheader("Student Overview")
         attempts = pd.read_sql(
@@ -815,11 +1245,9 @@ if ROLE == "admin":
         st.dataframe(attempts, use_container_width=True)
         st.caption("Latest attempts across students. Filter/export via table menu.")
 
-# ─────────────────────────────────────────────────────────────────────
 # Student experience
-# ─────────────────────────────────────────────────────────────────────
-if ROLE == "student":
-    st.title("🎓 Student")
+if st.session_state["auth"]["role"] == "student":
+    _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
     courses = pd.read_sql(
         text("""
             SELECT C.course_id, C.title
@@ -863,8 +1291,6 @@ if ROLE == "student":
 
     if "asked_history" not in st.session_state:
         st.session_state.asked_history = []
-    #m, total = mastered_count(USER_ID, lid)
-    #st.progress(min(m / max(total, 1), 1.0), text=f"Mastered {m}/{total} words")
 
     # Active question state
     new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
@@ -944,7 +1370,7 @@ if ROLE == "student":
             st.warning("Please **Submit** your answer first, then click **Next**.")
 
 # After Submit: show feedback + Next (outside the form), and ONLY Next advances
-if ROLE == "student" and st.session_state.get("answered") and st.session_state.get("eval"):
+if st.session_state["auth"]["role"] == "student" and st.session_state.get("answered") and st.session_state.get("eval"):
     ev = st.session_state.eval
     st.subheader(f"Word: **{st.session_state.active_word}**")
     if ev["is_correct"]:
@@ -990,631 +1416,8 @@ if ROLE == "student" and st.session_state.get("answered") and st.session_state.g
         st.session_state.eval = None
         st.rerun()
 
-# Sidebar health
-#st.sidebar.header("Health")
-#if st.sidebar.button("DB ping"):
- #   try:
-  #      with engine.connect() as conn:
-   #         one = conn.execute(text("SELECT 1")).scalar()
-    #    st.sidebar.success(f"DB OK (result={one})")
-    #except Exception as e:
-     #   st.sidebar.error(f"DB error: {e}")
 # ─────────────────────────────────────────────────────────────────────
-# Tweaks requested on 2025-09-30 (append-only patch)
-# - Custom titles for Admin/Student pages
-# - Back button for previous question
-# - Word counter: X of N completed in current lesson
+# Version footer (nice to show deployed tag)
 # ─────────────────────────────────────────────────────────────────────
-
-def _hide_default_h1_and_set(title_text: str):
-    # Hide the first-level Streamlit title (h1) and set our own
-    st.markdown("""
-        <style>
-        h1 {display:none;}
-        </style>
-    """, unsafe_allow_html=True)
-    st.title(title_text)
-
-# 1) Custom headline per role (post-login pages)
-if "auth" in st.session_state:
-    _role = st.session_state.get("auth", {}).get("role")
-    if _role == "admin":
-        _hide_default_h1_and_set("welcome to English Learning made easy - Teacher Console")
-    elif _role == "student":
-        _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
-
-# 2) Student-only enhancements: Back button + word counter
-if "auth" in st.session_state and st.session_state.get("auth", {}).get("role") == "student":
-    # Safety: ensure required vars exist (these are defined above in the student block)
-    _cid = locals().get("cid", None)
-    _lid = locals().get("lid", None)
-    _words_df = locals().get("words_df", pd.DataFrame())
-    _active = st.session_state.get("active_word", None)
-
-    # --- Word counter state (unique words completed in this lesson) ---
-    # We count a word as "completed" when the student has submitted an answer for it.
-    if _lid is not None:
-        _attempt_key = f"__attempted_words_{_lid}"
-        if _attempt_key not in st.session_state:
-            st.session_state[_attempt_key] = set()
-
-        # When a submission just happened (answered True) record it once per word
-        if st.session_state.get("answered") and st.session_state.get("eval"):
-            _record_flag_key = "__last_recorded_word"
-            if st.session_state.get(_record_flag_key) != st.session_state.get("active_word"):
-                st.session_state[_attempt_key].add(st.session_state.get("active_word"))
-                st.session_state[_record_flag_key] = st.session_state.get("active_word")
-
-        # Compute X of N
-        _total_words = int(_words_df.shape[0]) if isinstance(_words_df, pd.DataFrame) else 0
-        _completed_words = len(st.session_state[_attempt_key])
-        # Show a compact counter just under the page title area
-        st.caption(f"Lesson progress: **{_completed_words} / {_total_words} words completed**")
-
-    # --- Back button support ---
-    # We keep a lightweight trail of previously shown questions (by headword) to step back.
-    _trail_key = "__q_trail"
-    if _trail_key not in st.session_state:
-        st.session_state[_trail_key] = []
-
-    # Detect forward navigation (active_word changed): push previous word to trail
-    _last_seen_key = "__last_active_word"
-    _last_active = st.session_state.get(_last_seen_key)
-    if _active and _last_active and _active != _last_active:
-        # push last question onto trail
-        st.session_state[_trail_key].append(_last_active)
-    # Update last active tracker
-    if _active:
-        st.session_state[_last_seen_key] = _active
-
-    # Render a Back button (works whether the current question is answered or not)
-    def _restore_question(prev_word: str):
-        """Restore the previous question payload and reset state without logging a new attempt."""
-        if prev_word is None or _words_df.empty:
-            return
-        row_prev = _words_df[_words_df["headword"] == prev_word]
-        if row_prev.empty:
-            return
-        st.session_state.active_word = prev_word
-        st.session_state.q_started_at = time.time()
-        st.session_state.qdata = build_question_payload(prev_word, row_prev.iloc[0]["synonyms"])
-        st.session_state.grid_for_word = prev_word
-        st.session_state.grid_keys = [f"opt_{prev_word}_{i}" for i in range(len(st.session_state.qdata['choices']))]
-        st.session_state.selection = set()    # clear selections on restore to avoid stale checks
-        st.session_state.answered = False     # ensure they must submit again
-        st.session_state.eval = None
-
-    # Place the Back button below feedback area (or near the bottom otherwise)
-    with st.container():
-        c_back, _ = st.columns([1, 5])
-        with c_back:
-            if st.button("◀ Back", key="btn_back_to_prev"):
-                if st.session_state[_trail_key]:
-                    _prev = st.session_state[_trail_key].pop()  # last word
-                    _restore_question(_prev)
-                    st.rerun()
-# ─────────────────────────────────────────────────────────────────────
-# Option A: Attempted-aware sidebar progress (append-only override)
-# Shows % Attempted until any words are Mastered; then shows % Mastered.
-# Returns (mastered_count, total_words, percent_for_sidebar)
-# ─────────────────────────────────────────────────────────────────────
-def course_progress(user_id: int, course_id: int):
-    # All unique headwords in this course
-    all_words = pd.read_sql(
-        text("""
-            SELECT w.headword
-            FROM lessons L
-            JOIN lesson_words lw ON lw.lesson_id = L.lesson_id
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE L.course_id=:c
-        """),
-        con=engine, params={"c": int(course_id)}
-    )["headword"].tolist()
-    unique_words = list(set(all_words))
-    total = len(unique_words)
-    if total == 0:
-        return (0, 0, 0)
-
-    # Mastered words in this course for this user
-    mastered = pd.read_sql(
-        text("""
-            SELECT COUNT(*) AS c
-            FROM word_stats
-            WHERE user_id=:u AND mastered=TRUE AND headword = ANY(:arr)
-        """),
-        con=engine, params={"u": int(user_id), "arr": unique_words}
-    )["c"].iloc[0]
-
-    # Attempted at least once (distinct headwords) for this course
-    attempted = pd.read_sql(
-        text("""
-            SELECT COUNT(DISTINCT headword) AS c
-            FROM attempts
-            WHERE user_id=:u AND course_id=:c AND headword = ANY(:arr)
-        """),
-        con=engine, params={"u": int(user_id), "c": int(course_id), "arr": unique_words}
-    )["c"].iloc[0]
-
-    # Sidebar percent logic: if no mastered yet, show attempted %
-    numerator = mastered if mastered > 0 else attempted
-    percent = int(round(100 * numerator / total))
-    return (int(mastered), total, percent)
-# ─────────────────────────────────────────────────────────────────────
-# AUTH INTEGRATION (append-only)
-# - init AuthService
-# - enforce student expiry (auto sign-out + rerun)
-# - sidebar "Account" → change password
-# - admin tool: reopen student (+365 days)
-# ─────────────────────────────────────────────────────────────────────
-try:
-    from auth_service import AuthService
-    auth = AuthService(engine)
-except Exception as _e:
-    auth = None
-    st.sidebar.warning("Auth service not initialized. Check auth_service.py")
-
-# 1) Enforce expiry AFTER any login; if expired, immediately log out and rerun
-if auth and "auth" in st.session_state and st.session_state["auth"].get("role") == "student":
-    try:
-        _u = user_by_email(st.session_state["auth"]["email"])
-        if auth.is_student_expired(_u):
-            st.sidebar.error("Your account has expired. Ask your teacher to reopen access.")
-            st.session_state.pop("auth", None)
-            st.rerun()
-    except Exception:
-        pass
-
-# 2) Post-login: Sidebar "Account" to change password (for Admin and Student)
-if auth and "auth" in st.session_state:
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("Account"):
-        # Show student expiry info
-        if st.session_state["auth"]["role"] == "student":
-            try:
-                with engine.begin() as _conn:
-                    _exp = _conn.execute(text("SELECT expires_at FROM users WHERE user_id=:u"),
-                                         {"u": int(st.session_state["auth"]["user_id"])}).scalar()
-                if _exp:
-                    st.caption(f"Access until: {str(_exp)}")
-            except Exception:
-                pass
-
-        _old = st.text_input("Old password", type="password", key="acct_old_pw")
-        _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
-        _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
-        if st.button("Change password", key="acct_change_pw_btn"):
-            if _new1 != _new2:
-                st.warning("New passwords do not match.")
-            elif not _old or not _new1:
-                st.warning("Please fill all fields.")
-            else:
-                ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1)
-                st.success(msg) if ok else st.error(msg)
-
-        # Optional: also email a reset link while logged in
-        # --- EMAIL RESET DISABLED (post-login helper) ---
-        #if st.button("Email me a reset link", key="acct_send_reset"):
-        #    base_url = os.getenv("APP_BASE_URL", "")
-        #    ok, msg = auth.email_password_reset(st.session_state["auth"]["email"], base_url)
-        #    st.info(msg) if ok else st.error(msg)
-
-# 3) Admin-only: quick tool to Reopen student (+365d)
-if auth and "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
-    st.markdown("---")
-    st.subheader("Admin: Account Tools")
-
-    _adm_df = pd.read_sql(
-        text("SELECT user_id, name, email, expires_at, is_active FROM users WHERE role='student' ORDER BY name"),
-        con=engine
-    )
-    if _adm_df.empty:
-        st.info("No students yet.")
-    else:
-        _sel = st.selectbox(
-            "Select student",
-            _adm_df["user_id"].tolist(),
-            format_func=lambda x: f"{_adm_df.loc[_adm_df['user_id']==x,'name'].values[0]}  "
-                                  f"({_adm_df.loc[_adm_df['user_id']==x,'email'].values[0]})",
-            key="admin_tools_student"
-        )
-        _row = _adm_df[_adm_df["user_id"]==_sel].iloc[0]
-        st.caption(f"Status: {'Active' if _row['is_active'] else 'Disabled'} • Expires at: {str(_row['expires_at'])}")
-
-        if st.button("Reopen +365 days", key="btn_reopen_365"):
-            ok, msg = auth.reopen_student(int(_sel), days=365)
-            st.success(msg) if ok else st.error(msg)
-# Admin-only: SMTP diagnostics
-if "auth" in st.session_state and st.session_state["auth"]["role"] == "admin":
-    with st.expander("Email / SMTP Diagnostics"):
-        import ssl, smtplib
-        from email.message import EmailMessage
-        host = os.getenv("SMTP_HOST"); port = os.getenv("SMTP_PORT")
-        user = os.getenv("SMTP_USER"); pwd = os.getenv("SMTP_PASS")
-        sender = os.getenv("SMTP_FROM"); base = os.getenv("APP_BASE_URL")
-        st.write(f"APP_BASE_URL: {base or '(empty)'}")
-        st.write(f"SMTP_HOST: {host or '(empty)'}")
-        st.write(f"SMTP_PORT: {port or '(empty)'}")
-        st.write(f"SMTP_USER: {user or '(empty)'}")
-        st.write(f"SMTP_FROM: {sender or '(empty)'}")
-        to_addr = st.text_input("Send a test email to:", value=(sender or ""))
-        if st.button("Send SMTP test"):
-            try:
-                msg = EmailMessage()
-                msg["Subject"] = "SMTP test — English Learning Made Easy"
-                msg["From"] = sender; msg["To"] = to_addr
-                msg.set_content("If you see this, SMTP is working from Render.")
-                with smtplib.SMTP(host, int(port)) as s:
-                    s.starttls(context=ssl.create_default_context())
-                    s.login(user, pwd)
-                    s.send_message(msg)
-                st.success("✅ Test email sent. Check inbox and SendGrid → Email Activity.")
-            except Exception as e:
-                st.error(f"❌ SMTP error: {e}")
-# ─────────────────────────────────────────────────────────────────────
-# TEACHER UI V2 (append-only, safe to ship disabled)
-# Toggle with env var: TEACHER_UI_V2=1  (default off)
-# ─────────────────────────────────────────────────────────────────────
-import os
-
-TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
-
-# ---------- Small cached readers ----------
-@st.cache_data(ttl=10)
-def td2_get_courses():
-    return pd.read_sql(text("SELECT course_id, title, description FROM courses ORDER BY title"), con=engine)
-
-@st.cache_data(ttl=10)
-def td2_get_lessons(course_id: int):
-    return pd.read_sql(text("""
-        SELECT lesson_id, title, sort_order
-        FROM lessons WHERE course_id=:c ORDER BY sort_order, lesson_id
-    """), con=engine, params={"c": int(course_id)})
-
-@st.cache_data(ttl=10)
-def td2_get_active_students():
-    return pd.read_sql(text("""
-        SELECT user_id, name, email FROM users
-        WHERE role='student' AND is_active=TRUE
-        ORDER BY name
-    """), con=engine)
-
-@st.cache_data(ttl=10)
-def td2_get_enrollments_for_course(course_id: int):
-    return pd.read_sql(text("""
-        SELECT E.user_id, U.name, U.email
-        FROM enrollments E JOIN users U ON U.user_id=E.user_id
-        WHERE E.course_id=:c ORDER BY U.name
-    """), con=engine, params={"c": int(course_id)})
-
-def td2_invalidate():
-    st.cache_data.clear()
-
-# ---------- CREATE TAB ----------
-def teacher_create_ui():
-    st.subheader("Create")
-    c1, c2 = st.columns(2)
-
-    # New Course
-    with c1, st.form("td2_create_course"):
-        st.markdown("**New course**")
-        title = st.text_input("Title", key="td2_new_course_title")
-        desc  = st.text_area("Description", key="td2_new_course_desc")
-        if st.form_submit_button("Create course", type="primary"):
-            if title.strip():
-                with engine.begin() as conn:
-                    conn.execute(text("INSERT INTO courses(title, description) VALUES(:t,:d)"),
-                                 {"t": title.strip(), "d": desc.strip()})
-                td2_invalidate()
-                st.success("Course created.")
-                st.rerun()
-            else:
-                st.error("Title is required.")
-
-    # New Lesson
-    with c2, st.form("td2_create_lesson"):
-        st.markdown("**New lesson**")
-        dfc = td2_get_courses()
-        if dfc.empty:
-            st.info("Create a course first.")
-        else:
-            cid = st.selectbox("Course", dfc["course_id"].tolist(),
-                               format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
-                               key="td2_lesson_course")
-            lt  = st.text_input("Lesson title", key="td2_lesson_title")
-            so  = st.number_input("Sort order", 0, 999, 0, key="td2_lesson_sort")
-            if st.form_submit_button("Create lesson", type="primary"):
-                if lt.strip():
-                    with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO lessons(course_id, title, sort_order)
-                            VALUES(:c,:t,:o)
-                        """), {"c": int(cid), "t": lt.strip(), "o": int(so)})
-                    td2_invalidate()
-                    st.success("Lesson created.")
-                    st.rerun()
-                else:
-                    st.error("Lesson title is required.")
-
-# ---------- helpers for MANAGE ----------
-def td2_save_course_edits(df):
-    with engine.begin() as conn:
-        for _, r in df.iterrows():
-            conn.execute(text("""
-                UPDATE courses SET title=:t, description=:d WHERE course_id=:c
-            """), {"t": str(r["title"]).strip(), "d": str(r.get("description") or "").strip(),
-                   "c": int(r["course_id"])})
-
-def td2_save_lesson_edits(course_id: int, df):
-    with engine.begin() as conn:
-        for _, r in df.iterrows():
-            conn.execute(text("""
-                UPDATE lessons SET title=:t, sort_order=:o
-                WHERE lesson_id=:l AND course_id=:c
-            """), {"t": str(r["title"]).strip(), "o": int(r.get("sort_order") or 0),
-                   "l": int(r["lesson_id"]), "c": int(course_id)})
-
-def td2_delete_course(course_id: int):
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM courses WHERE course_id=:c"), {"c": int(course_id)})
-
-def td2_delete_lesson(lesson_id: int):
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM lessons WHERE lesson_id=:l"), {"l": int(lesson_id)})
-
-def td2_import_words_csv(lesson_id: int, df_csv: pd.DataFrame, replace: bool):
-    # Replace: clear links
-    with engine.begin() as conn:
-        if replace:
-            conn.execute(text("DELETE FROM lesson_words WHERE lesson_id=:l"), {"l": int(lesson_id)})
-
-        n = 0
-        for _, r in df_csv.iterrows():
-            hw = str(r.get("headword") or "").strip()
-            syns = str(r.get("synonyms") or "").strip()
-            if not hw or not syns:
-                continue
-            syn_list = [s.strip() for s in syns.split(",") if s.strip()]
-            diff = 1 if (len(hw) <= 6 and len(syn_list) <= 3) else (2 if len(hw) <= 8 and len(syn_list) <= 5 else 3)
-
-            wid = conn.execute(text("""
-                INSERT INTO words(headword, synonyms, difficulty)
-                VALUES(:h,:s,:d)
-                ON CONFLICT DO NOTHING
-                RETURNING word_id
-            """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
-            if wid is None:
-                wid = conn.execute(text("""
-                    SELECT word_id FROM words WHERE headword=:h AND synonyms=:s
-                """), {"h": hw, "s": ", ".join(syn_list)}).scalar()
-                if wid is None:
-                    continue  # safety
-
-            conn.execute(text("""
-                INSERT INTO lesson_words(lesson_id, word_id, sort_order)
-                VALUES(:l,:w,:o)
-                ON CONFLICT (lesson_id, word_id) DO NOTHING
-            """), {"l": int(lesson_id), "w": int(wid), "o": int(n)})
-            n += 1
-    return n
-
-# ---------- MANAGE TAB ----------
-def teacher_manage_ui():
-    st.subheader("Manage")
-    dfc = td2_get_courses()
-    c1, c2, c3 = st.columns([1.2, 1.4, 1.2])
-
-    # COL 1 — Courses list + inline edit + delete
-    with c1:
-        st.markdown("**Courses**")
-        if dfc.empty:
-            st.info("No courses yet.")
-        else:
-            q = st.text_input("Search", key="td2_course_q")
-            dfc_view = dfc.copy()
-            if q.strip():
-                m = dfc_view["title"].str.contains(q, case=False, na=False) | dfc_view["description"].fillna("").str.contains(q, case=False, na=False)
-                dfc_view = dfc_view[m]
-
-            edited = st.data_editor(
-                dfc_view[["course_id", "title", "description"]].reset_index(drop=True),
-                use_container_width=True,
-                hide_index=True,
-                key="td2_courses_editor",
-                column_config={
-                    "course_id": st.column_config.NumberColumn("ID", disabled=True),
-                    "title": st.column_config.TextColumn("Title"),
-                    "description": st.column_config.TextColumn("Description"),
-                }
-            )
-            if st.button("Save course edits", key="td2_save_courses"):
-                td2_save_course_edits(edited)
-                td2_invalidate()
-                st.success("Courses updated.")
-                st.rerun()
-
-            with st.expander("Delete a course"):
-                cid_del = st.selectbox("Course", dfc["course_id"].tolist(),
-                                       format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
-                                       key="td2_course_delete_sel")
-                confirm = st.text_input("Type DELETE to confirm", key="td2_course_delete_confirm")
-                if st.button("Delete course", type="secondary", key="td2_course_delete_btn"):
-                    if confirm.strip().upper() == "DELETE":
-                        td2_delete_course(cid_del)
-                        td2_invalidate()
-                        st.success("Course deleted.")
-                        st.rerun()
-                    else:
-                        st.error("Please type DELETE to confirm.")
-
-    # COL 2 — Lessons for selected course + upload/replace
-    with c2:
-        st.markdown("**Lessons**")
-        if dfc.empty:
-            st.info("Create a course first.")
-        else:
-            cid_sel = st.selectbox("Course", dfc["course_id"].tolist(),
-                                   format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
-                                   key="td2_lessons_course_sel")
-            dfl = td2_get_lessons(cid_sel)
-            if dfl.empty:
-                st.info("No lessons yet for this course.")
-            else:
-                edited_l = st.data_editor(
-                    dfl[["lesson_id", "title", "sort_order"]].reset_index(drop=True),
-                    use_container_width=True,
-                    hide_index=True,
-                    key="td2_lessons_editor",
-                    column_config={
-                        "lesson_id": st.column_config.NumberColumn("ID", disabled=True),
-                        "title": st.column_config.TextColumn("Title"),
-                        "sort_order": st.column_config.NumberColumn("Order", min_value=0, step=1),
-                    }
-                )
-                if st.button("Save lesson edits", key="td2_save_lessons"):
-                    td2_save_lesson_edits(cid_sel, edited_l)
-                    td2_invalidate()
-                    st.success("Lessons updated.")
-                    st.rerun()
-
-            with st.expander("Delete a lesson"):
-                # refresh lessons list for delete
-                dfl_del = td2_get_lessons(cid_sel)
-                if dfl_del.empty:
-                    st.caption("No lessons.")
-                else:
-                    lid_del = st.selectbox("Lesson", dfl_del["lesson_id"].tolist(),
-                                           format_func=lambda x: dfl_del.loc[dfl_del["lesson_id"]==x, "title"].values[0],
-                                           key="td2_lesson_delete_sel")
-                    confirm_l = st.text_input("Type DELETE to confirm", key="td2_lesson_delete_confirm")
-                    if st.button("Delete lesson", type="secondary", key="td2_lesson_delete_btn"):
-                        if confirm_l.strip().upper() == "DELETE":
-                            td2_delete_lesson(lid_del)
-                            td2_invalidate()
-                            st.success("Lesson deleted.")
-                            st.rerun()
-                        else:
-                            st.error("Please type DELETE to confirm.")
-
-            # Upload CSV (append/replace)
-            with st.form("td2_upload_csv_form"):
-                st.markdown("**Upload words CSV (headword,synonyms)**")
-                f = st.file_uploader("CSV file", type=["csv"], key="td2_upload_csv")
-                replace = st.checkbox("Replace existing words in this lesson", value=False, key="td2_replace_mode")
-                lid_target = None
-                dfl2 = td2_get_lessons(cid_sel)
-                if not dfl2.empty:
-                    lid_target = st.selectbox("Target lesson", dfl2["lesson_id"].tolist(),
-                                              format_func=lambda x: dfl2.loc[dfl2["lesson_id"]==x, "title"].values[0],
-                                              key="td2_upload_lesson_sel")
-                submit = st.form_submit_button("Import words")
-                if submit:
-                    if f is None or lid_target is None:
-                        st.error("Please choose a CSV file and a lesson.")
-                    else:
-                        try:
-                            df_csv = pd.read_csv(f)
-                            ok_cols = set([c.lower().strip() for c in df_csv.columns])
-                            if not {"headword","synonyms"}.issubset(ok_cols):
-                                st.error("CSV must have columns: headword, synonyms")
-                            else:
-                                # normalize column names
-                                df_csv.columns = [c.lower().strip() for c in df_csv.columns]
-                                n = td2_import_words_csv(int(lid_target), df_csv, replace)
-                                td2_invalidate()
-                                st.success(f"Imported {n} words.")
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"Import failed: {e}")
-# --- Bulk import for entire course (append/refresh multiple lessons) ---
-with st.form("td2_course_bulk_import"):
-    st.markdown("**Bulk import entire course (multi-lesson CSV)**")
-    st.caption("CSV columns: lesson_title, headword, synonyms  (optional: sort_order)")
-    f2 = st.file_uploader("Course CSV", type=["csv"], key="td2_course_csv")
-    refresh_course = st.checkbox("Refresh matching lessons (clear words first)", value=False, key="td2_course_refresh")
-    create_missing = st.checkbox("Create missing lessons automatically", value=True, key="td2_course_create")
-    go2 = st.form_submit_button("Import course CSV")
-    if go2:
-        if f2 is None:
-            st.error("Choose a CSV file.")
-        else:
-            try:
-                df_bulk = pd.read_csv(f2)
-                n_words, n_lessons = td2_import_course_csv(int(cid_sel), df_bulk, refresh_course, create_missing)
-                td2_invalidate()
-                st.success(f"Imported {n_words} words; created {n_lessons} new lessons.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Bulk import failed: {e}")
-
-    # COL 3 — Assign to students
-    with c3:
-        st.markdown("**Assign to students**")
-        if dfc.empty:
-            st.info("Create a course first.")
-            return
-        cid_assign = st.selectbox("Course", dfc["course_id"].tolist(),
-                                  format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
-                                  key="td2_assign_course_sel")
-        df_students = td2_get_active_students()
-        df_enrolled = td2_get_enrollments_for_course(cid_assign)
-
-        enrolled_ids = set(df_enrolled["user_id"].tolist())
-        choices = df_students[~df_students["user_id"].isin(enrolled_ids)]
-
-        add_ids = st.multiselect(
-            "Add students",
-            choices["user_id"].tolist(),
-            format_func=lambda x: f"{choices.loc[choices['user_id']==x,'name'].values[0]} "
-                                  f"({choices.loc[choices['user_id']==x,'email'].values[0]})",
-            key="td2_assign_add"
-        )
-        if st.button("Enroll selected", key="td2_assign_add_btn"):
-            with engine.begin() as conn:
-                for sid in add_ids:
-                    conn.execute(text("""
-                        INSERT INTO enrollments(user_id,course_id)
-                        VALUES(:u,:c) ON CONFLICT (user_id,course_id) DO NOTHING
-                    """), {"u": int(sid), "c": int(cid_assign)})
-            td2_invalidate()
-            st.success("Enrolled.")
-            st.rerun()
-
-        st.markdown("**Currently enrolled**")
-        if df_enrolled.empty:
-            st.caption("None yet.")
-        else:
-            to_remove = st.multiselect(
-                "Remove students",
-                df_enrolled["user_id"].tolist(),
-                format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id']==x,'name'].values[0]} "
-                                      f"({df_enrolled.loc[df_enrolled['user_id']==x,'email'].values[0]})",
-                key="td2_assign_remove"
-            )
-            if st.button("Remove selected", key="td2_assign_remove_btn"):
-                with engine.begin() as conn:
-                    for sid in to_remove:
-                        conn.execute(text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
-                                     {"u": int(sid), "c": int(cid_assign)})
-                td2_invalidate()
-                st.success("Removed.")
-                st.rerun()
-
-# ---------- ACTIVATION HOOK ----------
-def render_teacher_dashboard_v2():
-    sub_create, sub_manage = st.tabs(["Create", "Manage"])
-    with sub_create: teacher_create_ui()
-    with sub_manage: teacher_manage_ui()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+APP_VERSION = os.getenv("APP_VERSION", "dev")
+st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
