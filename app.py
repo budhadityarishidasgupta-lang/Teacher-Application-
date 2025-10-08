@@ -1068,30 +1068,18 @@ if auth and st.session_state["auth"]["role"] == "student":
         pass
 
 # Sidebar account tools (change password, optional email reset)
-if auth and "auth" in st.session_state:
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("Account"):
-        if st.session_state["auth"]["role"] == "student":
-            try:
-                with engine.begin() as _conn:
-                    _exp = _conn.execute(text("SELECT expires_at FROM users WHERE user_id=:u"),
-                                         {"u": int(st.session_state["auth"]["user_id"])}).scalar()
-                if _exp:
-                    st.caption(f"Access until: {str(_exp)}")
-            except Exception:
-                pass
-
-        _old = st.text_input("Old password", type="password", key="acct_old_pw")
-        _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
-        _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
-        if st.button("Change password", key="acct_change_pw_btn"):
-            if _new1 != _new2:
-                st.warning("New passwords do not match.")
-            elif not _old or not _new1:
-                st.warning("Please fill all fields.")
-            else:
-                ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1) if auth else (False, "Auth disabled")
-                st.success(msg) if ok else st.error(msg)
+with st.sidebar.expander("Account"):
+    _old = st.text_input("Old password", type="password", key="acct_old_pw")
+    _new1 = st.text_input("New password", type="password", key="acct_new_pw1")
+    _new2 = st.text_input("Confirm new password", type="password", key="acct_new_pw2")
+    if st.button("Change password", key="acct_change_pw_btn"):
+        if _new1 != _new2:
+            st.warning("New passwords do not match.")
+        elif not _old or not _new1:
+            st.warning("Please fill all fields.")
+        else:
+            ok, msg = auth.change_password(st.session_state["auth"]["user_id"], _old, _new1)
+            st.success(msg) if ok else st.error(msg)
 
 # Admin-only: reopen student (+365 days)
 if auth and st.session_state["auth"]["role"] == "admin":
@@ -1421,3 +1409,4 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
