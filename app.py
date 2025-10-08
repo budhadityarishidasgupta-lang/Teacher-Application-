@@ -9,6 +9,12 @@ import streamlit as st
 from dotenv import load_dotenv
 from passlib.hash import bcrypt
 from sqlalchemy import create_engine, text
+# Disable Streamlit help rendering globally (safety net)
+try:
+    import streamlit as st  # already imported above
+    st.help = lambda *args, **kwargs: None
+except Exception:
+    pass
 
 # ─────────────────────────────────────────────────────────────────────
 # Basic config
@@ -959,8 +965,8 @@ def login_form():
         auth  # noqa
     except NameError:
         try:
-            from auth_service import AuthService
-            auth = AuthService(engine)
+           # from auth_service import AuthService
+           # auth = AuthService(engine)
         except Exception:
             auth = None
 
@@ -1419,6 +1425,7 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
