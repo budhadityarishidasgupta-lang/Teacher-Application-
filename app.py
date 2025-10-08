@@ -963,15 +963,16 @@ except Exception as _e:
 # ─────────────────────────────────────────────────────────────────────
 def login_form():
     # Lazy-init auth so this works even if AuthService is only defined later.
-    global auth
+global auth
+try:
+    auth  # noqa  # just checks if 'auth' already exists
+except NameError:
     try:
-        auth  # noqa
-    except NameError:
-        try:
-           # from auth_service import AuthService
-           # auth = AuthService(engine)
-        except Exception:
-            auth = None
+        # If not defined yet, safely import and initialize it
+        from auth_service import AuthService
+        auth = AuthService(engine)
+    except Exception:
+        auth = None
 
     st.sidebar.subheader("Sign in")
 
