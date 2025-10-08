@@ -9,13 +9,14 @@ import streamlit as st
 from dotenv import load_dotenv
 from passlib.hash import bcrypt
 from sqlalchemy import create_engine, text
-# Disable Streamlit help rendering globally (safety net)
+
+# Disable Streamlit help rendering globally (optional debug kill switch)
 try:
-    import streamlit as st  # already imported above
     st.help = lambda *args, **kwargs: None
 except Exception:
+    # ignore any import issues quietly
     pass
-
+    
 # ─────────────────────────────────────────────────────────────────────
 # Basic config
 # ─────────────────────────────────────────────────────────────────────
@@ -1425,6 +1426,7 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
