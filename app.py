@@ -967,15 +967,18 @@ except Exception as _e:
 # Login / Session
 # ─────────────────────────────────────────────────────────────────────
 def login_form():
-    # Lazy-init auth so this works even if AuthService is only defined later.
-    global auth
-    try:
-        auth  # noqa  # just checks if 'auth' already exists
-    except NameError:
+    # Don't reference auth in a way that displays it
+    # Just use it internally
+    
+    # Get or create auth without triggering display
+    if 'auth_service' not in st.session_state:
         try:
-            # If not defined yet, safely import and initialize it
             from auth_service import AuthService
-            auth = AuthService(engine)
+            st.session_state.auth_service = AuthService(engine)
+        except Exception:
+            st.session_state.auth_service = None
+    
+    auth_svc = st.session_state.auth_service
         except Exception:
             auth = None
 
@@ -1434,6 +1437,7 @@ if st.session_state["auth"]["role"] == "student" and st.session_state.get("answe
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
