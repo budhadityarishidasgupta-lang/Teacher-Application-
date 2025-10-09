@@ -12,6 +12,15 @@ from sqlalchemy import create_engine, text
 
 import streamlit as st
 import builtins
+import hashlib
+
+# Guard stubs — replaced later by real definitions after bootstrap
+def lesson_progress(*args, **kwargs):
+    raise RuntimeError("lesson_progress called before helpers were defined")
+
+def get_missed_words(*args, **kwargs):
+    raise RuntimeError("get_missed_words called before helpers were defined")
+
 
 # Disable all help renderers (prevents the login_page methods panel)
 try:
@@ -230,6 +239,95 @@ patch_users_table()
 patch_courses_table()
 
 # ─────────────────────────────────────────────────────────────────────
+# Lesson helpers (canonical — must be before Student UI)
+# ─────────────────────────────────────────────────────────────────────
+def lesson_progress(user_id: int, lesson_id: int):
+    """
+    Returns (total_words, mastered_count, attempted_count) for a lesson.
+    Matches call-site unpacking: total_q, mastered_q, attempted_q = lesson_progress(...)
+    """
+    # total words in lesson
+    total_df = pd.read_sql(
+        text("""
+            SELECT COUNT(DISTINCT w.headword) AS total
+            FROM lesson_words lw
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE lw.lesson_id = :l
+        """),
+        con=engine, params={"l": int(lesson_id)}
+    )
+    total = int(total_df.iloc[0]["total"] or 0)
+    if total == 0:
+        return 0, 0, 0
+
+    # list of headwords in this lesson
+    hw_df = pd.read_sql(
+        text("""
+            SELECT DISTINCT w.headword
+            FROM lesson_words lw
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE lw.lesson_id = :l
+        """),
+        con=engine, params={"l": int(lesson_id)}
+    )
+    heads = hw_df["headword"].tolist()
+
+    # mastered & attempted for this user on these headwords
+    stats_df = pd.read_sql(
+        text("""
+            SELECT
+              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
+              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
+            FROM word_stats
+            WHERE user_id = :u AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "arr": heads}
+    )
+    mastered = int(stats_df.iloc[0]["mastered_count"] or 0)
+    attempted = int(stats_df.iloc[0]["attempted_count"] or 0)
+    return total, mastered, attempted
+
+
+def get_missed_words(user_id: int, lesson_id: int):
+    """
+    Returns a list of headwords whose latest attempt in this lesson was incorrect.
+    Falls back to words with correct_streak=0 (but attempted) if no recent wrongs.
+    """
+    latest = pd.read_sql(
+        text("""
+            WITH last AS (
+              SELECT headword, MAX(id) AS last_id
+              FROM attempts
+              WHERE user_id=:u AND lesson_id=:l
+              GROUP BY headword
+            )
+            SELECT a.headword
+            FROM attempts a
+            JOIN last ON a.id = last.last_id
+            WHERE a.is_correct = FALSE
+        """),
+        con=engine, params={"u": int(user_id), "l": int(lesson_id)}
+    )
+    missed = set(latest["headword"].tolist())
+
+    if not missed:
+        fallback = pd.read_sql(
+            text("""
+                SELECT DISTINCT w.headword
+                FROM lesson_words lw
+                JOIN words w ON w.word_id = lw.word_id
+                LEFT JOIN word_stats s ON s.user_id=:u AND s.headword = w.headword
+                WHERE lw.lesson_id = :l
+                  AND s.total_attempts > 0
+                  AND COALESCE(s.correct_streak, 0) = 0
+            """),
+            con=engine, params={"u": int(user_id), "l": int(lesson_id)}
+        )
+        missed = set(fallback["headword"].tolist())
+
+    return sorted(missed)
+
+# ─────────────────────────────────────────────────────────────────────
 # DB helpers (CRUD) — Postgres
 # ─────────────────────────────────────────────────────────────────────
 def create_user(name, email, password, role):
@@ -407,7 +505,8 @@ def build_question_payload(headword: str, synonyms_str: str):
         "ladder","ocean","camera","blanket","sandwich","rocket","helmet","garden","notebook","button"
     ]
     pool = [d for d in distractor_pool if d.lower() not in {c.lower() for c in correct}]
-    rnd = random.Random(hash(headword) % (2**32))  # stable per word
+    seed = int(hashlib.md5(headword.encode("utf-8")).hexdigest(), 16) % (2**32)
+    rnd = random.Random(seed) # stable per word across restarts
     distractors = []
     while len(distractors) < 4 and pool:
         cand = rnd.choice(pool)
@@ -1303,33 +1402,40 @@ if st.session_state["auth"]["role"] == "student":
 if st.session_state["auth"]["role"] == "student":
     lessons = pd.read_sql(
         text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
-        con=engine, params={"c": cid}
+        con=engine, params={"c": int(cid)}
     )
     if lessons.empty:
         st.info("This course has no lessons yet.")
         st.stop()
 
     l_map = dict(zip(lessons["lesson_id"], lessons["title"]))
-    lid = st.selectbox("Lesson", list(l_map.keys()), format_func=lambda x: l_map[x], key="student_lesson_select")
+    lid = st.selectbox(
+        "Lesson",
+        list(l_map.keys()),
+        format_func=lambda x: l_map[x],
+        key="student_lesson_select"
+    )
+
+    # Initialize per-lesson question counter (once per lesson)
+    if st.session_state.q_index_per_lesson.get(int(lid)) is None:
+        st.session_state.q_index_per_lesson[int(lid)] = 1
 
     # NEW: lesson-level progress and question count
     total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
     basis = mastered_q if mastered_q > 0 else attempted_q
     pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
 
-    if int(lid) not in st.session_state.q_index_per_lesson:
-        st.session_state.q_index_per_lesson[int(lid)] = 1
-
     q_now = st.session_state.q_index_per_lesson[int(lid)]
     st.markdown(
         f"**Progress:** {pct}%  ·  Mastered {mastered_q}/{total_q}  ·  **Q {q_now} / {total_q}**"
     )
-    st.progress(pct/100.0)
+    st.progress(pct / 100.0)
 
-    words_df = lesson_words(cid, lid)
+    words_df = lesson_words(int(cid), int(lid))
     if words_df.empty:
         st.info("This lesson has no words yet.")
         st.stop()
+
 
     # ensure history state (must NOT be inside the 'words_df.empty' block)
     if "asked_history" not in st.session_state:
@@ -1623,6 +1729,7 @@ def get_missed_words(user_id: int, lesson_id: int):
         missed = set(fallback["headword"].tolist())
 
     return sorted(missed)
+
 
 
 
