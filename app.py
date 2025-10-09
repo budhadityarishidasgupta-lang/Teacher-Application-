@@ -1,29 +1,30 @@
-import os, time, random, sqlite3
-from contextlib import closing
+# ─────────────────────────────────────────────────────────────────────
+# Imports & startup config
+# ─────────────────────────────────────────────────────────────────────
+import os, time, random  # (sqlite3 not needed)
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-
+import pandas as pd  # (numpy not needed unless you use it later)
 from dotenv import load_dotenv
 from passlib.hash import bcrypt
 from sqlalchemy import create_engine, text
-
 import streamlit as st
-import builtins
 
-# Disable all help renderers (prevents the login_page methods panel)
+# Optional: only if you truly want to suppress help panes
+import builtins
 try:
     st.help = lambda *args, **kwargs: None
 except Exception:
     pass
-
 try:
     builtins.help = lambda *args, **kwargs: None
 except Exception:
     pass
-    
+
+# Load .env (local dev); on Render, env vars come from dashboard
+load_dotenv()
+
 # ─────────────────────────────────────────────────────────────────────
 # Basic config
 # ─────────────────────────────────────────────────────────────────────
@@ -1481,33 +1482,40 @@ if st.session_state["auth"]["role"] == "student":
 if st.session_state["auth"]["role"] == "student":
     lessons = pd.read_sql(
         text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
-        con=engine, params={"c": cid}
+        con=engine, params={"c": int(cid)}
     )
     if lessons.empty:
         st.info("This course has no lessons yet.")
         st.stop()
 
     l_map = dict(zip(lessons["lesson_id"], lessons["title"]))
-    lid = st.selectbox("Lesson", list(l_map.keys()), format_func=lambda x: l_map[x], key="student_lesson_select")
+    lid = st.selectbox(
+        "Lesson",
+        list(l_map.keys()),
+        format_func=lambda x: l_map[x],
+        key="student_lesson_select"
+    )
+
+    # Initialize per-lesson question counter (once per lesson)
+    if st.session_state.q_index_per_lesson.get(int(lid)) is None:
+        st.session_state.q_index_per_lesson[int(lid)] = 1
 
     # NEW: lesson-level progress and question count
     total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
     basis = mastered_q if mastered_q > 0 else attempted_q
     pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
 
-    if int(lid) not in st.session_state.q_index_per_lesson:
-        st.session_state.q_index_per_lesson[int(lid)] = 1
-
     q_now = st.session_state.q_index_per_lesson[int(lid)]
     st.markdown(
         f"**Progress:** {pct}%  ·  Mastered {mastered_q}/{total_q}  ·  **Q {q_now} / {total_q}**"
     )
-    st.progress(pct/100.0)
+    st.progress(pct / 100.0)
 
-    words_df = lesson_words(cid, lid)
+    words_df = lesson_words(int(cid), int(lid))
     if words_df.empty:
         st.info("This lesson has no words yet.")
         st.stop()
+
 
     # ensure history state (must NOT be inside the 'words_df.empty' block)
     if "asked_history" not in st.session_state:
@@ -1668,6 +1676,7 @@ if st.session_state["auth"]["role"] == "student":
                 st.session_state.selection = set()
                 st.session_state.answered = False
                 st.session_state.eval = None
+                st.session_state.q_index_per_lesson[int(lid)] = st.session_state.q_index_per_lesson.get(int(lid), 0) + 1
                 st.rerun()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1703,7 +1712,7 @@ if st.session_state["auth"]["role"] == "student":
                         st.session_state.selection = set()
                         st.session_state.answered = False
                         st.session_state.eval = None
-
+                        st.session_state.q_index_per_lesson[int(lid)] = st.session_state.q_index_per_lesson.get(int(lid), 0) + 1
                         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1711,6 +1720,7 @@ if st.session_state["auth"]["role"] == "student":
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
