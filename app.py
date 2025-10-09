@@ -94,90 +94,90 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overfl
 # ─────────────────────────────────────────────────────────────────────
 # Lesson helpers (must be defined before Student UI uses them)
 # ─────────────────────────────────────────────────────────────────────
-from sqlalchemy import text as _text
+#from sqlalchemy import text as _text
 
-def lesson_progress(user_id: int, lesson_id: int):
-    """
-    Returns (total_words, mastered_count, attempted_count) for a lesson.
-    If mastered_count == 0, you can display attempted% instead.
-    """
-    total_df = pd.read_sql(
-        _text("""
-            SELECT COUNT(DISTINCT w.headword) AS total
-            FROM lesson_words lw
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE lw.lesson_id = :l
-        """),
-        con=engine, params={"l": int(lesson_id)}
-    )
-    total = int(total_df.iloc[0]["total"] or 0)
-    if total == 0:
-        return 0, 0, 0
+#def lesson_progress(user_id: int, lesson_id: int):
+#    """
+#    Returns (total_words, mastered_count, attempted_count) for a lesson.
+#    If mastered_count == 0, you can display attempted% instead.
+#    """
+#    total_df = pd.read_sql(
+#        _text("""
+#            SELECT COUNT(DISTINCT w.headword) AS total
+#            FROM lesson_words lw
+#            JOIN words w ON w.word_id = lw.word_id
+#            WHERE lw.lesson_id = :l
+#        """),
+#        con=engine, params={"l": int(lesson_id)}
+#    )
+#    total = int(total_df.iloc[0]["total"] or 0)
+#    if total == 0:
+#        return 0, 0, 0
 
-    hw_df = pd.read_sql(
-        _text("""
-            SELECT DISTINCT w.headword
-            FROM lesson_words lw
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE lw.lesson_id = :l
-        """),
-        con=engine, params={"l": int(lesson_id)}
-    )
-    heads = hw_df["headword"].tolist()
+#    hw_df = pd.read_sql(
+#        _text("""
+#            SELECT DISTINCT w.headword
+#            FROM lesson_words lw
+#            JOIN words w ON w.word_id = lw.word_id
+#            WHERE lw.lesson_id = :l
+#        """),
+#        con=engine, params={"l": int(lesson_id)}
+#    )
+#    heads = hw_df["headword"].tolist()
 
-    stats_df = pd.read_sql(
-        _text("""
-            SELECT
-              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
-              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
-            FROM word_stats
-            WHERE user_id = :u AND headword = ANY(:arr)
-        """),
-        con=engine, params={"u": int(user_id), "arr": heads}
-    )
-    mastered = int(stats_df.iloc[0]["mastered_count"] or 0)
-    attempted = int(stats_df.iloc[0]["attempted_count"] or 0)
-    return total, mastered, attempted
+#    stats_df = pd.read_sql(
+#        _text("""
+#            SELECT
+#              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
+#              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
+#            FROM word_stats
+#            WHERE user_id = :u AND headword = ANY(:arr)
+#        """),
+#        con=engine, params={"u": int(user_id), "arr": heads}
+#    )
+#    mastered = int(stats_df.iloc[0]["mastered_count"] or 0)
+#    attempted = int(stats_df.iloc[0]["attempted_count"] or 0)
+#    return total, mastered, attempted
 
 
-def get_missed_words(user_id: int, lesson_id: int):
-    """
-    Returns a list of headwords whose latest attempt in this lesson was incorrect.
-    Falls back to words with correct_streak=0 (but attempted) if no recent wrongs.
-    """
-    latest = pd.read_sql(
-        _text("""
-            WITH last AS (
-              SELECT headword, MAX(id) AS last_id
-              FROM attempts
-              WHERE user_id=:u AND lesson_id=:l
-              GROUP BY headword
-            )
-            SELECT a.headword
-            FROM attempts a
-            JOIN last ON a.id = last.last_id
-            WHERE a.is_correct = FALSE
-        """),
-        con=engine, params={"u": int(user_id), "l": int(lesson_id)}
-    )
-    missed = set(latest["headword"].tolist())
+#def get_missed_words(user_id: int, lesson_id: int):
+#    """
+#    Returns a list of headwords whose latest attempt in this lesson was incorrect.
+#    Falls back to words with correct_streak=0 (but attempted) if no recent wrongs.
+#    """
+#    latest = pd.read_sql(
+#        _text("""
+#            WITH last AS (
+#              SELECT headword, MAX(id) AS last_id
+#              FROM attempts
+#              WHERE user_id=:u AND lesson_id=:l
+#              GROUP BY headword
+#            )
+#            SELECT a.headword
+#            FROM attempts a
+#            JOIN last ON a.id = last.last_id
+#            WHERE a.is_correct = FALSE
+#        """),
+#        con=engine, params={"u": int(user_id), "l": int(lesson_id)}
+#    )
+#    missed = set(latest["headword"].tolist())
 
-    if not missed:
-        fallback = pd.read_sql(
-            _text("""
-                SELECT DISTINCT w.headword
-                FROM lesson_words lw
-                JOIN words w ON w.word_id = lw.word_id
-                LEFT JOIN word_stats s ON s.user_id=:u AND s.headword = w.headword
-                WHERE lw.lesson_id = :l
-                  AND s.total_attempts > 0
-                  AND COALESCE(s.correct_streak, 0) = 0
-            """),
-            con=engine, params={"u": int(user_id), "l": int(lesson_id)}
-        )
-        missed = set(fallback["headword"].tolist())
+ #   if not missed:
+  #      fallback = pd.read_sql(
+   #         _text("""
+    #            SELECT DISTINCT w.headword
+    #            FROM lesson_words lw
+    #            JOIN words w ON w.word_id = lw.word_id
+    #            LEFT JOIN word_stats s ON s.user_id=:u AND s.headword = w.headword
+    #            WHERE lw.lesson_id = :l
+    #              AND s.total_attempts > 0
+    #              AND COALESCE(s.correct_streak, 0) = 0
+    #        """),
+    #        con=engine, params={"u": int(user_id), "l": int(lesson_id)}
+    #    )
+    #    missed = set(fallback["headword"].tolist())
 
-    return sorted(missed)
+    # return sorted(missed)
 
 # ─────────────────────────────────────────────────────────────────────
 # Schema creation + tiny self-healing patches
@@ -316,6 +316,95 @@ def patch_courses_table():
 init_db()
 patch_users_table()
 patch_courses_table()
+
+# ─────────────────────────────────────────────────────────────────────
+# Lesson helpers (canonical)
+# ─────────────────────────────────────────────────────────────────────
+def lesson_progress(user_id: int, lesson_id: int):
+    """
+    Returns (total_words, mastered_count, attempted_count) for a lesson.
+    Matches call-site unpacking: total_q, mastered_q, attempted_q = lesson_progress(...)
+    """
+    # total words in lesson
+    total_df = pd.read_sql(
+        text("""
+            SELECT COUNT(DISTINCT w.headword) AS total
+            FROM lesson_words lw
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE lw.lesson_id = :l
+        """),
+        con=engine, params={"l": int(lesson_id)}
+    )
+    total = int(total_df.iloc[0]["total"] or 0)
+    if total == 0:
+        return 0, 0, 0
+
+    # list of headwords in this lesson
+    hw_df = pd.read_sql(
+        text("""
+            SELECT DISTINCT w.headword
+            FROM lesson_words lw
+            JOIN words w ON w.word_id = lw.word_id
+            WHERE lw.lesson_id = :l
+        """),
+        con=engine, params={"l": int(lesson_id)}
+    )
+    heads = hw_df["headword"].tolist()
+
+    # mastered & attempted for this user on these headwords
+    stats_df = pd.read_sql(
+        text("""
+            SELECT
+              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
+              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
+            FROM word_stats
+            WHERE user_id = :u AND headword = ANY(:arr)
+        """),
+        con=engine, params={"u": int(user_id), "arr": heads}
+    )
+    mastered = int(stats_df.iloc[0]["mastered_count"] or 0)
+    attempted = int(stats_df.iloc[0]["attempted_count"] or 0)
+    return total, mastered, attempted
+
+
+def get_missed_words(user_id: int, lesson_id: int):
+    """
+    Returns a list of headwords whose latest attempt in this lesson was incorrect.
+    Falls back to words with correct_streak=0 (but attempted) if no recent wrongs.
+    """
+    latest = pd.read_sql(
+        text("""
+            WITH last AS (
+              SELECT headword, MAX(id) AS last_id
+              FROM attempts
+              WHERE user_id=:u AND lesson_id=:l
+              GROUP BY headword
+            )
+            SELECT a.headword
+            FROM attempts a
+            JOIN last ON a.id = last.last_id
+            WHERE a.is_correct = FALSE
+        """),
+        con=engine, params={"u": int(user_id), "l": int(lesson_id)}
+    )
+    missed = set(latest["headword"].tolist())
+
+    if not missed:
+        fallback = pd.read_sql(
+            text("""
+                SELECT DISTINCT w.headword
+                FROM lesson_words lw
+                JOIN words w ON w.word_id = lw.word_id
+                LEFT JOIN word_stats s ON s.user_id=:u AND s.headword = w.headword
+                WHERE lw.lesson_id = :l
+                  AND s.total_attempts > 0
+                  AND COALESCE(s.correct_streak, 0) = 0
+            """),
+            con=engine, params={"u": int(user_id), "l": int(lesson_id)}
+        )
+        missed = set(fallback["headword"].tolist())
+
+    return sorted(missed)
 
 # ─────────────────────────────────────────────────────────────────────
 # DB helpers (CRUD) — Postgres
@@ -1622,6 +1711,7 @@ if st.session_state["auth"]["role"] == "student":
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
