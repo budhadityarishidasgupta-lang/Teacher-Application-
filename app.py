@@ -1469,11 +1469,18 @@ if st.session_state["auth"]["role"] == "student":
     lid = st.selectbox("Lesson", list(l_map.keys()), format_func=lambda x: l_map[x], key="student_lesson_select")
     lid = int(lid)
 
+    # Reset UI state on lesson switch
+    if st.session_state.get("active_lid") != lid:
+        st.session_state.answered = False
+        st.session_state.eval = None
+        st.session_state.active_word = None
+        st.session_state.selection = set()
+
     # Ensure per-lesson question counter
     if st.session_state.q_index_per_lesson.get(lid) is None:
         st.session_state.q_index_per_lesson[lid] = 1
 
-    # Progress line
+    # Progress line (compact)
     total_q, mastered_q, attempted_q = lesson_progress(USER_ID, lid)
     basis = mastered_q if mastered_q > 0 else attempted_q
     pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
@@ -1486,142 +1493,102 @@ if st.session_state["auth"]["role"] == "student":
         st.info("This lesson has no words yet.")
         st.stop()
 
-# --- DEBUG SENTINEL A: baseline state ---
-st.caption(
-    f"DEBUG A — cid={cid}, lid={lid}, words={len(words_df)}, "
-    f"active={st.session_state.get('active_word')}, "
-    f"answered={st.session_state.get('answered')}, "
-    f"has_eval={st.session_state.get('eval') is not None}"
-)
+    # --- DEBUG SENTINEL A: baseline state ---
+    st.caption(
+        f"DEBUG A — cid={cid}, lid={lid}, words={len(words_df)}, "
+        f"active={st.session_state.get('active_word')}, "
+        f"answered={st.session_state.get('answered')}, "
+        f"has_eval={st.session_state.get('eval') is not None}"
+    )
 
-# Safety: make sure history exists
-if "asked_history" not in st.session_state:
-    st.session_state.asked_history = []
-
-# Decide if we need a new question
-need_new = (
-    not st.session_state.get("active_word") or
-    st.session_state.get("active_lid") != lid or
-    "qdata" not in st.session_state
-)
-
-# --- DEBUG SENTINEL B: need_new decision
-st.caption(f"DEBUG B — need_new={need_new}")
-
-# Initialize question if needed
-if need_new:
-    try:
-        st.session_state.active_lid = lid
-        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.q_started_at = time.time()
-        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-        st.session_state.grid_for_word = st.session_state.active_word
-        st.session_state.grid_keys = [
-            f"opt_{st.session_state.active_word}_{i}"
-            for i in range(len(st.session_state.qdata['choices']))
-        ]
-        st.session_state.selection = set()
-        st.session_state.answered = False
-        st.session_state.eval = None
-        st.success("DEBUG: question initialized")
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-# Hard guard: active must be in this lesson
-active = st.session_state.get("active_word")
-if not active or active not in set(words_df["headword"]):
-    st.warning(f"DEBUG: repairing active_word (was {active})")
-    try:
-        st.session_state.active_lid = lid
-        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.q_started_at = time.time()
-        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-        st.session_state.grid_for_word = st.session_state.active_word
-        st.session_state.grid_keys = [
-            f"opt_{st.session_state.active_word}_{i}"
-            for i in range(len(st.session_state.qdata['choices']))
-        ]
-        st.session_state.selection = set()
-        st.session_state.answered = False
-        st.session_state.eval = None
-        active = st.session_state.active_word
-        st.success(f"DEBUG: repaired to {active}")
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-# Heal impossible state (form hidden but no eval to show)
-if st.session_state.get("answered") and not st.session_state.get("eval"):
-    st.caption("DEBUG: healing state (answered=True but eval=None) → showing form")
-    st.session_state.answered = False
-
-# Pull current payload (with guard)
-try:
-    row = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-    qdata = st.session_state.qdata
-    choices = qdata["choices"]
-    correct_set = qdata["correct"]
-    st.caption(f"DEBUG C — active={st.session_state.active_word}, choices={len(choices)}")
-except Exception as e:
-    st.exception(e)
-    st.stop()
-
-    # Session guards
+    # Safety: make sure history exists
     if "asked_history" not in st.session_state:
         st.session_state.asked_history = []
 
-    # Need a new question?
-    new_word_needed = (not st.session_state.get("active_word")) or (st.session_state.get("active_lid") != lid)
-    if new_word_needed:
-        st.session_state.active_lid = lid
-        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.q_started_at = time.time()
-        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-        st.session_state.grid_for_word = st.session_state.active_word
-        st.session_state.grid_keys = [
-            f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
-        ]
-        st.session_state.selection = set()
-        st.session_state.answered = False
-        st.session_state.eval = None
+    # Decide if we need a new question
+    need_new = (
+        not st.session_state.get("active_word") or
+        st.session_state.get("active_lid") != lid or
+        "qdata" not in st.session_state
+    )
 
-    # Hard guard if active got cleared
+    # --- DEBUG SENTINEL B: need_new decision
+    st.caption(f"DEBUG B — need_new={need_new}")
+
+    # Initialize question if needed
+    if need_new:
+        try:
+            st.session_state.active_lid = lid
+            st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+            st.session_state.q_started_at = time.time()
+            row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+            st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+            st.session_state.grid_for_word = st.session_state.active_word
+            st.session_state.grid_keys = [
+                f"opt_{st.session_state.active_word}_{i}"
+                for i in range(len(st.session_state.qdata['choices']))
+            ]
+            st.session_state.selection = set()
+            st.session_state.answered = False
+            st.session_state.eval = None
+            st.success("DEBUG: question initialized")
+        except Exception as e:
+            st.exception(e)
+            st.stop()
+
+    # Hard guard: active must be in this lesson
     active = st.session_state.get("active_word")
     if not active or active not in set(words_df["headword"]):
-        st.session_state.active_lid = lid
-        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.q_started_at = time.time()
-        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-        st.session_state.grid_for_word = st.session_state.active_word
-        st.session_state.grid_keys = [
-            f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
-        ]
-        st.session_state.selection = set()
+        st.warning(f"DEBUG: repairing active_word (was {active})")
+        try:
+            st.session_state.active_lid = lid
+            st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+            st.session_state.q_started_at = time.time()
+            row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+            st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+            st.session_state.grid_for_word = st.session_state.active_word
+            st.session_state.grid_keys = [
+                f"opt_{st.session_state.active_word}_{i}"
+                for i in range(len(st.session_state.qdata['choices']))
+            ]
+            st.session_state.selection = set()
+            st.session_state.answered = False
+            st.session_state.eval = None
+            active = st.session_state.active_word
+            st.success(f"DEBUG: repaired to {active}")
+        except Exception as e:
+            st.exception(e)
+            st.stop()
+
+    # Heal impossible state (form hidden but no eval to show)
+    if st.session_state.get("answered") and not st.session_state.get("eval"):
+        st.caption("DEBUG: healing state (answered=True but eval=None) → showing form")
         st.session_state.answered = False
-        st.session_state.eval = None
-        active = st.session_state.active_word
 
-    # Question payload
-    row = words_df[words_df["headword"] == active].iloc[0]
-    qdata = st.session_state.qdata
-    choices = qdata["choices"]
-    correct_set = qdata["correct"]
+    # Pull current payload (with guard)
+    try:
+        row = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+        qdata = st.session_state.qdata
+        choices = qdata["choices"]
+        correct_set = qdata["correct"]
+        st.caption(f"DEBUG C — active={st.session_state.active_word}, choices={len(choices)}")
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
-    # Tabs
+    # ---------------------------
+    # TABS (top-level; not inside any except)
+    # ---------------------------
     tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
 
     # ─────────────────────────────────────────────────────────────────
     # PRACTICE TAB — quiz form + after-submit feedback + Next
     # ─────────────────────────────────────────────────────────────────
     with tab_practice:
+        st.caption("DEBUG D — inside Practice tab")
         if not st.session_state.answered:
             with st.form("quiz_form", clear_on_submit=False):
-                st.subheader(f"Word: **{active}**")
+                st.subheader(f"Word: **{st.session_state.active_word}**")
                 st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
 
                 keys = st.session_state.grid_keys
@@ -1634,16 +1601,12 @@ except Exception as e:
                     with col:
                         checked = opt in temp_selection
                         new_val = st.checkbox(opt, value=checked, key=keys[i])
-                    if new_val:
-                        temp_selection.add(opt)
-                    else:
-                        temp_selection.discard(opt)
+                    if new_val: temp_selection.add(opt)
+                    else:       temp_selection.discard(opt)
 
                 c1, c2 = st.columns([1, 1])
-                with c1:
-                    submitted = st.form_submit_button("Submit", type="primary")
-                with c2:
-                    nextq = st.form_submit_button("Next ▶")
+                with c1:  submitted = st.form_submit_button("Submit", type="primary")
+                with c2:  nextq     = st.form_submit_button("Next ▶")
 
             st.session_state.selection = temp_selection
 
@@ -1654,7 +1617,7 @@ except Exception as e:
 
                 correct_choice_for_log = list(correct_set)[0]
                 update_after_attempt(
-                    USER_ID, cid, lid, active,
+                    USER_ID, cid, lid, st.session_state.active_word,
                     is_correct, elapsed_ms, int(row["difficulty"]),
                     ", ".join(sorted(picked_set)), correct_choice_for_log
                 )
@@ -1666,23 +1629,15 @@ except Exception as e:
                     "correct_set": set(correct_set),
                     "choices": list(choices)
                 }
-
-                # push wrong answers to the review queue
-                if not is_correct:
-                    from collections import deque
-                    if "review_queue" not in st.session_state or st.session_state.review_queue is None:
-                        st.session_state.review_queue = deque()
-                    if st.session_state.active_word not in st.session_state.review_queue:
-                        st.session_state.review_queue.appendleft(st.session_state.active_word)
-
                 st.rerun()
 
             elif nextq:
-                st.warning("Please **Submit** your answer first, then click **Next**.")
+                st.warning("Please **Submit** first, then click **Next**.")
 
         # AFTER-SUBMIT feedback + Next button
         if st.session_state.get("answered") and st.session_state.get("eval"):
             ev = st.session_state.eval
+            st.caption("DEBUG E — showing feedback")
             st.subheader(f"Word: **{st.session_state.active_word}**")
             if ev["is_correct"]:
                 st.success("✅ Correct!")
@@ -1703,6 +1658,62 @@ except Exception as e:
                     lines.append(f"- **{opt}** {tag}")
                 st.markdown("\n".join(lines))
                 st.caption("Tip: pick all the options that mean almost the same as the main word.")
+
+            if st.button("Next ▶", use_container_width=True):
+                st.session_state.asked_history.append(st.session_state.active_word)
+
+                # serve from review queue first
+                if st.session_state.review_queue:
+                    next_word = st.session_state.review_queue.popleft()
+                else:
+                    next_word = choose_next_word(USER_ID, cid, lid, words_df)
+
+                # load next word
+                st.session_state.active_word = next_word
+                st.session_state.q_started_at = time.time()
+                next_row = words_df[words_df["headword"] == next_word].iloc[0]
+                st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
+                st.session_state.grid_for_word = next_word
+                st.session_state.grid_keys = [
+                    f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata["choices"]))
+                ]
+                st.session_state.selection = set()
+                st.session_state.answered = False
+                st.session_state.eval = None
+                st.rerun()
+
+    # ─────────────────────────────────────────────────────────────────
+    # REVIEW TAB — retry past mistakes
+    # ─────────────────────────────────────────────────────────────────
+    with tab_review:
+        st.caption("DEBUG F — inside Review tab")
+
+        missed = get_missed_words(USER_ID, lid)
+        if not missed:
+            n_queue = len(st.session_state.review_queue) if "review_queue" in st.session_state else 0
+            if n_queue > 0:
+                st.info(f"No recent wrong answers, but {n_queue} item(s) are queued for quick retry.")
+            else:
+                st.success("Nice! No mistakes to review for this lesson.")
+        else:
+            cols = st.columns(3)
+            for i, hw in enumerate(missed):
+                with cols[i % 3]:
+                    if st.button(f"Retry: {hw}", key=f"retry_{lid}_{hw}"):
+                        # load this headword immediately into the quiz
+                        st.session_state.active_lid = lid
+                        st.session_state.active_word = hw
+                        st.session_state.q_started_at = time.time()
+                        row_retry = words_df[words_df["headword"] == hw].iloc[0]
+                        st.session_state.qdata = build_question_payload(hw, row_retry["synonyms"])
+                        st.session_state.grid_for_word = hw
+                        st.session_state.grid_keys = [
+                            f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
+                        ]
+                        st.session_state.selection = set()
+                        st.session_state.answered = False
+                        st.session_state.eval = None
+                        st.rerun()
 
             # optional GPT feedback (kept)
             try:
@@ -1865,6 +1876,7 @@ def get_missed_words(user_id: int, lesson_id: int):
         missed = set(fallback["headword"].tolist())
 
     return sorted(missed)
+
 
 
 
