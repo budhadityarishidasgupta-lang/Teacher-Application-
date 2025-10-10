@@ -1381,30 +1381,30 @@ if st.session_state["auth"]["role"] == "student":
         con=engine, params={"u": USER_ID}
     )
 
-with st.sidebar:
-    st.subheader("My courses")
-    if courses.empty:
-        st.info("No courses assigned yet.")
-    else:
-        labels = []
-        id_by_label = {}
-        for _, rowc in courses.iterrows():
-            c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
-            label = f"{rowc['title']}"  # keep label stable
-            labels.append(label)
-            id_by_label[label] = int(rowc["course_id"])
+#with st.sidebar:
+#    st.subheader("My courses")
+#    if courses.empty:
+#        st.info("No courses assigned yet.")
+#    else:
+#        labels = []
+#        id_by_label = {}
+#        for _, rowc in courses.iterrows():
+#            c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
+#            label = f"{rowc['title']}"  # keep label stable
+#            labels.append(label)
+#            id_by_label[label] = int(rowc["course_id"])
 
         # 👇 ADD THIS RIGHT HERE (before st.radio)
-        prev = st.session_state.get("active_cid")
-        if prev in id_by_label.values() and "student_course_select" not in st.session_state:
-            default_label = [k for k, v in id_by_label.items() if v == prev][0]
-            default_index = labels.index(default_label)
-        else:
-            default_index = 0
+#        prev = st.session_state.get("active_cid")
+#        if prev in id_by_label.values() and "student_course_select" not in st.session_state:
+#            default_label = [k for k, v in id_by_label.items() if v == prev][0]
+#            default_index = labels.index(default_label)
+#        else:
+#            default_index = 0
 
-        selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
-        cid = id_by_label[selected_label]
-        st.session_state["active_cid"] = cid
+#        selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
+#        cid = id_by_label[selected_label]
+#        st.session_state["active_cid"] = cid
 
 #        c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
 #        st.caption(f"Selected: {selected_label} — {c_pct}% complete")
@@ -1653,38 +1653,6 @@ if st.session_state["auth"]["role"] == "student":
                 st.session_state.eval = None
                 st.rerun()
 
-    # ─────────────────────────────────────────────────────────────────
-    # REVIEW TAB — retry past mistakes
-    # ─────────────────────────────────────────────────────────────────
-    with tab_review:
-        st.write("Click a word you missed to retry it now:")
-
-        missed = get_missed_words(USER_ID, lid)
-        if not missed:
-            n_queue = len(st.session_state.review_queue) if "review_queue" in st.session_state else 0
-            if n_queue > 0:
-                st.info(f"No recent wrong answers, but {n_queue} item(s) are queued for quick retry.")
-            else:
-                st.success("Nice! No mistakes to review for this lesson.")
-        else:
-            cols = st.columns(3)
-            for i, hw in enumerate(missed):
-                with cols[i % 3]:
-                    if st.button(f"Retry: {hw}", key=f"retry_{lid}_{hw}"):
-                        # load this headword immediately into the quiz
-                        st.session_state.active_lid = lid
-                        st.session_state.active_word = hw
-                        st.session_state.q_started_at = time.time()
-                        row_retry = words_df[words_df["headword"] == hw].iloc[0]
-                        st.session_state.qdata = build_question_payload(hw, row_retry["synonyms"])
-                        st.session_state.grid_for_word = hw
-                        st.session_state.grid_keys = [
-                            f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
-                        ]
-                        st.session_state.selection = set()
-                        st.session_state.answered = False
-                        st.session_state.eval = None
-                        st.rerun()
 
     # ─────────────────────────────────────────────────────────────────
     # REVIEW TAB — retry past mistakes
