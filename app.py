@@ -1381,20 +1381,33 @@ if st.session_state["auth"]["role"] == "student":
         con=engine, params={"u": USER_ID}
     )
 
-    with st.sidebar:
-        st.subheader("My courses")
-        if courses.empty:
-            st.info("No courses assigned yet.")
+with st.sidebar:
+    st.subheader("My courses")
+    if courses.empty:
+        st.info("No courses assigned yet.")
+    else:
+        labels = []
+        id_by_label = {}
+        for _, rowc in courses.iterrows():
+            c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
+            label = f"{rowc['title']}"  # keep label stable
+            labels.append(label)
+            id_by_label[label] = int(rowc["course_id"])
+
+        # 👇 ADD THIS RIGHT HERE (before st.radio)
+        prev = st.session_state.get("active_cid")
+        if prev in id_by_label.values() and "student_course_select" not in st.session_state:
+            default_label = [k for k, v in id_by_label.items() if v == prev][0]
+            default_index = labels.index(default_label)
         else:
-            labels = []
-            id_by_label = {}
-            for _, rowc in courses.iterrows():
-                c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
-                label = f"{rowc['title']} — {c_pct}%"
-                labels.append(label)
-                id_by_label[label] = int(rowc["course_id"])
-            selected_label = st.radio("Courses", labels, index=0, key="student_course_radio")
-            cid = id_by_label[selected_label]
+            default_index = 0
+
+        selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
+        cid = id_by_label[selected_label]
+        st.session_state["active_cid"] = cid
+
+        c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
+        st.caption(f"Selected: {selected_label} — {c_pct}% complete")
 
 # -----------------------------
 # STUDENT FLOW (main content)
@@ -1729,6 +1742,7 @@ def get_missed_words(user_id: int, lesson_id: int):
         missed = set(fallback["headword"].tolist())
 
     return sorted(missed)
+
 
 
 
