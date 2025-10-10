@@ -1413,225 +1413,278 @@ with st.sidebar:
 # STUDENT FLOW (main content)
 # -----------------------------
 if st.session_state["auth"]["role"] == "student":
+    _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
+
+    # Enrolled courses
+    courses = pd.read_sql(
+        text("""
+            SELECT C.course_id, C.title
+            FROM enrollments E JOIN courses C ON C.course_id=E.course_id
+            WHERE E.user_id=:u
+        """),
+        con=engine, params={"u": USER_ID}
+    )
+
+    # Sidebar: course select (inside the student block so 'courses' is always defined here)
+    with st.sidebar:
+        st.subheader("My courses")
+        if courses.empty:
+            st.info("No courses assigned yet.")
+        else:
+            labels = []
+            id_by_label = {}
+            for _, rowc in courses.iterrows():
+                # keep label stable (no %)
+                label = f"{rowc['title']}"
+                labels.append(label)
+                id_by_label[label] = int(rowc["course_id"])
+
+            # restore previous selection when possible
+            prev = st.session_state.get("active_cid")
+            if prev in id_by_label.values() and "student_course_select" not in st.session_state:
+                default_label = [k for k, v in id_by_label.items() if v == prev][0]
+                default_index = labels.index(default_label)
+            else:
+                default_index = 0
+
+            selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
+            cid = id_by_label[selected_label]
+            st.session_state["active_cid"] = cid
+
+    # Guard: require a course
+    if courses.empty or "active_cid" not in st.session_state:
+        st.stop()
+    cid = int(st.session_state["active_cid"])
+
+    # Lessons for the course
     lessons = pd.read_sql(
         text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
-        con=engine, params={"c": int(cid)}
+        con=engine, params={"c": cid}
     )
     if lessons.empty:
         st.info("This course has no lessons yet.")
         st.stop()
 
     l_map = dict(zip(lessons["lesson_id"], lessons["title"]))
-    lid = st.selectbox(
-        "Lesson",
-        list(l_map.keys()),
-        format_func=lambda x: l_map[x],
-        key="student_lesson_select"
-    )
+    lid = st.selectbox("Lesson", list(l_map.keys()), format_func=lambda x: l_map[x], key="student_lesson_select")
+    lid = int(lid)
 
-    # Initialize per-lesson question counter (once per lesson)
-    if st.session_state.q_index_per_lesson.get(int(lid)) is None:
-        st.session_state.q_index_per_lesson[int(lid)] = 1
+    # Ensure per-lesson question counter
+    if st.session_state.q_index_per_lesson.get(lid) is None:
+        st.session_state.q_index_per_lesson[lid] = 1
 
-# NEW: lesson-level progress and question count
-total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
-basis = mastered_q if mastered_q > 0 else attempted_q
-pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
+    # Progress line
+    total_q, mastered_q, attempted_q = lesson_progress(USER_ID, lid)
+    basis = mastered_q if mastered_q > 0 else attempted_q
+    pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
+    q_now = st.session_state.q_index_per_lesson.get(lid, 1)
+    st.markdown(f"**Q {q_now} / {total_q}**  ·  Progress: **{pct}%** :")
 
-# Ensure a counter exists
-q_now = st.session_state.q_index_per_lesson.get(int(lid), 1)
+    # Load words for lesson
+    words_df = lesson_words(cid, lid)
+    if words_df.empty:
+        st.info("This lesson has no words yet.")
+        st.stop()
 
-# Compact header (no duplicates, no progress bar)
-st.markdown(f"**Q {q_now} / {total_q}**  ·  Progress: **{pct}%** :")
+    # Session guards
+    if "asked_history" not in st.session_state:
+        st.session_state.asked_history = []
 
-words_df = lesson_words(int(cid), int(lid))
-if words_df.empty:
-    st.info("This lesson has no words yet.")
-    st.stop()
+    # Need a new question?
+    new_word_needed = (not st.session_state.get("active_word")) or (st.session_state.get("active_lid") != lid)
+    if new_word_needed:
+        st.session_state.active_lid = lid
+        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.q_started_at = time.time()
+        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+        st.session_state.grid_for_word = st.session_state.active_word
+        st.session_state.grid_keys = [
+            f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
+        ]
+        st.session_state.selection = set()
+        st.session_state.answered = False
+        st.session_state.eval = None
 
-# ensure history state (must NOT be inside the 'words_df.empty' block)
-if "asked_history" not in st.session_state:
-    st.session_state.asked_history = []
+    # Hard guard if active got cleared
+    active = st.session_state.get("active_word")
+    if not active or active not in set(words_df["headword"]):
+        st.session_state.active_lid = lid
+        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.q_started_at = time.time()
+        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+        st.session_state.grid_for_word = st.session_state.active_word
+        st.session_state.grid_keys = [
+            f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
+        ]
+        st.session_state.selection = set()
+        st.session_state.answered = False
+        st.session_state.eval = None
+        active = st.session_state.active_word
 
-# Active question state
-new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
-if new_word_needed:
-    st.session_state.active_lid = lid
-    st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
-    st.session_state.q_started_at = time.time()
-    row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-    st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-    st.session_state.grid_for_word = st.session_state.active_word
-    st.session_state.grid_keys = [
-        f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
-    ]
-    st.session_state.selection = set()
-    st.session_state.answered = False
-    st.session_state.eval = None
+    # Question payload
+    row = words_df[words_df["headword"] == active].iloc[0]
+    qdata = st.session_state.qdata
+    choices = qdata["choices"]
+    correct_set = qdata["correct"]
 
-if "answered" not in st.session_state:
-    st.session_state.answered = False
-if "eval" not in st.session_state:
-    st.session_state.eval = None
+    # Tabs
+    tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
 
-active = st.session_state.active_word
-row = words_df[words_df["headword"] == active].iloc[0]
-qdata = st.session_state.qdata
-choices = qdata["choices"]
-correct_set = qdata["correct"]
+    # ─────────────────────────────────────────────────────────────────
+    # PRACTICE TAB — quiz form + after-submit feedback + Next
+    # ─────────────────────────────────────────────────────────────────
+    with tab_practice:
+        if not st.session_state.answered:
+            with st.form("quiz_form", clear_on_submit=False):
+                st.subheader(f"Word: **{active}**")
+                st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
 
-# NEW: tabs for Practice vs Review
-tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
+                keys = st.session_state.grid_keys
+                row1 = st.columns(3); row2 = st.columns(3)
+                grid_rows = [row1, row2]
 
-# ─────────────────────────────────────────────────────────────────────
-# PRACTICE TAB — quiz form + after-submit feedback + Next
-# ─────────────────────────────────────────────────────────────────────
-with tab_practice:
-    # The quiz form (no auto-advance)
-    if not st.session_state.answered:
-        with st.form("quiz_form", clear_on_submit=False):
-            st.subheader(f"Word: **{active}**")
-            st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
+                temp_selection = set(st.session_state.selection)
+                for i, opt in enumerate(choices):
+                    col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
+                    with col:
+                        checked = opt in temp_selection
+                        new_val = st.checkbox(opt, value=checked, key=keys[i])
+                    if new_val:
+                        temp_selection.add(opt)
+                    else:
+                        temp_selection.discard(opt)
 
-            keys = st.session_state.grid_keys
-            row1 = st.columns(3)
-            row2 = st.columns(3)
-            grid_rows = [row1, row2]
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    submitted = st.form_submit_button("Submit", type="primary")
+                with c2:
+                    nextq = st.form_submit_button("Next ▶")
 
-            temp_selection = set(st.session_state.selection)
-            for i, opt in enumerate(choices):
-                col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
-                with col:
-                    checked = opt in temp_selection
-                    new_val = st.checkbox(opt, value=checked, key=keys[i])
-                if new_val:
-                    temp_selection.add(opt)
-                else:
-                    temp_selection.discard(opt)
+            st.session_state.selection = temp_selection
 
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                submitted = st.form_submit_button("Submit", type="primary")
-            with c2:
-                nextq = st.form_submit_button("Next ▶")
+            if submitted:
+                elapsed_ms = (time.time() - st.session_state.q_started_at) * 1000
+                picked_set = set(list(st.session_state.selection))
+                is_correct = (picked_set == correct_set)
 
-        st.session_state.selection = temp_selection
+                correct_choice_for_log = list(correct_set)[0]
+                update_after_attempt(
+                    USER_ID, cid, lid, active,
+                    is_correct, elapsed_ms, int(row["difficulty"]),
+                    ", ".join(sorted(picked_set)), correct_choice_for_log
+                )
 
-        if submitted:
-            elapsed_ms = (time.time() - st.session_state.q_started_at) * 1000
-            picked_set = set(list(st.session_state.selection))
-            is_correct = (picked_set == correct_set)
+                st.session_state.answered = True
+                st.session_state.eval = {
+                    "is_correct": bool(is_correct),
+                    "picked_set": set(picked_set),
+                    "correct_set": set(correct_set),
+                    "choices": list(choices)
+                }
 
-            correct_choice_for_log = list(correct_set)[0]
-            update_after_attempt(
-                USER_ID, cid, lid, active,
-                is_correct, elapsed_ms, int(row["difficulty"]),
-                ", ".join(sorted(picked_set)), correct_choice_for_log
-            )
+                # push wrong answers to the review queue
+                if not is_correct:
+                    from collections import deque
+                    if "review_queue" not in st.session_state or st.session_state.review_queue is None:
+                        st.session_state.review_queue = deque()
+                    if st.session_state.active_word not in st.session_state.review_queue:
+                        st.session_state.review_queue.appendleft(st.session_state.active_word)
 
-            st.session_state.answered = True
-            st.session_state.eval = {
-                "is_correct": bool(is_correct),
-                "picked_set": set(picked_set),
-                "correct_set": set(correct_set),
-                "choices": list(choices)
-            }
+                st.rerun()
 
-            if not is_correct:
-                from collections import deque
-                if "review_queue" not in st.session_state or st.session_state.review_queue is None:
-                    st.session_state.review_queue = deque()
-                if st.session_state.active_word not in st.session_state.review_queue:
-                    st.session_state.review_queue.appendleft(st.session_state.active_word)
+            elif nextq:
+                st.warning("Please **Submit** your answer first, then click **Next**.")
 
-            st.rerun()
-
-        elif nextq:
-            st.warning("Please **Submit** your answer first, then click **Next**.")
-
-    # AFTER-SUBMIT feedback + Next button
-    if st.session_state.get("answered") and st.session_state.get("eval"):
-        ev = st.session_state.eval
-        st.subheader(f"Word: **{st.session_state.active_word}**")
-        if ev["is_correct"]:
-            st.success("✅ Correct!")
-        else:
-            st.error("❌ Not quite. Check the correct answers below.")
-
-        with st.expander("Why are these the best choices?", expanded=True):
-            lines = []
-            for opt in ev["choices"]:
-                if opt in ev["correct_set"] and opt in ev["picked_set"]:
-                    tag = "✅ correct (you picked)"
-                elif opt in ev["correct_set"]:
-                    tag = "✅ correct"
-                elif opt in ev["picked_set"]:
-                    tag = "❌ your pick"
-                else:
-                    tag = ""
-                lines.append(f"- **{opt}** {tag}")
-            st.markdown("\n".join(lines))
-            st.caption("Tip: pick all the options that mean almost the same as the main word.")
-
-        try:
-            correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
-            why, examples = gpt_feedback_examples(st.session_state.active_word, correct_choice_for_text)
-            st.info(f"**Why:** {why}")
-            st.markdown(f"**Examples:**\n\n- {examples[0]}\n- {examples[1]}")
-        except Exception:
-            pass
-
-        if st.button("Next ▶", use_container_width=True):
-            st.session_state.asked_history.append(st.session_state.active_word)
-
-            if st.session_state.review_queue:
-                next_word = st.session_state.review_queue.popleft()
+        # AFTER-SUBMIT feedback + Next button
+        if st.session_state.get("answered") and st.session_state.get("eval"):
+            ev = st.session_state.eval
+            st.subheader(f"Word: **{st.session_state.active_word}**")
+            if ev["is_correct"]:
+                st.success("✅ Correct!")
             else:
-                next_word = choose_next_word(USER_ID, cid, lid, words_df)
+                st.error("❌ Not quite. Check the correct answers below.")
 
-            st.session_state.active_word = next_word
-            st.session_state.q_started_at = time.time()
-            next_row = words_df[words_df["headword"] == next_word].iloc[0]
-            st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-            st.session_state.grid_for_word = next_word
-            st.session_state.grid_keys = [
-                f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata["choices"]))
-            ]
-            st.session_state.selection = set()
-            st.session_state.answered = False
-            st.session_state.eval = None
-            st.rerun()
+            with st.expander("Why are these the best choices?", expanded=True):
+                lines = []
+                for opt in ev["choices"]:
+                    if opt in ev["correct_set"] and opt in ev["picked_set"]:
+                        tag = "✅ correct (you picked)"
+                    elif opt in ev["correct_set"]:
+                        tag = "✅ correct"
+                    elif opt in ev["picked_set"]:
+                        tag = "❌ your pick"
+                    else:
+                        tag = ""
+                    lines.append(f"- **{opt}** {tag}")
+                st.markdown("\n".join(lines))
+                st.caption("Tip: pick all the options that mean almost the same as the main word.")
 
-# REVIEW TAB — retry past mistakes
-with tab_review:
-    st.write("Click a word you missed to retry it now:")
+            # optional GPT feedback (kept)
+            try:
+                correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
+                why, examples = gpt_feedback_examples(st.session_state.active_word, correct_choice_for_text)
+                st.info(f"**Why:** {why}")
+                st.markdown(f"**Examples:**\n\n- {examples[0]}\n- {examples[1]}")
+            except Exception:
+                pass
 
-    missed = get_missed_words(USER_ID, int(lid))
-    if not missed:
-        n_queue = len(st.session_state.review_queue) if "review_queue" in st.session_state else 0
-        if n_queue > 0:
-            st.info(f"No recent wrong answers, but {n_queue} item(s) are queued for quick retry.")
+            if st.button("Next ▶", use_container_width=True):
+                st.session_state.asked_history.append(st.session_state.active_word)
+
+                # serve from review queue first
+                if st.session_state.review_queue:
+                    next_word = st.session_state.review_queue.popleft()
+                else:
+                    next_word = choose_next_word(USER_ID, cid, lid, words_df)
+
+                # load next word
+                st.session_state.active_word = next_word
+                st.session_state.q_started_at = time.time()
+                next_row = words_df[words_df["headword"] == next_word].iloc[0]
+                st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
+                st.session_state.grid_for_word = next_word
+                st.session_state.grid_keys = [
+                    f"opt_{next_word}_{i}" for i in range(len(st.session_state.qdata["choices"]))
+                ]
+                st.session_state.selection = set()
+                st.session_state.answered = False
+                st.session_state.eval = None
+                st.rerun()
+
+    # ─────────────────────────────────────────────────────────────────
+    # REVIEW TAB — retry past mistakes
+    # ─────────────────────────────────────────────────────────────────
+    with tab_review:
+        st.write("Click a word you missed to retry it now:")
+
+        missed = get_missed_words(USER_ID, lid)
+        if not missed:
+            n_queue = len(st.session_state.review_queue) if "review_queue" in st.session_state else 0
+            if n_queue > 0:
+                st.info(f"No recent wrong answers, but {n_queue} item(s) are queued for quick retry.")
+            else:
+                st.success("Nice! No mistakes to review for this lesson.")
         else:
-            st.success("Nice! No mistakes to review for this lesson.")
-    else:
-        cols = st.columns(3)
-        for i, hw in enumerate(missed):
-            with cols[i % 3]:
-                if st.button(f"Retry: {hw}", key=f"retry_{int(lid)}_{hw}"):
-                    st.session_state.active_lid = lid
-                    st.session_state.active_word = hw
-                    st.session_state.q_started_at = time.time()
-
-                    row_retry = words_df[words_df["headword"] == hw].iloc[0]
-                    st.session_state.qdata = build_question_payload(hw, row_retry["synonyms"])
-                    st.session_state.grid_for_word = hw
-                    st.session_state.grid_keys = [
-                        f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
-                    ]
-                    st.session_state.selection = set()
-                    st.session_state.answered = False
-                    st.session_state.eval = None
-                    st.rerun()
+            cols = st.columns(3)
+            for i, hw in enumerate(missed):
+                with cols[i % 3]:
+                    if st.button(f"Retry: {hw}", key=f"retry_{lid}_{hw}"):
+                        # load this headword immediately into the quiz
+                        st.session_state.active_lid = lid
+                        st.session_state.active_word = hw
+                        st.session_state.q_started_at = time.time()
+                        row_retry = words_df[words_df["headword"] == hw].iloc[0]
+                        st.session_state.qdata = build_question_payload(hw, row_retry["synonyms"])
+                        st.session_state.grid_for_word = hw
+                        st.session_state.grid_keys = [
+                            f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
+                        ]
+                        st.session_state.selection = set()
+                        st.session_state.answered = False
+                        st.session_state.eval = None
+                        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
@@ -1728,6 +1781,7 @@ def get_missed_words(user_id: int, lesson_id: int):
         missed = set(fallback["headword"].tolist())
 
     return sorted(missed)
+
 
 
 
