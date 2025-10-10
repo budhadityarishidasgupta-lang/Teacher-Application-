@@ -1449,37 +1449,36 @@ if words_df.empty:
     st.info("This lesson has no words yet.")
     st.stop()
 
-
 # ensure history state (must NOT be inside the 'words_df.empty' block)
-    if "asked_history" not in st.session_state:
-        st.session_state.asked_history = []
+if "asked_history" not in st.session_state:
+    st.session_state.asked_history = []
 
 # Active question state
-    new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
-    if new_word_needed:
-        st.session_state.active_lid = lid
-        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
-        st.session_state.q_started_at = time.time()
-        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
-        st.session_state.grid_for_word = st.session_state.active_word
-        st.session_state.grid_keys = [
-            f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
-        ]
-        st.session_state.selection = set()
-        st.session_state.answered = False
-        st.session_state.eval = None
+new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
+if new_word_needed:
+    st.session_state.active_lid = lid
+    st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+    st.session_state.q_started_at = time.time()
+    row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+    st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+    st.session_state.grid_for_word = st.session_state.active_word
+    st.session_state.grid_keys = [
+        f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
+    ]
+    st.session_state.selection = set()
+    st.session_state.answered = False
+    st.session_state.eval = None
 
-    if "answered" not in st.session_state:
-        st.session_state.answered = False
-    if "eval" not in st.session_state:
-        st.session_state.eval = None
+if "answered" not in st.session_state:
+    st.session_state.answered = False
+if "eval" not in st.session_state:
+    st.session_state.eval = None
 
-    active = st.session_state.active_word
-    row = words_df[words_df["headword"] == active].iloc[0]
-    qdata = st.session_state.qdata
-    choices = qdata["choices"]
-    correct_set = qdata["correct"]
+active = st.session_state.active_word
+row = words_df[words_df["headword"] == active].iloc[0]
+qdata = st.session_state.qdata
+choices = qdata["choices"]
+correct_set = qdata["correct"]
 
     # NEW: tabs for Practice vs Review
     tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
@@ -1742,6 +1741,7 @@ def get_missed_words(user_id: int, lesson_id: int):
         missed = set(fallback["headword"].tolist())
 
     return sorted(missed)
+
 
 
 
