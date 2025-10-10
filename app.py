@@ -1406,8 +1406,8 @@ with st.sidebar:
         cid = id_by_label[selected_label]
         st.session_state["active_cid"] = cid
 
-        c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
-        st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+#        c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
+#        st.caption(f"Selected: {selected_label} — {c_pct}% complete")
 
 # -----------------------------
 # STUDENT FLOW (main content)
@@ -1433,28 +1433,28 @@ if st.session_state["auth"]["role"] == "student":
     if st.session_state.q_index_per_lesson.get(int(lid)) is None:
         st.session_state.q_index_per_lesson[int(lid)] = 1
 
-    # NEW: lesson-level progress and question count
-    total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
-    basis = mastered_q if mastered_q > 0 else attempted_q
-    pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
+# NEW: lesson-level progress and question count
+total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
+basis = mastered_q if mastered_q > 0 else attempted_q
+pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
 
-    q_now = st.session_state.q_index_per_lesson[int(lid)]
-    st.markdown(
-        f"**Progress:** {pct}%  ·  Mastered {mastered_q}/{total_q}  ·  **Q {q_now} / {total_q}**"
-    )
-    st.progress(pct / 100.0)
+# Ensure a counter exists
+q_now = st.session_state.q_index_per_lesson.get(int(lid), 1)
 
-    words_df = lesson_words(int(cid), int(lid))
-    if words_df.empty:
-        st.info("This lesson has no words yet.")
-        st.stop()
+# Compact header (no duplicates, no progress bar)
+st.markdown(f"**Q {q_now} / {total_q}**  ·  Progress: **{pct}%** :")
+
+words_df = lesson_words(int(cid), int(lid))
+if words_df.empty:
+    st.info("This lesson has no words yet.")
+    st.stop()
 
 
-    # ensure history state (must NOT be inside the 'words_df.empty' block)
+# ensure history state (must NOT be inside the 'words_df.empty' block)
     if "asked_history" not in st.session_state:
         st.session_state.asked_history = []
 
-    # Active question state
+# Active question state
     new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
     if new_word_needed:
         st.session_state.active_lid = lid
@@ -1742,6 +1742,7 @@ def get_missed_words(user_id: int, lesson_id: int):
         missed = set(fallback["headword"].tolist())
 
     return sorted(missed)
+
 
 
 
