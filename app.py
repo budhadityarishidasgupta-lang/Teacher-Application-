@@ -1409,27 +1409,57 @@ def render_q_header(q_now: int, total_q: int, pct: int, *,
 
     css = f"""
     <style>
-      .qhdr {{ display:flex; align-items:center; gap:12px; line-height:1; }}
+      .qhdr {{
+        display:flex;
+        align-items:center;
+        gap:12px;
+        line-height:1;
+        flex-wrap:wrap;
+      }}
       .qhdr .track {{
-        position:relative; width:240px; height:9px; border-radius:999px;
-        overflow:hidden; background:{track_light};
+        position:relative;
+        width:240px;
+        height:9px;
+        border-radius:999px;
+        overflow:hidden;
+        background:{track_light};
       }}
       @media (prefers-color-scheme: dark) {{
         .qhdr .track {{ background:{track_dark}; }}
       }}
-      .qhdr .fill {{ position:absolute; inset:0; width:{pct}%; background:{fill}; }}
-      .qhdr .pct {{ opacity:.75; font-size:0.95rem; }}
-      .qhdr .label {{ font-weight:600; }}
+      .qhdr .fill {{
+        position:absolute;
+        inset:0;
+        width:{pct}%;
+        background:{fill};
+        transition: width 0.4s ease;
+      }}
+      .qhdr .pct {{
+        opacity:.75;
+        font-size:0.95rem;
+      }}
+      .qhdr .label {{
+        font-weight:600;
+        white-space:nowrap;
+      }}
+      .qhdr .sub {{
+        font-weight:500;
+        opacity:.8;
+        margin-right:4px;
+      }}
     </style>
     """
+
     html = f"""
     <div class="qhdr" aria-label="Question progress: {q_now} of {total_q} ({pct} percent)">
       <div class="label">Q {q_now} / {total_q}</div>
+      <div class="sub">Lesson Mastery</div>
       <div class="track"><div class="fill"></div></div>
       <div class="pct">{pct}%</div>
     </div>
     """
     st.markdown(css + html, unsafe_allow_html=True)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Navigation helper: go back to the previous served word
@@ -1770,6 +1800,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
