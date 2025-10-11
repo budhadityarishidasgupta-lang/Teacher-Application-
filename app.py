@@ -1575,6 +1575,9 @@ if st.session_state["auth"]["role"] == "student":
 # PRACTICE TAB — quiz form + after-submit feedback + Next
 # ─────────────────────────────────────────────────────────────────────
 with tab_practice:
+    # Always start with current selection state
+    temp_selection = set(st.session_state.get("selection", set()))
+
     # The quiz form (no auto-advance)
     if not st.session_state.answered:
         with st.form("quiz_form", clear_on_submit=False):
@@ -1586,7 +1589,6 @@ with tab_practice:
             row2 = st.columns(3)
             grid_rows = [row1, row2]
 
-            temp_selection = set(st.session_state.selection)
             for i, opt in enumerate(choices):
                 col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
                 with col:
@@ -1602,6 +1604,11 @@ with tab_practice:
                 submitted = st.form_submit_button("Submit", type="primary")
             with c2:
                 nextq = st.form_submit_button("Next ▶")
+
+    else:
+        # Prevent undefined vars when answered state active
+        submitted = False
+        nextq = False
 
     # Allow going back even before submitting
     if st.button("◀ Back", key="btn_back_form"):
@@ -1763,6 +1770,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
