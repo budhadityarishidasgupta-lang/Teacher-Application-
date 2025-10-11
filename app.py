@@ -1395,6 +1395,42 @@ def lesson_progress(user_id: int, lesson_id: int):
         return 0, 0, 0
     return total, mastered, attempted
 
+# ─────────────────────────────────────────────────────────────────────
+# UI Helper: compact question header with inline progress bar (theme-agnostic)
+# ─────────────────────────────────────────────────────────────────────
+def render_q_header(q_now: int, total_q: int, pct: int, *,
+                    fill="#3b82f6", track_light="#e5e7eb", track_dark="#374151"):
+    import math
+    import streamlit as st
+
+    total_q = max(1, int(total_q or 1))
+    q_now   = max(1, min(int(q_now or 1), total_q))
+    pct     = max(0, min(100, int(math.floor(pct or 0))))
+
+    css = f"""
+    <style>
+      .qhdr {{ display:flex; align-items:center; gap:12px; line-height:1; }}
+      .qhdr .track {{
+        position:relative; width:240px; height:9px; border-radius:999px;
+        overflow:hidden; background:{track_light};
+      }}
+      @media (prefers-color-scheme: dark) {{
+        .qhdr .track {{ background:{track_dark}; }}
+      }}
+      .qhdr .fill {{ position:absolute; inset:0; width:{pct}%; background:{fill}; }}
+      .qhdr .pct {{ opacity:.75; font-size:0.95rem; }}
+      .qhdr .label {{ font-weight:600; }}
+    </style>
+    """
+    html = f"""
+    <div class="qhdr" aria-label="Question progress: {q_now} of {total_q} ({pct} percent)">
+      <div class="label">Q {q_now} / {total_q}</div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="pct">{pct}%</div>
+    </div>
+    """
+    st.markdown(css + html, unsafe_allow_html=True)
+
 
 # -----------------------------
 # STUDENT FLOW (main content)
@@ -1429,7 +1465,7 @@ if st.session_state["auth"]["role"] == "student":
     q_now = st.session_state.q_index_per_lesson.get(int(lid), 1)
 
     # Compact header (no duplicates, no progress bar)
-    st.markdown(f"**Q {q_now} / {total_q}**  ·  Progress: **{pct}%** :")
+    render_q_header(q_now, total_q, pct)
 
     words_df = lesson_words(int(cid), int(lid))
     if words_df.empty:
@@ -1462,12 +1498,38 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.eval = None
 
     active = st.session_state.active_word
-    row = words_df[words_df["headword"] == active].iloc[0]
+
+# Harden lookup in case lesson changed mid-session
+    filtered = words_df[words_df["headword"] == active]
+    if filtered.empty:
+        st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.q_started_at = time.time()
+        row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
+        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+        st.session_state.grid_for_word = st.session_state.active_word
+        st.session_state.grid_keys = [
+            f"opt_{st.session_state.active_word}_{i}"
+            for i in range(len(st.session_state.qdata["choices"]))
+    ]
+        st.session_state.selection = set()
+        st.session_state.answered = False
+        st.session_state.eval = None
+        st.rerun()
+    else:
+        row = filtered.iloc[0]
+
     qdata = st.session_state.qdata
     choices = qdata["choices"]
     correct_set = qdata["correct"]
 
-    # NEW: tabs for Practice vs Review
+# State hardening so we never hide both form and feedback
+    if st.session_state.answered and st.session_state.eval is None:
+        st.session_state.answered = False
+
+# Render compact header with inline progress bar (before tabs)
+    render_q_header(q_now, total_q, pct)
+
+# Tabs for Practice vs Review (header stays ABOVE)
     tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1640,5 +1702,6 @@ if st.session_state["auth"]["role"] == "student":
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
