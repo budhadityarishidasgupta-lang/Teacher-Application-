@@ -1611,8 +1611,8 @@ with tab_practice:
         nextq = False
 
     # Allow going back even before submitting
-    if st.button("◀ Back", key="btn_back_form"):
-        _go_back_to_prev_word(lid, words_df)
+    #if st.button("◀ Back", key="btn_back_form"):
+    #    _go_back_to_prev_word(lid, words_df)
 
     # Always persist selection each render
     st.session_state.selection = temp_selection
@@ -1770,6 +1770,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
