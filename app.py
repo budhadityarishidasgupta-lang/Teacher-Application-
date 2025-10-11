@@ -1571,79 +1571,78 @@ if st.session_state["auth"]["role"] == "student":
 # Tabs for Practice vs Review (header stays ABOVE)
     tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
 
-    # ─────────────────────────────────────────────────────────────────────
-    # PRACTICE TAB — quiz form + after-submit feedback + Next
-    # ─────────────────────────────────────────────────────────────────────
-    with tab_practice:
-        # The quiz form (no auto-advance)
-        if not st.session_state.answered:
-            with st.form("quiz_form", clear_on_submit=False):
-                st.subheader(f"Word: **{active}**")
-                st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
+# ─────────────────────────────────────────────────────────────────────
+# PRACTICE TAB — quiz form + after-submit feedback + Next
+# ─────────────────────────────────────────────────────────────────────
+with tab_practice:
+    # The quiz form (no auto-advance)
+    if not st.session_state.answered:
+        with st.form("quiz_form", clear_on_submit=False):
+            st.subheader(f"Word: **{active}**")
+            st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
 
-                keys = st.session_state.grid_keys
-                row1 = st.columns(3)
-                row2 = st.columns(3)
-                grid_rows = [row1, row2]
+            keys = st.session_state.grid_keys
+            row1 = st.columns(3)
+            row2 = st.columns(3)
+            grid_rows = [row1, row2]
 
-                temp_selection = set(st.session_state.selection)
-                for i, opt in enumerate(choices):
-                    col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
-                    with col:
-                        checked = opt in temp_selection
-                        new_val = st.checkbox(opt, value=checked, key=keys[i])
-                    if new_val:
-                        temp_selection.add(opt)
-                    else:
-                        temp_selection.discard(opt)
+            temp_selection = set(st.session_state.selection)
+            for i, opt in enumerate(choices):
+                col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
+                with col:
+                    checked = opt in temp_selection
+                    new_val = st.checkbox(opt, value=checked, key=keys[i])
+                if new_val:
+                    temp_selection.add(opt)
+                else:
+                    temp_selection.discard(opt)
 
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    submitted = st.form_submit_button("Submit", type="primary")
-                with c2:
-                    nextq = st.form_submit_button("Next ▶")
- # Allow going back even before submitting
-        if st.button("◀ Back", key="btn_back_form"):
-            _go_back_to_prev_word(lid, words_df)
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                submitted = st.form_submit_button("Submit", type="primary")
+            with c2:
+                nextq = st.form_submit_button("Next ▶")
 
+    # Allow going back even before submitting
+    if st.button("◀ Back", key="btn_back_form"):
+        _go_back_to_prev_word(lid, words_df)
 
-            st.session_state.selection = temp_selection
+    # Always persist selection each render
+    st.session_state.selection = temp_selection
 
-            if submitted:
-                elapsed_ms = (time.time() - st.session_state.q_started_at) * 1000
-                picked_set = set(list(st.session_state.selection))
-                is_correct = (picked_set == correct_set)
+    # Handle Submit
+    if submitted:
+        elapsed_ms = (time.time() - st.session_state.q_started_at) * 1000
+        picked_set = set(list(st.session_state.selection))
+        is_correct = (picked_set == correct_set)
 
-                correct_choice_for_log = list(correct_set)[0]
-                update_after_attempt(
-                    USER_ID, cid, lid, active,
-                    is_correct, elapsed_ms, int(row["difficulty"]),
-                    ", ".join(sorted(picked_set)), correct_choice_for_log
-                )
+        correct_choice_for_log = list(correct_set)[0]
+        update_after_attempt(
+            USER_ID, cid, lid, active,
+            is_correct, int(elapsed_ms), int(row["difficulty"]),
+            ", ".join(sorted(picked_set)), correct_choice_for_log
+        )
 
-                st.session_state.answered = True
-                st.session_state.eval = {
-                    "is_correct": bool(is_correct),
-                    "picked_set": set(picked_set),
-                    "correct_set": set(correct_set),
-                    "choices": list(choices)
-                }
+        st.session_state.answered = True
+        st.session_state.eval = {
+            "is_correct": bool(is_correct),
+            "picked_set": set(picked_set),
+            "correct_set": set(correct_set),
+            "choices": list(choices)
+        }
 
-                # If wrong, push this headword to the front of the review queue
-                if not is_correct:
-                    try:
-                        from collections import deque
-                        if "review_queue" not in st.session_state or st.session_state.review_queue is None:
-                            st.session_state.review_queue = deque()
-                        if st.session_state.active_word not in st.session_state.review_queue:
-                            st.session_state.review_queue.appendleft(st.session_state.active_word)
-                    except Exception:
-                        pass
+        # If wrong, push this headword to the front of the review queue
+        if not is_correct:
+            from collections import deque
+            if "review_queue" not in st.session_state or st.session_state.review_queue is None:
+                st.session_state.review_queue = deque()
+            if st.session_state.active_word not in st.session_state.review_queue:
+                st.session_state.review_queue.appendleft(st.session_state.active_word)
 
-                st.rerun()
+        st.rerun()
 
-            elif nextq:
-                st.warning("Please **Submit** your answer first, then click **Next**.")
+    elif nextq:
+        st.warning("Please **Submit** your answer first, then click **Next**.")
 
 # AFTER-SUBMIT feedback + Back & Next buttons
 if st.session_state.get("answered") and st.session_state.get("eval"):
@@ -1672,7 +1671,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         st.markdown("\n".join(lines))
         st.caption("Tip: pick all the options that mean almost the same as the main word.")
 
-    # GPT feedback (optional, keep if you already have it)
+    # GPT feedback (optional)
     try:
         correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
         why, examples = gpt_feedback_examples(st.session_state.active_word, correct_choice_for_text)
@@ -1681,9 +1680,9 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
     except Exception:
         pass
 
-# ───────────────────────────────────────────────────────────────
-# Buttons: Back and Next
-# ───────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────
+    # Buttons: Back and Next
+    # ───────────────────────────────────────────────────────────────
     bcol, ncol = st.columns([1, 1])
 
     # Back button (uses helper defined earlier)
@@ -1716,7 +1715,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
             st.session_state.answered = False
             st.session_state.eval = None
 
-            # Bump lesson question index (already tracked)
+            # Bump lesson question index
             st.session_state.q_index_per_lesson[int(lid)] = \
                 st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
 
@@ -1764,6 +1763,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
