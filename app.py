@@ -937,63 +937,68 @@ def teacher_manage_ui():
                         except Exception as e:
                             st.error(f"Bulk import failed: {e}")
 
-    # COL 3 — Assign / remove students for selected course
+# COL 3 — Assign / remove students for selected course
     with c3:
         st.markdown("**Assign students**")
         if dfc.empty:
             st.info("Create a course first.")
         else:
-            cid_assign = st.selectbox("Course", dfc["course_id"].tolist(),
-                                      format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
-                                      key="td2_assign_course_sel")
+            cid_assign = st.selectbox(
+                "Course",
+                dfc["course_id"].tolist(),
+                format_func=lambda x: dfc.loc[dfc["course_id"] == x, "title"].values[0],
+                key="td2_assign_course_sel"
+        )
 
-            df_students = td2_get_active_students()
-            if df_students.empty:
-                st.caption("No active students.")
-            else:
-                sid_assign = st.selectbox(
-                    "Student",
-                    df_students["user_id"].tolist(),
-                    format_func=lambda x: f"{df_students.loc[df_students['user_id']==x,'name'].values[0]} "
-                                          f"({df_students.loc[df_students['user_id']==x,'email'].values[0]})",
-                    key="td2_assign_student_sel"
-                )
-                if st.button("Enroll", key="td2_assign_enroll_btn"):
-                    with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO enrollments(user_id,course_id)
-                            VALUES(:u,:c)
-                            ON CONFLICT (user_id,course_id) DO NOTHING
-                        """), {"u": int(sid_assign), "c": int(cid_assign)})
-                    td2_invalidate()
-                    st.success("Enrolled.")
+        # Now we are INSIDE the same 'else:' block ↓
+        df_students = td2_get_active_students()
+        df_enrolled = pd.DataFrame()  # default to avoid NameError
 
-                st.markdown("**Currently enrolled**")
-                df_enrolled = td2_get_enrollments_for_course(cid_assign)
-            if df_enrolled.empty:
-                st.caption("None yet.")
-            else:
-                to_remove = st.multiselect(
-                    "Remove students",
-                    df_enrolled["user_id"].tolist(),
-                    format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id']==x,'name'].values[0]} "
-                                          f"({df_enrolled.loc[df_enrolled['user_id']==x,'email'].values[0]})",
-                    key="td2_assign_remove"
-                )
-                if st.button("Remove selected", key="td2_assign_remove_btn"):
-                    with engine.begin() as conn:
-                        for sid in to_remove:
-                            conn.execute(text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
-                                         {"u": int(sid), "c": int(cid_assign)})
-                    td2_invalidate()
-                    st.success("Removed.")
-                    st.rerun()
+        if df_students.empty:
+            st.caption("No active students.")
+        else:
+            sid_assign = st.selectbox(
+                "Student",
+                df_students["user_id"].tolist(),
+                format_func=lambda x: f"{df_students.loc[df_students['user_id'] == x, 'name'].values[0]} "
+                                      f"({df_students.loc[df_students['user_id'] == x, 'email'].values[0]})",
+                key="td2_assign_student_sel"
+            )
 
-def render_teacher_dashboard_v2():
-    sub_create, sub_manage = st.tabs(["Create", "Manage"])
-    with sub_create: teacher_create_ui()
-    with sub_manage: teacher_manage_ui()
+            if st.button("Enroll", key="td2_assign_enroll_btn"):
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO enrollments(user_id, course_id)
+                        VALUES(:u, :c)
+                        ON CONFLICT (user_id, course_id) DO NOTHING
+                    """), {"u": int(sid_assign), "c": int(cid_assign)})
+                td2_invalidate()
+                st.success("Enrolled.")
 
+            st.markdown("**Currently enrolled**")
+            df_enrolled = td2_get_enrollments_for_course(cid_assign)
+
+        # Safe checks for enrolled list
+        if df_enrolled.empty:
+            st.caption("None yet.")
+        else:
+            to_remove = st.multiselect(
+                "Remove students",
+                df_enrolled["user_id"].tolist(),
+                format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id'] == x, 'name'].values[0]} "
+                                      f"({df_enrolled.loc[df_enrolled['user_id'] == x, 'email'].values[0]})",
+                key="td2_assign_remove"
+            )
+            if st.button("Remove selected", key="td2_assign_remove_btn"):
+                with engine.begin() as conn:
+                    for sid in to_remove:
+                        conn.execute(
+                            text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
+                            {"u": int(sid), "c": int(cid_assign)}
+                        )
+                td2_invalidate()
+                st.success("Removed.")
+                st.rerun()
 # ─────────────────────────────────────────────────────────────────────
 # AUTH INTEGRATION (optional / append-only)
 # ─────────────────────────────────────────────────────────────────────
@@ -1324,34 +1329,35 @@ if st.session_state["auth"]["role"] == "student":
         con=engine, params={"u": USER_ID}
     )
 
-    # now sidebar is inside the student block 👇
-with st.sidebar:
-    st.subheader("My courses")
-    if courses.empty:
-        st.info("No courses assigned yet.")
-        st.stop()
-    else:
-        labels = []
-        id_by_label = {}
-        for _, rowc in courses.iterrows():
-            c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
-            label = f"{rowc['title']}"  # keep label stable
-            labels.append(label)
-            id_by_label[label] = int(rowc["course_id"])
-
-        prev = st.session_state.get("active_cid")
-        if prev in id_by_label.values() and "student_course_select" not in st.session_state:
-            default_label = [k for k, v in id_by_label.items() if v == prev][0]
-            default_index = labels.index(default_label)
+    # Sidebar is truly inside the student block ↓
+    with st.sidebar:
+        st.subheader("My courses")
+        if courses.empty:
+            st.info("No courses assigned yet.")
+            st.stop()
         else:
-            default_index = 0
+            labels = []
+            id_by_label = {}
+            for _, rowc in courses.iterrows():
+                c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
+                label = f"{rowc['title']}"
+                labels.append(label)
+                id_by_label[label] = int(rowc["course_id"])
 
-        selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
-        cid = id_by_label[selected_label]
-        st.session_state["active_cid"] = cid
+            prev = st.session_state.get("active_cid")
+            if prev in id_by_label.values() and "student_course_select" not in st.session_state:
+                default_label = [k for k, v in id_by_label.items() if v == prev][0]
+                default_index = labels.index(default_label)
+            else:
+                default_index = 0
 
-        c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
-        st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+            selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
+            cid = id_by_label[selected_label]
+            st.session_state["active_cid"] = cid
+
+            c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
+            st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1634,4 +1640,5 @@ if st.session_state["auth"]["role"] == "student":
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
