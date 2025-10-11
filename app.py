@@ -14,14 +14,6 @@ import streamlit as st
 import builtins
 import hashlib
 
-# Guard stubs — replaced later by real definitions after bootstrap
-def lesson_progress(*args, **kwargs):
-    raise RuntimeError("lesson_progress called before helpers were defined")
-
-def get_missed_words(*args, **kwargs):
-    raise RuntimeError("get_missed_words called before helpers were defined")
-
-
 # Disable all help renderers (prevents the login_page methods panel)
 try:
     st.help = lambda *args, **kwargs: None
@@ -237,56 +229,6 @@ def patch_courses_table():
 init_db()
 patch_users_table()
 patch_courses_table()
-
-# ─────────────────────────────────────────────────────────────────────
-# Lesson helpers (canonical — must be before Student UI)
-# ─────────────────────────────────────────────────────────────────────
-def lesson_progress(user_id: int, lesson_id: int):
-    """
-    Returns (total_words, mastered_count, attempted_count) for a lesson.
-    Matches call-site unpacking: total_q, mastered_q, attempted_q = lesson_progress(...)
-    """
-    # total words in lesson
-    total_df = pd.read_sql(
-        text("""
-            SELECT COUNT(DISTINCT w.headword) AS total
-            FROM lesson_words lw
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE lw.lesson_id = :l
-        """),
-        con=engine, params={"l": int(lesson_id)}
-    )
-    total = int(total_df.iloc[0]["total"] or 0)
-    if total == 0:
-        return 0, 0, 0
-
-    # list of headwords in this lesson
-    hw_df = pd.read_sql(
-        text("""
-            SELECT DISTINCT w.headword
-            FROM lesson_words lw
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE lw.lesson_id = :l
-        """),
-        con=engine, params={"l": int(lesson_id)}
-    )
-    heads = hw_df["headword"].tolist()
-
-    # mastered & attempted for this user on these headwords
-    stats_df = pd.read_sql(
-        text("""
-            SELECT
-              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
-              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
-            FROM word_stats
-            WHERE user_id = :u AND headword = ANY(:arr)
-        """),
-        con=engine, params={"u": int(user_id), "arr": heads}
-    )
-    mastered = int(stats_df.iloc[0]["mastered_count"] or 0)
-    attempted = int(stats_df.iloc[0]["attempted_count"] or 0)
-    return total, mastered, attempted
-
 
 def get_missed_words(user_id: int, lesson_id: int):
     """
@@ -1026,8 +968,8 @@ def teacher_manage_ui():
                     td2_invalidate()
                     st.success("Enrolled.")
 
-            st.markdown("**Currently enrolled**")
-            df_enrolled = td2_get_enrollments_for_course(cid_assign)
+                st.markdown("**Currently enrolled**")
+                df_enrolled = td2_get_enrollments_for_course(cid_assign)
             if df_enrolled.empty:
                 st.caption("None yet.")
             else:
@@ -1372,6 +1314,7 @@ if st.session_state["auth"]["role"] == "admin":
 # Student experience
 if st.session_state["auth"]["role"] == "student":
     _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
+
     courses = pd.read_sql(
         text("""
             SELECT C.course_id, C.title
@@ -1381,11 +1324,12 @@ if st.session_state["auth"]["role"] == "student":
         con=engine, params={"u": USER_ID}
     )
 
+    # now sidebar is inside the student block 👇
 with st.sidebar:
     st.subheader("My courses")
     if courses.empty:
         st.info("No courses assigned yet.")
-        st.stop()  # ← important: prevents cid/lid references later
+        st.stop()
     else:
         labels = []
         id_by_label = {}
@@ -1394,7 +1338,6 @@ with st.sidebar:
             label = f"{rowc['title']}"  # keep label stable
             labels.append(label)
             id_by_label[label] = int(rowc["course_id"])
-
 
         prev = st.session_state.get("active_cid")
         if prev in id_by_label.values() and "student_course_select" not in st.session_state:
@@ -1409,6 +1352,43 @@ with st.sidebar:
 
         c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
         st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Helper for lesson progress (canonical — keep only ONE copy in file)
+# ─────────────────────────────────────────────────────────────────────
+from sqlalchemy import text as sa_text
+
+@st.cache_data(ttl=5)
+def lesson_progress(user_id: int, lesson_id: int):
+    """
+    One-shot, portable computation of lesson progress.
+    Returns: (total_words, mastered_count, attempted_count)
+    """
+    sql = sa_text("""
+        SELECT
+          COUNT(DISTINCT w.headword) AS total,
+          SUM(CASE WHEN s.mastered IS TRUE THEN 1 ELSE 0 END) AS mastered_count,
+          SUM(CASE WHEN COALESCE(s.total_attempts,0) > 0 THEN 1 ELSE 0 END) AS attempted_count
+        FROM lesson_words lw
+        JOIN words w ON w.word_id = lw.word_id
+        LEFT JOIN word_stats s
+               ON s.user_id = :u
+              AND s.headword = w.headword
+        WHERE lw.lesson_id = :l
+    """)
+    df = pd.read_sql(sql, con=engine, params={"u": int(user_id), "l": int(lesson_id)})
+
+    if df.empty:
+        return 0, 0, 0
+
+    total     = int(df.iloc[0]["total"] or 0)
+    mastered  = int(df.iloc[0]["mastered_count"] or 0)
+    attempted = int(df.iloc[0]["attempted_count"] or 0)
+    if total <= 0:
+        return 0, 0, 0
+    return total, mastered, attempted
+
 
 # -----------------------------
 # STUDENT FLOW (main content)
@@ -1608,6 +1588,9 @@ if st.session_state["auth"]["role"] == "student":
                 st.session_state.selection = set()
                 st.session_state.answered = False
                 st.session_state.eval = None
+                # increase question counter
+                st.session_state.q_index_per_lesson[int(lid)] = \
+                    st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
                 st.rerun()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1651,113 +1634,4 @@ if st.session_state["auth"]["role"] == "student":
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────
-# Helper for lesson progress
-# ─────────────────────────────────────────────────────────────────────
-from sqlalchemy import text as _text
-
-def lesson_progress(user_id: int, lesson_id: int):
-    """
-    Returns (total_words, mastered_count, attempted_count) for a lesson.
-    If mastered_count == 0, you can display attempted% instead.
-    """
-    # total words in lesson
-    total_df = pd.read_sql(
-        _text("""
-            SELECT COUNT(DISTINCT w.headword) AS total
-            FROM lesson_words lw
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE lw.lesson_id = :l
-        """),
-        con=engine, params={"l": int(lesson_id)}
-    )
-    total = int(total_df.iloc[0]["total"] or 0)
-    if total == 0:
-        return 0, 0, 0
-
-    # list of headwords in lesson
-    hw_df = pd.read_sql(
-        _text("""
-            SELECT DISTINCT w.headword
-            FROM lesson_words lw
-            JOIN words w ON w.word_id = lw.word_id
-            WHERE lw.lesson_id = :l
-        """),
-        con=engine, params={"l": int(lesson_id)}
-    )
-    heads = hw_df["headword"].tolist()
-
-    # mastered & attempted for this user on these headwords
-    stats_df = pd.read_sql(
-        _text("""
-            SELECT
-              SUM(CASE WHEN mastered THEN 1 ELSE 0 END) AS mastered_count,
-              SUM(CASE WHEN total_attempts > 0 THEN 1 ELSE 0 END) AS attempted_count
-            FROM word_stats
-            WHERE user_id = :u AND headword = ANY(:arr)
-        """),
-        con=engine, params={"u": int(user_id), "arr": heads}
-    )
-    mastered = int(stats_df.iloc[0]["mastered_count"] or 0)
-    attempted = int(stats_df.iloc[0]["attempted_count"] or 0)
-    return total, mastered, attempted
-
-def get_missed_words(user_id: int, lesson_id: int):
-    """
-    Returns a list of headwords whose latest attempt in this lesson was incorrect.
-    Falls back to words with correct_streak=0 (but attempted) if no recent wrongs.
-    """
-    latest = pd.read_sql(
-        _text("""
-            WITH last AS (
-              SELECT headword, MAX(id) AS last_id
-              FROM attempts
-              WHERE user_id=:u AND lesson_id=:l
-              GROUP BY headword
-            )
-            SELECT a.headword
-            FROM attempts a
-            JOIN last ON a.id = last.last_id
-            WHERE a.is_correct = FALSE
-        """),
-        con=engine, params={"u": int(user_id), "l": int(lesson_id)}
-    )
-    missed = set(latest["headword"].tolist())
-
-    if not missed:
-        fallback = pd.read_sql(
-            _text("""
-                SELECT DISTINCT w.headword
-                FROM lesson_words lw
-                JOIN words w ON w.word_id = lw.word_id
-                LEFT JOIN word_stats s ON s.user_id=:u AND s.headword = w.headword
-                WHERE lw.lesson_id = :l
-                  AND s.total_attempts > 0
-                  AND COALESCE(s.correct_streak, 0) = 0
-            """),
-            con=engine, params={"u": int(user_id), "l": int(lesson_id)}
-        )
-        missed = set(fallback["headword"].tolist())
-
-    return sorted(missed)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
