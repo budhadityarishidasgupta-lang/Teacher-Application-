@@ -1681,6 +1681,50 @@ with tab_practice:
     elif nextq:
         st.warning("Please **Submit** your answer first, then click **Next**.")
 
+# ========== PATCH START: Dynamic feedback by lesson type (Option A) ==========
+# Detect lesson kind from course/lesson titles (synonym | antonym)
+def detect_lesson_kind(course_title: str, lesson_title: str) -> str:
+    t = f"{str(course_title or '')} {str(lesson_title or '')}".lower()
+    antonym_keys = ["antonym", "antonyms", "opposite", "opposites", "contrary", "reverse"]
+    return "antonym" if any(k in t for k in antonym_keys) else "synonym"
+
+# Deterministic, kid-friendly text (no API needed)
+def feedback_text(headword: str, correct_word: str, lesson_kind: str):
+    h, c = (headword or "").strip(), (correct_word or "").strip()
+    if lesson_kind == "antonym":
+        why = f"'{c}' is an opposite of '{h}'. They mean very different things."
+        examples = [
+            f"I felt {h} in the sunshine, but {c} when plans were canceled.",
+            f"A warm day feels {h}; a stormy day can feel {c}."
+        ]
+    else:
+        # default = synonym
+        why = f"'{c}' means almost the same as '{h}', so it fits here."
+        examples = [
+            f"I felt {c} when I finished my project.",
+            f"Our class was {c} after we won the match."
+        ]
+    return why, examples[:2]
+
+# Override: route old call sites to the new dynamic generator
+def gpt_feedback_examples(headword: str, correct_word: str):
+    """
+    Backward-compatible wrapper.
+    Uses title-based detection to choose synonym/antonym wording.
+    Ignores external APIs (OpenAI/Gemini) for speed and zero cost.
+    """
+    try:
+        # These globals are set in your Student flow
+        course_title = selected_label          # sidebar radio (course label)
+        lesson_title = l_map[lid]              # selected lesson title
+    except Exception:
+        course_title, lesson_title = "", ""
+
+    kind = detect_lesson_kind(course_title, lesson_title)
+    return feedback_text(headword, correct_word, kind)
+# ========== PATCH END: Dynamic feedback by lesson type (Option A) ==========
+
+
 # AFTER-SUBMIT feedback + Back & Next buttons
 if st.session_state.get("answered") and st.session_state.get("eval"):
     ev = st.session_state.eval
@@ -1706,7 +1750,18 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
                 tag = ""
             lines.append(f"- **{opt}** {tag}")
         st.markdown("\n".join(lines))
-        st.caption("Tip: pick all the options that mean almost the same as the main word.")
+
+    # NEW: dynamic tip text based on lesson kind
+        try:
+            lesson_kind = detect_lesson_kind(selected_label, l_map[lid])
+        except Exception:
+            lesson_kind = "synonym"
+        tip = (
+            "Tip: pick all the options that **mean almost the same** as the main word."
+            if lesson_kind == "synonym"
+            else "Tip: pick the options that are **opposites** of the main word."
+        )
+        st.caption(tip)
 
     # GPT feedback (optional)
     try:
@@ -1800,6 +1855,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 # ─────────────────────────────────────────────────────────────────────
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
+
 
 
 
