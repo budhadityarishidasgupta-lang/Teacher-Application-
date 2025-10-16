@@ -999,6 +999,57 @@ def teacher_manage_ui():
                 td2_invalidate()
                 st.success("Removed.")
                 st.rerun()
+
+
+def render_teacher_dashboard_v2():
+    """Render the teacher dashboard experience using the v2 helper routines."""
+
+    st.markdown("### Teacher workspace")
+    st.caption("Create courses, organise lessons, and manage student enrolments from one place.")
+
+    try:
+        summary = pd.read_sql(
+            text(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM courses) AS courses,
+                  (SELECT COUNT(*) FROM lessons) AS lessons,
+                  (SELECT COUNT(*) FROM words)   AS words,
+                  (SELECT COUNT(*) FROM enrollments) AS enrollments
+                """
+            ),
+            con=engine,
+        )
+    except Exception:
+        summary = pd.DataFrame()
+
+    if not summary.empty:
+        c_courses, c_lessons, c_words, c_enroll = st.columns(4)
+        c_courses.metric("Courses", int(summary.iloc[0]["courses"]))
+        c_lessons.metric("Lessons", int(summary.iloc[0]["lessons"]))
+        c_words.metric("Words", int(summary.iloc[0]["words"]))
+        c_enroll.metric("Enrollments", int(summary.iloc[0]["enrollments"]))
+
+    tab_create, tab_manage, tab_help = st.tabs(["Create", "Manage", "Help"])
+
+    with tab_create:
+        teacher_create_ui()
+
+    with tab_manage:
+        teacher_manage_ui()
+
+    with tab_help:
+        st.markdown(
+            """
+            **CSV Tips**
+
+            * Words CSV files must include `headword` and `synonyms` columns.
+            * Bulk course imports support `lesson_title`, `headword`, `synonyms`, and optional `sort_order`.
+            * Use the refresh checkbox to replace existing lesson vocabulary when re-importing.
+
+            **Need a reset?** Use the delete expanders inside the *Manage* tab to remove courses or lessons.
+            """
+        )
 # ─────────────────────────────────────────────────────────────────────
 # AUTH INTEGRATION (optional / append-only)
 # ─────────────────────────────────────────────────────────────────────
@@ -1579,7 +1630,7 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.grid_keys = [
             f"opt_{st.session_state.active_word}_{i}"
             for i in range(len(st.session_state.qdata["choices"]))
-    ]
+        ]
         st.session_state.selection = set()
         st.session_state.answered = False
         st.session_state.eval = None
@@ -1604,82 +1655,82 @@ if st.session_state["auth"]["role"] == "student":
 # ─────────────────────────────────────────────────────────────────────
 # PRACTICE TAB — quiz form + after-submit feedback + Next
 # ─────────────────────────────────────────────────────────────────────
-with tab_practice:
-    # Always start with current selection state
-    temp_selection = set(st.session_state.get("selection", set()))
+    with tab_practice:
+        # Always start with current selection state
+        temp_selection = set(st.session_state.get("selection", set()))
 
-    # The quiz form (no auto-advance)
-    if not st.session_state.answered:
-        with st.form("quiz_form", clear_on_submit=False):
-            st.subheader(f"Word: **{active}**")
-            st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
+        # The quiz form (no auto-advance)
+        if not st.session_state.answered:
+            with st.form("quiz_form", clear_on_submit=False):
+                st.subheader(f"Word: **{active}**")
+                st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
 
-            keys = st.session_state.grid_keys
-            row1 = st.columns(3)
-            row2 = st.columns(3)
-            grid_rows = [row1, row2]
+                keys = st.session_state.grid_keys
+                row1 = st.columns(3)
+                row2 = st.columns(3)
+                grid_rows = [row1, row2]
 
-            for i, opt in enumerate(choices):
-                col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
-                with col:
-                    checked = opt in temp_selection
-                    new_val = st.checkbox(opt, value=checked, key=keys[i])
-                if new_val:
-                    temp_selection.add(opt)
-                else:
-                    temp_selection.discard(opt)
+                for i, opt in enumerate(choices):
+                    col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
+                    with col:
+                        checked = opt in temp_selection
+                        new_val = st.checkbox(opt, value=checked, key=keys[i])
+                    if new_val:
+                        temp_selection.add(opt)
+                    else:
+                        temp_selection.discard(opt)
 
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                submitted = st.form_submit_button("Submit", type="primary")
-            with c2:
-                nextq = st.form_submit_button("Next ▶")
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    submitted = st.form_submit_button("Submit", type="primary")
+                with c2:
+                    nextq = st.form_submit_button("Next ▶")
 
-    else:
-        # Prevent undefined vars when answered state active
-        submitted = False
-        nextq = False
+        else:
+            # Prevent undefined vars when answered state active
+            submitted = False
+            nextq = False
 
-    # Allow going back even before submitting
-    #if st.button("◀ Back", key="btn_back_form"):
-    #    _go_back_to_prev_word(lid, words_df)
+        # Allow going back even before submitting
+        #if st.button("◀ Back", key="btn_back_form"):
+        #    _go_back_to_prev_word(lid, words_df)
 
-    # Always persist selection each render
-    st.session_state.selection = temp_selection
+        # Always persist selection each render
+        st.session_state.selection = temp_selection
 
-    # Handle Submit
-    if submitted:
-        elapsed_ms = (time.time() - st.session_state.q_started_at) * 1000
-        picked_set = set(list(st.session_state.selection))
-        is_correct = (picked_set == correct_set)
+        # Handle Submit
+        if submitted:
+            elapsed_ms = (time.time() - st.session_state.q_started_at) * 1000
+            picked_set = set(list(st.session_state.selection))
+            is_correct = (picked_set == correct_set)
 
-        correct_choice_for_log = list(correct_set)[0]
-        update_after_attempt(
-            USER_ID, cid, lid, active,
-            is_correct, int(elapsed_ms), int(row["difficulty"]),
-            ", ".join(sorted(picked_set)), correct_choice_for_log
-        )
+            correct_choice_for_log = list(correct_set)[0]
+            update_after_attempt(
+                USER_ID, cid, lid, active,
+                is_correct, int(elapsed_ms), int(row["difficulty"]),
+                ", ".join(sorted(picked_set)), correct_choice_for_log
+            )
 
-        st.session_state.answered = True
-        st.session_state.eval = {
-            "is_correct": bool(is_correct),
-            "picked_set": set(picked_set),
-            "correct_set": set(correct_set),
-            "choices": list(choices)
-        }
+            st.session_state.answered = True
+            st.session_state.eval = {
+                "is_correct": bool(is_correct),
+                "picked_set": set(picked_set),
+                "correct_set": set(correct_set),
+                "choices": list(choices)
+            }
 
-        # If wrong, push this headword to the front of the review queue
-        if not is_correct:
-            from collections import deque
-            if "review_queue" not in st.session_state or st.session_state.review_queue is None:
-                st.session_state.review_queue = deque()
-            if st.session_state.active_word not in st.session_state.review_queue:
-                st.session_state.review_queue.appendleft(st.session_state.active_word)
+            # If wrong, push this headword to the front of the review queue
+            if not is_correct:
+                from collections import deque
+                if "review_queue" not in st.session_state or st.session_state.review_queue is None:
+                    st.session_state.review_queue = deque()
+                if st.session_state.active_word not in st.session_state.review_queue:
+                    st.session_state.review_queue.appendleft(st.session_state.active_word)
 
-        st.rerun()
+            st.rerun()
 
-    elif nextq:
-        st.warning("Please **Submit** your answer first, then click **Next**.")
+        elif nextq:
+            st.warning("Please **Submit** your answer first, then click **Next**.")
 
 # ========== PATCH START: Dynamic feedback by lesson type (Option A) ==========
 # Detect lesson kind from course/lesson titles (synonym | antonym)
