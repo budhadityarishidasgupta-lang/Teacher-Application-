@@ -999,6 +999,57 @@ def teacher_manage_ui():
                 td2_invalidate()
                 st.success("Removed.")
                 st.rerun()
+
+
+def render_teacher_dashboard_v2():
+    """Render the teacher dashboard experience using the v2 helper routines."""
+
+    st.markdown("### Teacher workspace")
+    st.caption("Create courses, organise lessons, and manage student enrolments from one place.")
+
+    try:
+        summary = pd.read_sql(
+            text(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM courses) AS courses,
+                  (SELECT COUNT(*) FROM lessons) AS lessons,
+                  (SELECT COUNT(*) FROM words)   AS words,
+                  (SELECT COUNT(*) FROM enrollments) AS enrollments
+                """
+            ),
+            con=engine,
+        )
+    except Exception:
+        summary = pd.DataFrame()
+
+    if not summary.empty:
+        c_courses, c_lessons, c_words, c_enroll = st.columns(4)
+        c_courses.metric("Courses", int(summary.iloc[0]["courses"]))
+        c_lessons.metric("Lessons", int(summary.iloc[0]["lessons"]))
+        c_words.metric("Words", int(summary.iloc[0]["words"]))
+        c_enroll.metric("Enrollments", int(summary.iloc[0]["enrollments"]))
+
+    tab_create, tab_manage, tab_help = st.tabs(["Create", "Manage", "Help"])
+
+    with tab_create:
+        teacher_create_ui()
+
+    with tab_manage:
+        teacher_manage_ui()
+
+    with tab_help:
+        st.markdown(
+            """
+            **CSV Tips**
+
+            * Words CSV files must include `headword` and `synonyms` columns.
+            * Bulk course imports support `lesson_title`, `headword`, `synonyms`, and optional `sort_order`.
+            * Use the refresh checkbox to replace existing lesson vocabulary when re-importing.
+
+            **Need a reset?** Use the delete expanders inside the *Manage* tab to remove courses or lessons.
+            """
+        )
 # ─────────────────────────────────────────────────────────────────────
 # AUTH INTEGRATION (optional / append-only)
 # ─────────────────────────────────────────────────────────────────────
