@@ -1,4 +1,4 @@
-import os, time, random, sqlite3
+import os, time, random, sqlite3, html
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +32,14 @@ st.set_page_config(page_title="Learning English Made Easy", page_icon="📚", la
 
 APP_DIR = Path(__file__).parent
 load_dotenv(APP_DIR / ".env", override=True)
+
+# Global theme (student quiz surface)
+THEME_CSS_PATH = APP_DIR / "static" / "theme.css"
+if THEME_CSS_PATH.exists():
+    try:
+        st.markdown(f"<style>{THEME_CSS_PATH.read_text()}</style>", unsafe_allow_html=True)
+    except Exception:
+        pass
 
 # Student-only toggle (env or URL param)
 FORCE_STUDENT = os.getenv("FORCE_STUDENT_MODE", "0") == "1"
@@ -1449,6 +1457,13 @@ def lesson_progress(user_id: int, lesson_id: int):
 # ─────────────────────────────────────────────────────────────────────
 # UI Helper: compact question header with inline progress bar (theme-agnostic)
 # ─────────────────────────────────────────────────────────────────────
+DIFFICULTY_THEME = {
+    1: {"emoji": "🟢", "label": "Easy", "class": "difficulty-easy"},
+    2: {"emoji": "🟠", "label": "Medium", "class": "difficulty-medium"},
+    3: {"emoji": "🔴", "label": "Hard", "class": "difficulty-hard"},
+}
+
+
 def render_q_header(q_now: int, total_q: int, pct: int, *,
                     fill="#3b82f6", track_light="#e5e7eb", track_dark="#374151"):
     import math
@@ -1463,40 +1478,60 @@ def render_q_header(q_now: int, total_q: int, pct: int, *,
       .qhdr {{
         display:flex;
         align-items:center;
-        gap:12px;
+        gap:14px;
         line-height:1;
         flex-wrap:wrap;
+        font-size: clamp(0.95rem, 0.4vw + 0.8rem, 1rem);
       }}
       .qhdr .track {{
         position:relative;
-        width:240px;
-        height:9px;
+        width:min(360px, 45vw);
+        height:10px;
         border-radius:999px;
         overflow:hidden;
-        background:{track_light};
+        background:var(--quiz-progress-track, {track_light});
+        box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.05);
       }}
       @media (prefers-color-scheme: dark) {{
-        .qhdr .track {{ background:{track_dark}; }}
+        .qhdr .track {{ background:var(--quiz-progress-track-dark, {track_dark}); box-shadow:none; }}
+      }}
+      .qhdr .track::after {{
+        content:"";
+        position:absolute;
+        inset:0;
+        background:linear-gradient(120deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.4) 50%, rgba(255,255,255,0) 100%);
+        transform:translateX(-100%);
+        animation:qhdrShimmer 2.2s ease-in-out infinite;
+        mix-blend-mode: soft-light;
       }}
       .qhdr .fill {{
         position:absolute;
         inset:0;
-        width:{pct}%;
-        background:{fill};
-        transition: width 0.4s ease;
+        width:var(--progress-target, {pct}%);
+        background:linear-gradient(90deg, var(--quiz-progress-fill, {fill}) 0%, var(--quiz-progress-fill, {fill}) 100%);
+        transition:width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
       }}
       .qhdr .pct {{
         opacity:.75;
-        font-size:0.95rem;
+        font-weight:600;
       }}
       .qhdr .label {{
-        font-weight:600;
+        font-weight:700;
         white-space:nowrap;
+        letter-spacing:0.01em;
       }}
       .qhdr .sub {{
         font-weight:500;
-        opacity:.8;
+        opacity:.7;
         margin-right:4px;
+        text-transform:uppercase;
+        letter-spacing:0.12em;
+        font-size:0.78rem;
+      }}
+      @keyframes qhdrShimmer {{
+        0% {{ transform:translateX(-100%); }}
+        60% {{ transform:translateX(100%); }}
+        100% {{ transform:translateX(100%); }}
       }}
     </style>
     """
@@ -1505,7 +1540,7 @@ def render_q_header(q_now: int, total_q: int, pct: int, *,
     <div class="qhdr" aria-label="Question progress: {q_now} of {total_q} ({pct} percent)">
       <div class="label">Q {q_now} / {total_q}</div>
       <div class="sub">Lesson Mastery</div>
-      <div class="track"><div class="fill"></div></div>
+      <div class="track"><div class="fill" style="--progress-target:{pct}%"></div></div>
       <div class="pct">{pct}%</div>
     </div>
     """
@@ -1608,6 +1643,9 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.grid_keys = [
             f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
         ]
+        for _k in st.session_state.grid_keys:
+            if _k in st.session_state:
+                del st.session_state[_k]
         st.session_state.selection = set()
         st.session_state.answered = False
         st.session_state.eval = None
@@ -1631,6 +1669,9 @@ if st.session_state["auth"]["role"] == "student":
             f"opt_{st.session_state.active_word}_{i}"
             for i in range(len(st.session_state.qdata["choices"]))
         ]
+        for _k in st.session_state.grid_keys:
+            if _k in st.session_state:
+                del st.session_state[_k]
         st.session_state.selection = set()
         st.session_state.answered = False
         st.session_state.eval = None
@@ -1659,37 +1700,48 @@ if st.session_state["auth"]["role"] == "student":
         # Always start with current selection state
         temp_selection = set(st.session_state.get("selection", set()))
 
-        # The quiz form (no auto-advance)
+        submitted = False
+        nextq = False
+
         if not st.session_state.answered:
-            with st.form("quiz_form", clear_on_submit=False):
-                st.subheader(f"Word: **{active}**")
-                st.write("Pick the **synonyms** (select all that apply), then press **Submit**.")
+            difficulty_level = int(row.get("difficulty", 2) or 2)
+            diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
+            safe_word = html.escape(active)
 
-                keys = st.session_state.grid_keys
-                row1 = st.columns(3)
-                row2 = st.columns(3)
-                grid_rows = [row1, row2]
+            st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='quiz-heading'><h3>Word: <strong>{safe_word}</strong></h3>"
+                f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "<p class='quiz-instructions'>Pick every option that matches the meaning of the word.</p>",
+                unsafe_allow_html=True,
+            )
 
-                for i, opt in enumerate(choices):
-                    col = grid_rows[0][i] if i < 3 else grid_rows[1][i - 3]
-                    with col:
-                        checked = opt in temp_selection
-                        new_val = st.checkbox(opt, value=checked, key=keys[i])
-                    if new_val:
-                        temp_selection.add(opt)
-                    else:
+            keys = st.session_state.grid_keys
+            st.markdown("<div class='quiz-options-grid'>", unsafe_allow_html=True)
+            for i, opt in enumerate(choices):
+                selected = opt in temp_selection
+                clicked = st.button(
+                    opt,
+                    key=keys[i],
+                    use_container_width=True,
+                    type="primary" if selected else "secondary",
+                )
+                if clicked:
+                    if selected:
                         temp_selection.discard(opt)
+                    else:
+                        temp_selection.add(opt)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    submitted = st.form_submit_button("Submit", type="primary")
-                with c2:
-                    nextq = st.form_submit_button("Next ▶")
+            st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
+            submitted = st.button("Submit", key="btn_submit_quiz", type="primary")
+            nextq = st.button("Next ▶", key="btn_next_quiz")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        else:
-            # Prevent undefined vars when answered state active
-            submitted = False
-            nextq = False
+            st.markdown("</div>", unsafe_allow_html=True)
 
         # Allow going back even before submitting
         #if st.button("◀ Back", key="btn_back_form"):
@@ -1779,13 +1831,28 @@ def gpt_feedback_examples(headword: str, correct_word: str):
 # AFTER-SUBMIT feedback + Back & Next buttons
 if st.session_state.get("answered") and st.session_state.get("eval"):
     ev = st.session_state.eval
-    st.subheader(f"Word: **{st.session_state.active_word}**")
+    difficulty_level = int(row.get("difficulty", 2) or 2)
+    diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
+    safe_word_feedback = html.escape(st.session_state.active_word)
 
-    # Show feedback message
-    if ev["is_correct"]:
-        st.success("✅ Correct!")
-    else:
-        st.error("❌ Not quite. Check the correct answers below.")
+    st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='quiz-heading'><h3>Word: <strong>{safe_word_feedback}</strong></h3>"
+        f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    banner_class = "correct" if ev["is_correct"] else "try-again"
+    banner_text = "🎉 Correct!" if ev["is_correct"] else "🤔 Try again!"
+    st.markdown(
+        f"<div class='feedback-banner {banner_class}'>{banner_text}</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        "<p class='quiz-instructions'>Review the breakdown below, then choose your next step.</p>",
+        unsafe_allow_html=True,
+    )
 
     # Show explanation of options
     with st.expander("Why are these the best choices?", expanded=True):
@@ -1826,43 +1893,43 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
     # ───────────────────────────────────────────────────────────────
     # Buttons: Back and Next
     # ───────────────────────────────────────────────────────────────
-    bcol, ncol = st.columns([1, 1])
+    st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
+    if st.button("◀ Back", key="btn_back_feedback"):
+        _go_back_to_prev_word(lid, words_df)
+    if st.button("Next ▶", key="btn_next_feedback", type="primary"):
+        st.session_state.asked_history.append(st.session_state.active_word)
 
-    # Back button (uses helper defined earlier)
-    with bcol:
-        if st.button("◀ Back", key="btn_back_feedback", use_container_width=True):
-            _go_back_to_prev_word(lid, words_df)
+        # Serve from review queue first
+        if st.session_state.review_queue:
+            next_word = st.session_state.review_queue.popleft()
+        else:
+            next_word = choose_next_word(USER_ID, cid, lid, words_df)
 
-    # Next button (existing logic)
-    with ncol:
-        if st.button("Next ▶", key="btn_next_feedback", use_container_width=True):
-            st.session_state.asked_history.append(st.session_state.active_word)
+        # Load next word
+        st.session_state.active_word = next_word
+        st.session_state.q_started_at = time.time()
+        next_row = words_df[words_df["headword"] == next_word].iloc[0]
+        st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
+        st.session_state.grid_for_word = next_word
+        st.session_state.grid_keys = [
+            f"opt_{next_word}_{i}"
+            for i in range(len(st.session_state.qdata["choices"]))
+        ]
+        for _k in st.session_state.grid_keys:
+            if _k in st.session_state:
+                del st.session_state[_k]
+        st.session_state.selection = set()
+        st.session_state.answered = False
+        st.session_state.eval = None
 
-            # Serve from review queue first
-            if st.session_state.review_queue:
-                next_word = st.session_state.review_queue.popleft()
-            else:
-                next_word = choose_next_word(USER_ID, cid, lid, words_df)
+        # Bump lesson question index
+        st.session_state.q_index_per_lesson[int(lid)] = \
+            st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
 
-            # Load next word
-            st.session_state.active_word = next_word
-            st.session_state.q_started_at = time.time()
-            next_row = words_df[words_df["headword"] == next_word].iloc[0]
-            st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
-            st.session_state.grid_for_word = next_word
-            st.session_state.grid_keys = [
-                f"opt_{next_word}_{i}"
-                for i in range(len(st.session_state.qdata["choices"]))
-            ]
-            st.session_state.selection = set()
-            st.session_state.answered = False
-            st.session_state.eval = None
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            # Bump lesson question index
-            st.session_state.q_index_per_lesson[int(lid)] = \
-                st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
-
-            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1895,6 +1962,9 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
                         st.session_state.grid_keys = [
                             f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
                         ]
+                        for _k in st.session_state.grid_keys:
+                            if _k in st.session_state:
+                                del st.session_state[_k]
                         st.session_state.selection = set()
                         st.session_state.answered = False
                         st.session_state.eval = None
