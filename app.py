@@ -1,4 +1,4 @@
-import os, time, random, sqlite3, html
+import os, time, random, sqlite3, html, base64
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -182,11 +182,25 @@ def init_db():
           correct_streak   INTEGER DEFAULT 0,
           total_attempts   INTEGER DEFAULT 0,
           correct_attempts INTEGER DEFAULT 0,
+          xp_points        INTEGER DEFAULT 0,
+          streak_count     INTEGER DEFAULT 0,
           last_seen        TIMESTAMPTZ,
           mastered         BOOLEAN DEFAULT FALSE,
           difficulty       INTEGER DEFAULT 2,
           due_date         TIMESTAMPTZ,
           PRIMARY KEY (user_id, headword)
+        );
+        """
+        """
+        CREATE TABLE IF NOT EXISTS achievements (
+          achievement_id SERIAL PRIMARY KEY,
+          user_id        INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+          badge_name     TEXT NOT NULL,
+          badge_type     TEXT NOT NULL,
+          emoji          TEXT NOT NULL,
+          xp_bonus       INTEGER DEFAULT 0,
+          awarded_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE (user_id, badge_name)
         );
         """
     ]
@@ -233,10 +247,28 @@ def patch_courses_table():
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0"))
         conn.execute(text("ALTER TABLE words   ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 2"))
 
+def patch_gamification_tables():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE word_stats ADD COLUMN IF NOT EXISTS xp_points INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE word_stats ADD COLUMN IF NOT EXISTS streak_count INTEGER DEFAULT 0"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS achievements (
+              achievement_id SERIAL PRIMARY KEY,
+              user_id        INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+              badge_name     TEXT NOT NULL,
+              badge_type     TEXT NOT NULL,
+              emoji          TEXT NOT NULL,
+              xp_bonus       INTEGER DEFAULT 0,
+              awarded_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE (user_id, badge_name)
+            )
+        """))
+
 # Bootstrap order
 init_db()
 patch_users_table()
 patch_courses_table()
+patch_gamification_tables()
 
 def get_missed_words(user_id: int, lesson_id: int):
     """
@@ -372,43 +404,630 @@ def mastered_count(user_id, lesson_id):
     )["c"].iloc[0]
     return int(m), len(words)
 
-def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, response_ms, difficulty, chosen, correct_choice):
+
+def level_for_xp(xp_total: int):
+    xp_total = int(xp_total or 0)
+    for band in LEVEL_BANDS:
+        upper = band["max"]
+        if upper is None or xp_total <= upper:
+            return band
+    return LEVEL_BANDS[-1]
+
+
+def next_level_band(current_band: dict | None):
+    if not current_band:
+        return None
+    for idx, band in enumerate(LEVEL_BANDS):
+        if band["level"] == current_band["level"]:
+            return LEVEL_BANDS[idx + 1] if idx + 1 < len(LEVEL_BANDS) else None
+    return None
+
+
+def compute_answer_streak(conn, user_id: int, limit: int = 200) -> int:
+    rows = conn.execute(
+        text(
+            """
+            SELECT is_correct
+            FROM attempts
+            WHERE user_id=:u
+            ORDER BY id DESC
+            LIMIT :lim
+            """
+        ),
+        {"u": int(user_id), "lim": int(limit)},
+    ).fetchall()
+
+    streak = 0
+    for row in rows:
+        if row[0]:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def compute_login_streak(conn, user_id: int) -> int:
+    rows = conn.execute(
+        text(
+            """
+            SELECT DISTINCT DATE(ts) AS day
+            FROM attempts
+            WHERE user_id=:u
+            ORDER BY day DESC
+            """
+        ),
+        {"u": int(user_id)},
+    ).fetchall()
+
+    dates = [r[0] for r in rows if r[0] is not None]
+    if not dates:
+        return 0
+
+    streak = 1
+    last_day = dates[0]
+    for day in dates[1:]:
+        if last_day == day:
+            continue
+        if (last_day - day) == timedelta(days=1):
+            streak += 1
+            last_day = day
+        else:
+            break
+    return streak
+
+
+def grant_badge(conn, user_id: int, badge_name: str):
+    definition = BADGE_DEFINITIONS.get(badge_name)
+    if not definition:
+        return None
+
+    exists = conn.execute(
+        text("SELECT 1 FROM achievements WHERE user_id=:u AND badge_name=:b"),
+        {"u": int(user_id), "b": badge_name},
+    ).scalar()
+    if exists:
+        return None
+
+    row = conn.execute(
+        text(
+            """
+            INSERT INTO achievements (user_id, badge_name, badge_type, emoji, xp_bonus)
+            VALUES (:u, :b, :t, :e, :xp)
+            RETURNING achievement_id, badge_name, badge_type, emoji, xp_bonus, awarded_at
+            """
+        ),
+        {
+            "u": int(user_id),
+            "b": badge_name,
+            "t": definition["badge_type"],
+            "e": definition["emoji"],
+            "xp": int(definition.get("xp_bonus", 0)),
+        },
+    ).mappings().fetchone()
+
+    return dict(row) if row else None
+
+
+def evaluate_badges(conn, user_id: int):
+    newly_awarded = []
+
+    def maybe_award(name: str):
+        badge = grant_badge(conn, user_id, name)
+        if badge:
+            newly_awarded.append(badge)
+
+    correct_words = conn.execute(
+        text("SELECT COUNT(*) FROM word_stats WHERE user_id=:u AND correct_attempts > 0"),
+        {"u": int(user_id)},
+    ).scalar() or 0
+    if correct_words >= 1:
+        maybe_award("First Word Hero")
+
+    mastered_total = conn.execute(
+        text("SELECT COUNT(*) FROM word_stats WHERE user_id=:u AND mastered IS TRUE"),
+        {"u": int(user_id)},
+    ).scalar() or 0
+    if mastered_total >= 10:
+        maybe_award("Ten Words Mastered")
+    if mastered_total >= 50:
+        maybe_award("Fifty Words Fluent")
+
+    lesson_sql = text(
+        """
+        WITH lesson_totals AS (
+          SELECT lesson_id, COUNT(DISTINCT word_id) AS total_words
+          FROM lesson_words
+          GROUP BY lesson_id
+        ),
+        lesson_attempts AS (
+          SELECT lesson_id,
+                 COUNT(*) AS total_attempts,
+                 SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) AS correct_attempts,
+                 COUNT(DISTINCT headword) AS distinct_words
+          FROM attempts
+          WHERE user_id = :u
+          GROUP BY lesson_id
+        )
+        SELECT l.course_id,
+               lt.lesson_id,
+               lt.total_words,
+               COALESCE(la.total_attempts, 0) AS total_attempts,
+               COALESCE(la.correct_attempts, 0) AS correct_attempts,
+               COALESCE(la.distinct_words, 0) AS distinct_words
+        FROM lessons l
+        JOIN lesson_totals lt ON lt.lesson_id = l.lesson_id
+        LEFT JOIN lesson_attempts la ON la.lesson_id = lt.lesson_id
+        JOIN enrollments e ON e.course_id = l.course_id AND e.user_id = :u
+        """
+    )
+
+    lesson_rows = conn.execute(lesson_sql, {"u": int(user_id)}).mappings().all()
+
+    has_lesson_champion = False
+    has_perfectionist = False
+    course_tracker: dict[int, dict[str, int]] = {}
+
+    for row in lesson_rows:
+        total_words = int(row.get("total_words") or 0)
+        if total_words <= 0:
+            continue
+
+        total_attempts = int(row.get("total_attempts") or 0)
+        correct_attempts = int(row.get("correct_attempts") or 0)
+        distinct_words = int(row.get("distinct_words") or 0)
+        attempted_all = distinct_words >= total_words
+        accuracy = (correct_attempts / total_attempts) if total_attempts else 0.0
+
+        if attempted_all and accuracy >= 0.90:
+            has_lesson_champion = True
+        if attempted_all and total_attempts > 0 and accuracy >= 0.9999:
+            has_perfectionist = True
+
+        course_id = int(row.get("course_id"))
+        tracker = course_tracker.setdefault(course_id, {"total": 0, "attempted_all": 0, "meets": 0})
+        tracker["total"] += 1
+        if attempted_all:
+            tracker["attempted_all"] += 1
+            if accuracy >= 0.80:
+                tracker["meets"] += 1
+
+    if has_lesson_champion:
+        maybe_award("Lesson Champion")
+    if has_perfectionist:
+        maybe_award("Perfectionist")
+
+    for stats in course_tracker.values():
+        if stats["total"] > 0 and stats["attempted_all"] == stats["total"] and stats["meets"] == stats["total"]:
+            maybe_award("Course Finisher")
+            break
+
+    login_streak = compute_login_streak(conn, user_id)
+    if login_streak >= 7:
+        maybe_award("Weekly Streaker")
+
+    return newly_awarded
+
+
+def gamification_snapshot(user_id: int):
     with engine.begin() as conn:
-        prior = conn.execute(
-            text("SELECT correct_streak FROM word_stats WHERE user_id=:u AND headword=:h"),
-            {"u": user_id, "h": headword}
-        ).scalar()
-        prior = int(prior or 0)
-        new_streak = prior + 1 if is_correct else 0
-        mastered = new_streak >= 3
-        add_days = 3 if (is_correct and mastered) else (1 if is_correct else 0)
+        xp_words = conn.execute(
+            text("SELECT COALESCE(SUM(xp_points), 0) FROM word_stats WHERE user_id=:u"),
+            {"u": int(user_id)},
+        ).scalar() or 0
+        xp_badges = conn.execute(
+            text("SELECT COALESCE(SUM(xp_bonus), 0) FROM achievements WHERE user_id=:u"),
+            {"u": int(user_id)},
+        ).scalar() or 0
+        mastered_total = conn.execute(
+            text("SELECT COUNT(*) FROM word_stats WHERE user_id=:u AND mastered IS TRUE"),
+            {"u": int(user_id)},
+        ).scalar() or 0
+        correct_words = conn.execute(
+            text("SELECT COUNT(*) FROM word_stats WHERE user_id=:u AND correct_attempts > 0"),
+            {"u": int(user_id)},
+        ).scalar() or 0
+        badges = conn.execute(
+            text(
+                """
+                SELECT badge_name, badge_type, emoji, xp_bonus, awarded_at
+                FROM achievements
+                WHERE user_id=:u
+                ORDER BY awarded_at DESC
+                """
+            ),
+            {"u": int(user_id)},
+        ).mappings().all()
+        answer_streak = compute_answer_streak(conn, user_id)
+        login_streak = compute_login_streak(conn, user_id)
+
+    xp_total = int(xp_words) + int(xp_badges)
+    current_band = level_for_xp(xp_total)
+    next_band = next_level_band(current_band)
+
+    if current_band.get("max") is None:
+        progress_pct = 100
+        xp_to_next = 0
+    else:
+        span = max(current_band["max"] - current_band["min"], 1)
+        progress_pct = int(
+            max(
+                0,
+                min(100, round(100 * (xp_total - current_band["min"]) / span)),
+            )
+        )
+        xp_to_next = max(current_band["max"] - xp_total + 1, 0)
+
+    return {
+        "xp_total": xp_total,
+        "xp_from_words": int(xp_words),
+        "xp_from_badges": int(xp_badges),
+        "level": current_band["level"],
+        "level_name": current_band["title"],
+        "level_color": current_band["color"],
+        "next_level": next_band["level"] if next_band else None,
+        "next_level_name": next_band["title"] if next_band else None,
+        "xp_to_next": xp_to_next,
+        "progress_pct": progress_pct,
+        "badges": [dict(b) for b in badges],
+        "mastered_words": int(mastered_total),
+        "correct_words": int(correct_words),
+        "current_streak": int(answer_streak),
+        "login_streak": int(login_streak),
+    }
+
+
+def celebrate_badges(badges):
+    if not badges:
+        return
+    st.markdown(CONFETTI_SNIPPET, unsafe_allow_html=True)
+    try:
+        st.audio(BADGE_CHIME_AUDIO, format="audio/wav", start_time=0)
+    except Exception:
+        pass
+
+
+def inject_gamification_css():
+    if st.session_state.get("_gamification_css_injected"):
+        return
+    css = """
+    <style>
+      .gami-card-shell {
+        background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(16,185,129,0.08));
+        border-radius: 18px;
+        padding: 16px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .gami-top-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .gami-stat {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 110px;
+      }
+      .gami-stat .label {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: rgba(15, 23, 42, 0.6);
+      }
+      .gami-stat .value {
+        font-size: 1.3rem;
+        font-weight: 700;
+      }
+      .gami-stat.level .value {
+        color: var(--gami-level-color, #2563eb);
+      }
+      .gami-progress {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .gami-progress-bar {
+        background: rgba(148, 163, 184, 0.25);
+        border-radius: 999px;
+        height: 10px;
+        overflow: hidden;
+      }
+      .gami-progress-bar .fill {
+        height: 100%;
+        border-radius: inherit;
+        transition: width 0.6s ease;
+      }
+      .gami-progress small {
+        font-size: 0.75rem;
+        color: rgba(15, 23, 42, 0.7);
+      }
+      .gami-streaks {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        font-size: 0.85rem;
+        font-weight: 600;
+      }
+      .gami-streaks .secondary {
+        opacity: 0.7;
+      }
+      .gami-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      .gami-badge {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        width: 62px;
+        padding: 8px 6px;
+        border-radius: 14px;
+        background: rgba(255,255,255,0.65);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.06);
+        transition: transform 0.3s ease, box-shadow 0.3s ease;
+      }
+      .gami-badge .emoji {
+        font-size: 1.3rem;
+      }
+      .gami-badge small {
+        font-size: 0.65rem;
+        font-weight: 600;
+        opacity: 0.85;
+      }
+      .gami-badge.earned {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 18px rgba(59, 130, 246, 0.18);
+      }
+      .gami-badge.locked {
+        opacity: 0.35;
+      }
+      .gami-badge.pulse {
+        animation: gami-pulse 1.4s ease-in-out 3;
+      }
+      @keyframes gami-pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.08); }
+        100% { transform: scale(1); }
+      }
+      .gami-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        font-size: 0.8rem;
+        color: rgba(15, 23, 42, 0.65);
+      }
+      .gami-mobile summary {
+        cursor: pointer;
+        list-style: none;
+        font-weight: 700;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 14px;
+        padding: 12px 16px;
+        background: rgba(255,255,255,0.75);
+        margin-bottom: 8px;
+      }
+      .gami-mobile summary::-webkit-details-marker {
+        display: none;
+      }
+      .gami-mobile summary:after {
+        content: '▾';
+        float: right;
+        opacity: 0.6;
+      }
+      .gami-mobile[open] summary:after {
+        transform: rotate(180deg);
+      }
+      .gami-mobile .gami-card-shell {
+        margin-top: 8px;
+      }
+      .gami-desktop {
+        display: none;
+      }
+      @media (min-width: 900px) {
+        .gami-desktop {
+          display: block;
+        }
+        .gami-mobile {
+          display: none;
+        }
+      }
+      @media (max-width: 899px) {
+        .gami-mobile {
+          display: block;
+          margin-bottom: 16px;
+        }
+      }
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+    st.session_state["_gamification_css_injected"] = True
+
+
+def build_badge_row(snapshot: dict, highlight: set[str]):
+    earned = {b["badge_name"] for b in snapshot.get("badges", [])}
+    pieces = []
+    for name, meta in BADGE_DEFINITIONS.items():
+        classes = ["gami-badge", "earned" if name in earned else "locked"]
+        if name in highlight:
+            classes.append("pulse")
+        tooltip = f"{name} — {meta['milestone']} (+{meta['xp_bonus']} XP)"
+        pieces.append(
+            f"<span class='{' '.join(classes)}' title='{html.escape(tooltip)}'>"
+            f"<span class='emoji'>{meta['emoji']}</span>"
+            f"<small>+{meta['xp_bonus']}</small>"
+            "</span>"
+        )
+    return "".join(pieces)
+
+
+def build_gamification_card(snapshot: dict, highlight: set[str]):
+    inject_gamification_css()
+    xp_total = int(snapshot.get("xp_total", 0))
+    level = int(snapshot.get("level", 1))
+    level_name = html.escape(snapshot.get("level_name", "Learner"))
+    level_color = snapshot.get("level_color", "#2563eb")
+    progress_pct = int(max(0, min(100, snapshot.get("progress_pct", 0))))
+    next_level = snapshot.get("next_level")
+    xp_to_next = int(snapshot.get("xp_to_next") or 0)
+    mastered = int(snapshot.get("mastered_words", 0))
+    correct_words = int(snapshot.get("correct_words", 0))
+    login_streak = int(snapshot.get("login_streak", 0))
+    answer_streak = int(snapshot.get("current_streak", 0))
+
+    if next_level:
+        progress_caption = f"{xp_to_next} XP to Level {next_level}"
+    else:
+        progress_caption = "Legend status unlocked!"
+
+    badge_html = build_badge_row(snapshot, highlight)
+
+    card = f"""
+    <div class="gami-card-shell" style="--gami-level-color:{level_color};">
+      <div class="gami-top-row">
+        <div class="gami-stat">
+          <span class="label">Total XP</span>
+          <span class="value">{xp_total}</span>
+        </div>
+        <div class="gami-stat level">
+          <span class="label">Level</span>
+          <span class="value">Lv {level} · {level_name}</span>
+        </div>
+      </div>
+      <div class="gami-progress">
+        <div class="gami-progress-bar">
+          <div class="fill" style="width:{progress_pct}%; background:{level_color};"></div>
+        </div>
+        <small>{progress_caption}</small>
+      </div>
+      <div class="gami-streaks">
+        <span>🔥 {login_streak}-day streak</span>
+        <span class="secondary">✅ {answer_streak} correct streak</span>
+      </div>
+      <div class="gami-meta">
+        <span>🧠 Mastered words: {mastered}</span>
+        <span>📚 Words practiced: {correct_words}</span>
+      </div>
+      <div class="gami-badges">{badge_html}</div>
+    </div>
+    """
+    return card
+
+
+def render_gamification_panels(snapshot: dict, highlight: set[str] | None = None):
+    highlight = set(highlight or [])
+    card = build_gamification_card(snapshot, highlight)
+    sidebar_html = f"<div class='gami-desktop'>{card}</div>"
+    level = int(snapshot.get("level", 1))
+    level_name = html.escape(snapshot.get("level_name", "Learner"))
+    xp_total = int(snapshot.get("xp_total", 0))
+    mobile_summary = f"⭐ Level {level} · {level_name} — {xp_total} XP"
+    mobile_html = f"""
+    <details class="gami-mobile">
+      <summary>{mobile_summary}</summary>
+      {card}
+    </details>
+    """
+    return sidebar_html, mobile_html
+
+def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, response_ms, difficulty, chosen, correct_choice):
+    xp_awarded = 0
+    xp_for_word = 0
+    new_badges: list[dict] = []
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT correct_streak, streak_count, mastered, xp_points
+                FROM word_stats
+                WHERE user_id=:u AND headword=:h
+                """
+            ),
+            {"u": user_id, "h": headword},
+        ).mappings().fetchone()
+
+        prior_streak = int((row or {}).get("streak_count") or (row or {}).get("correct_streak") or 0)
+        prior_mastered = bool((row or {}).get("mastered"))
+
+        new_streak = prior_streak + 1 if is_correct else 0
+        became_mastered = is_correct and new_streak >= 3 and not prior_mastered
+        mastered_flag = prior_mastered or (is_correct and new_streak >= 3)
+
+        attempt_xp = 10 if is_correct else 0
+        mastery_bonus = 50 if became_mastered else 0
+        xp_for_word = attempt_xp + mastery_bonus
+        xp_awarded += xp_for_word
+
+        add_days = 3 if (is_correct and mastered_flag) else (1 if is_correct else 0)
         due = datetime.utcnow() + timedelta(days=add_days)
 
-        conn.execute(text("""
-            INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, last_seen, mastered, difficulty, due_date)
-            VALUES (:u, :h, :cs, 1, :ca, CURRENT_TIMESTAMP, :m, :d, :due)
-            ON CONFLICT (user_id, headword) DO UPDATE SET
-                correct_streak   = EXCLUDED.correct_streak,
-                total_attempts   = word_stats.total_attempts + 1,
-                correct_attempts = word_stats.correct_attempts + (:ca),
-                last_seen        = CURRENT_TIMESTAMP,
-                mastered         = CASE WHEN :m THEN TRUE ELSE word_stats.mastered END,
-                difficulty       = :d,
-                due_date         = :due
-        """), {
-            "u": user_id, "h": headword, "cs": new_streak,
-            "ca": 1 if is_correct else 0,
-            "m": mastered, "d": int(difficulty), "due": due
-        })
+        conn.execute(
+            text(
+                """
+                INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, xp_points, streak_count, last_seen, mastered, difficulty, due_date)
+                VALUES (:u, :h, :cs, 1, :ca, :xp, :sc, CURRENT_TIMESTAMP, :m, :d, :due)
+                ON CONFLICT (user_id, headword) DO UPDATE SET
+                    correct_streak   = EXCLUDED.correct_streak,
+                    total_attempts   = word_stats.total_attempts + 1,
+                    correct_attempts = word_stats.correct_attempts + (:ca),
+                    xp_points        = word_stats.xp_points + :xp,
+                    streak_count     = EXCLUDED.streak_count,
+                    last_seen        = CURRENT_TIMESTAMP,
+                    mastered         = CASE WHEN :m THEN TRUE ELSE word_stats.mastered END,
+                    difficulty       = :d,
+                    due_date         = :due
+                """
+            ),
+            {
+                "u": user_id,
+                "h": headword,
+                "cs": new_streak,
+                "sc": new_streak,
+                "ca": 1 if is_correct else 0,
+                "xp": xp_for_word,
+                "m": mastered_flag,
+                "d": int(difficulty),
+                "due": due,
+            },
+        )
 
-        conn.execute(text("""
-            INSERT INTO attempts(user_id,course_id,lesson_id,headword,is_correct,response_ms,chosen,correct_choice)
-            VALUES (:u,:c,:l,:h,:ok,:ms,:ch,:cc)
-        """), {
-            "u": user_id, "c": course_id, "l": lesson_id, "h": headword,
-            "ok": bool(is_correct), "ms": int(response_ms),
-            "ch": chosen, "cc": correct_choice
-        })
+        conn.execute(
+            text(
+                """
+                INSERT INTO attempts(user_id,course_id,lesson_id,headword,is_correct,response_ms,chosen,correct_choice)
+                VALUES (:u,:c,:l,:h,:ok,:ms,:ch,:cc)
+                """
+            ),
+            {
+                "u": user_id,
+                "c": course_id,
+                "l": lesson_id,
+                "h": headword,
+                "ok": bool(is_correct),
+                "ms": int(response_ms),
+                "ch": chosen,
+                "cc": correct_choice,
+            },
+        )
+
+        new_badges = evaluate_badges(conn, user_id)
+
+    xp_awarded += sum(int(b.get("xp_bonus", 0) or 0) for b in new_badges)
+
+    return {
+        "xp_awarded": xp_awarded,
+        "xp_for_word": xp_for_word,
+        "new_badges": new_badges,
+        "became_mastered": became_mastered,
+    }
 
 def recent_stats(user_id, course_id, lesson_id, n=10):
     df = pd.read_sql(
@@ -1176,6 +1795,7 @@ st.sidebar.caption(f"Signed in as **{NAME}** ({ROLE})")
 _defaults = {
     "answered": False, "eval": None, "active_word": None, "active_lid": None,
     "q_started_at": 0.0, "selection": set(), "asked_history": [],
+    "gamification": {}, "badges_recent": [], "badge_details_recent": [], "last_xp_gain": 0,
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -1379,6 +1999,10 @@ if st.session_state["auth"]["role"] == "admin":
 if st.session_state["auth"]["role"] == "student":
     _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
 
+    st.session_state.gamification = gamification_snapshot(USER_ID)
+    recent_badge_names = set(st.session_state.get("badges_recent", []))
+    sidebar_card, mobile_card = render_gamification_panels(st.session_state.gamification, recent_badge_names)
+
     courses = pd.read_sql(
         text("""
             SELECT C.course_id, C.title
@@ -1393,6 +2017,7 @@ if st.session_state["auth"]["role"] == "student":
         st.subheader("My courses")
         if courses.empty:
             st.info("No courses assigned yet.")
+            st.markdown(sidebar_card, unsafe_allow_html=True)
             st.stop()
         else:
             labels = []
@@ -1416,6 +2041,9 @@ if st.session_state["auth"]["role"] == "student":
 
             c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
             st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+            st.markdown(sidebar_card, unsafe_allow_html=True)
+
+    st.markdown(mobile_card, unsafe_allow_html=True)
 
 
 
@@ -1464,49 +2092,187 @@ DIFFICULTY_THEME = {
 }
 
 
-def render_q_header(q_now: int, total_q: int, pct: int, *,
-                    fill="#3b82f6", track_light="#e5e7eb", track_dark="#374151"):
+LEVEL_BANDS = [
+    {"level": 1, "min": 0,   "max": 99,  "title": "Learner",   "color": "#22c55e"},  # Green
+    {"level": 2, "min": 100, "max": 249, "title": "Achiever",  "color": "#f97316"},  # Orange
+    {"level": 3, "min": 250, "max": 499, "title": "Explorer",  "color": "#3b82f6"},  # Blue
+    {"level": 4, "min": 500, "max": 999, "title": "Champion",  "color": "#8b5cf6"},  # Purple
+    {"level": 5, "min": 1000, "max": None, "title": "Legend", "color": "#fbbf24"},  # Gold
+]
+
+BADGE_DEFINITIONS = {
+    "First Word Hero": {
+        "emoji": "🥇",
+        "xp_bonus": 20,
+        "badge_type": "milestone",
+        "milestone": "1 correct answer",
+    },
+    "Ten Words Mastered": {
+        "emoji": "🧠",
+        "xp_bonus": 50,
+        "badge_type": "mastery",
+        "milestone": "Master 10 unique words",
+    },
+    "Fifty Words Fluent": {
+        "emoji": "🏆",
+        "xp_bonus": 150,
+        "badge_type": "mastery",
+        "milestone": "Master 50 unique words",
+    },
+    "Lesson Champion": {
+        "emoji": "📘",
+        "xp_bonus": 100,
+        "badge_type": "lesson",
+        "milestone": "Lesson ≥90% accuracy",
+    },
+    "Course Finisher": {
+        "emoji": "🎓",
+        "xp_bonus": 250,
+        "badge_type": "course",
+        "milestone": "All lessons in a course ≥80% accuracy",
+    },
+    "Weekly Streaker": {
+        "emoji": "🔥",
+        "xp_bonus": 70,
+        "badge_type": "streak",
+        "milestone": "7-day login streak",
+    },
+    "Perfectionist": {
+        "emoji": "💎",
+        "xp_bonus": 100,
+        "badge_type": "achievement",
+        "milestone": "Lesson 100% accuracy",
+    },
+}
+
+BADGE_CHIME_BASE64 = (
+    "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"
+)
+
+BADGE_CHIME_AUDIO = base64.b64decode(BADGE_CHIME_BASE64.encode())
+
+CONFETTI_SNIPPET = """
+<script>
+(function(){
+  const existing = window.__streamlit_confetti__;
+  function fire(){
+    if (window.confetti) {
+      window.confetti({
+        particleCount: 120,
+        spread: 70,
+        origin: { y: 0.6 }
+      });
+    }
+  }
+  if (!existing) {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js';
+    script.onload = fire;
+    document.body.appendChild(script);
+    window.__streamlit_confetti__ = true;
+  } else {
+    fire();
+  }
+})();
+</script>
+"""
+
+
+def render_q_header(
+    q_now: int,
+    total_q: int,
+    pct: int,
+    *,
+    fill="#3b82f6",
+    track_light="#e5e7eb",
+    track_dark="#374151",
+    login_streak: int = 0,
+    badge_strip: list[dict] | None = None,
+):
     import math
     import streamlit as st
 
     total_q = max(1, int(total_q or 1))
-    q_now   = max(1, min(int(q_now or 1), total_q))
-    pct     = max(0, min(100, int(math.floor(pct or 0))))
+    q_now = max(1, min(int(q_now or 1), total_q))
+    pct = max(0, min(100, int(math.floor(pct or 0))))
 
-    # ── UI Enhancement · Quiz header progress (duplicate white bar removed) ─────
+    badge_strip = badge_strip or []
+    badge_html = []
+    for item in badge_strip[:5]:
+        classes = ["qhdr-badge"]
+        if item.get("is_new"):
+            classes.append("new")
+        title = html.escape(item.get("name", ""))
+        emoji = html.escape(item.get("emoji", ""))
+        badge_html.append(
+            f"<span class='{' '.join(classes)}' title='{title}'>{emoji}</span>"
+        )
+    if not badge_html:
+        badge_html.append("<span class='qhdr-badge placeholder'>Earn badges ✨</span>")
+
     css = f"""
     <style>
       .qhdr {{
         display:flex;
+        flex-direction:column;
+        gap:10px;
+        padding:12px 18px;
+        background:rgba(59,130,246,0.08);
+        border-radius:16px;
+        border:1px solid rgba(59,130,246,0.18);
+      }}
+      .qhdr-top {{
+        display:flex;
         align-items:center;
         gap:12px;
-        line-height:1;
         flex-wrap:wrap;
+        line-height:1;
         font-size: clamp(0.95rem, 0.4vw + 0.8rem, 1rem);
       }}
-      .qhdr .label {{
+      .qhdr-top .label {{
         font-weight:700;
         white-space:nowrap;
         letter-spacing:0.01em;
       }}
-      .qhdr .sub {{
+      .qhdr-top .sub {{
         font-weight:600;
         opacity:.7;
         text-transform:uppercase;
         letter-spacing:0.12em;
         font-size:0.75rem;
       }}
-      .qhdr .track {{
+      .qhdr-top .track {{
         position:relative;
-        width:min(340px, 44vw);
-        height:8px;
+        flex:1;
+        min-width:200px;
+        height:9px;
         border-radius:999px;
+        background:linear-gradient(90deg,{track_light},{track_light});
         overflow:hidden;
-        background:transparent;
       }}
-      .qhdr .fill {{
-        position:relative;
-        z-index:1;
+      @media (prefers-color-scheme:dark) {{
+        .qhdr-top .track {{
+          background:linear-gradient(90deg,{track_dark},{track_dark});
+        }}
+      }}
+      .qhdr-top .track .fill {{
         display:block;
         height:100%;
         width:var(--progress-target, {pct}%);
@@ -1515,22 +2281,70 @@ def render_q_header(q_now: int, total_q: int, pct: int, *,
         box-shadow:0 0 6px rgba(59, 130, 246, 0.55);
         transition:width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
       }}
-      .qhdr .pct {{
+      .qhdr-top .pct {{
         opacity:.75;
         font-weight:600;
+      }}
+      .qhdr-meta {{
+        display:flex;
+        flex-wrap:wrap;
+        align-items:center;
+        gap:12px;
+        font-size:0.82rem;
+      }}
+      .qhdr-meta .streak {{
+        font-weight:700;
+        display:flex;
+        align-items:center;
+        gap:6px;
+      }}
+      .qhdr-badges {{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        flex-wrap:wrap;
+      }}
+      .qhdr-badge {{
+        font-size:1.2rem;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        transition:transform 0.35s ease;
+      }}
+      .qhdr-badge.placeholder {{
+        font-size:0.75rem;
+        font-weight:600;
+        opacity:0.65;
+        padding:2px 8px;
+        border-radius:999px;
+        border:1px dashed rgba(59,130,246,0.45);
+      }}
+      .qhdr-badge.new {{
+        animation:qhdr-pop 1.4s ease-in-out 3;
+      }}
+      @keyframes qhdr-pop {{
+        0% {{ transform: scale(1); }}
+        50% {{ transform: scale(1.25); }}
+        100% {{ transform: scale(1); }}
       }}
     </style>
     """
 
-    html = f"""
-    <div class="qhdr" aria-label="Question progress: {q_now} of {total_q} ({pct} percent)">
-      <div class="label">Q {q_now} / {total_q}</div>
-      <div class="sub">Lesson Mastery</div>
-      <div class="track"><div class="fill" style="--progress-target:{pct}%"></div></div>
-      <div class="pct">{pct}%</div>
+    html_block = f"""
+    <div class=\"qhdr\" aria-label=\"Question progress: {q_now} of {total_q} ({pct} percent)\">
+      <div class=\"qhdr-top\">
+        <div class=\"label\">Q {q_now} / {total_q}</div>
+        <div class=\"sub\">Lesson Mastery</div>
+        <div class=\"track\"><div class=\"fill\" style=\"--progress-target:{pct}%\"></div></div>
+        <div class=\"pct\">{pct}%</div>
+      </div>
+      <div class=\"qhdr-meta\">
+        <span class=\"streak\">🔥 {int(login_streak)}-day streak</span>
+        <div class=\"qhdr-badges\">{''.join(badge_html)}</div>
+      </div>
     </div>
     """
-    st.markdown(css + html, unsafe_allow_html=True)
+    st.markdown(css + html_block, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1674,7 +2488,23 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.answered = False
 
 # Render compact header with inline progress bar (before tabs)
-    render_q_header(q_now, total_q, pct)
+    header_badges = [
+        {
+            "emoji": b.get("emoji", ""),
+            "name": b.get("badge_name", ""),
+            "is_new": b.get("badge_name") in recent_badge_names,
+        }
+        for b in st.session_state.gamification.get("badges", [])[:4]
+    ]
+
+    render_q_header(
+        q_now,
+        total_q,
+        pct,
+        login_streak=st.session_state.gamification.get("login_streak", 0),
+        badge_strip=header_badges,
+    )
+    st.session_state.badges_recent = []
 
 # Tabs for Practice vs Review (header stays ABOVE)
     tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
@@ -1743,11 +2573,26 @@ if st.session_state["auth"]["role"] == "student":
             is_correct = (picked_set == correct_set)
 
             correct_choice_for_log = list(correct_set)[0]
-            update_after_attempt(
-                USER_ID, cid, lid, active,
-                is_correct, int(elapsed_ms), int(row["difficulty"]),
-                ", ".join(sorted(picked_set)), correct_choice_for_log
+            result = update_after_attempt(
+                USER_ID,
+                cid,
+                lid,
+                active,
+                is_correct,
+                int(elapsed_ms),
+                int(row["difficulty"]),
+                ", ".join(sorted(picked_set)),
+                correct_choice_for_log,
             )
+
+            st.session_state.last_xp_gain = int(result.get("xp_awarded", 0) or 0)
+            st.session_state.badges_recent = [
+                b.get("badge_name") for b in result.get("new_badges", [])
+            ]
+            st.session_state.badge_details_recent = result.get("new_badges", [])
+            if result.get("new_badges"):
+                celebrate_badges(result["new_badges"])
+            st.session_state.gamification = gamification_snapshot(USER_ID)
 
             st.session_state.answered = True
             st.session_state.eval = {
@@ -1839,6 +2684,19 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         "<p class='quiz-instructions'>Review the breakdown below, then choose your next step.</p>",
         unsafe_allow_html=True,
     )
+
+    xp_gain = int(st.session_state.get("last_xp_gain", 0) or 0)
+    if xp_gain:
+        st.success(f"⭐ You earned {xp_gain} XP!")
+
+    new_badges = st.session_state.get("badge_details_recent", [])
+    if new_badges:
+        badge_list = ", ".join(
+            f"{b.get('emoji', '')} {b.get('badge_name', '')}".strip()
+            for b in new_badges
+        )
+        st.info(f"New badge unlocked: {badge_list}")
+        st.session_state.badge_details_recent = []
 
     # Show explanation of options
     with st.expander("Why are these the best choices?", expanded=True):
