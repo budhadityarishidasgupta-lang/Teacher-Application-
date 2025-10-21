@@ -82,34 +82,13 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe!123")
 TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
 
 # Gamification constants (declared early so helper functions can use them)
-DEFAULT_LEVEL_BANDS = [
+LEVEL_BANDS: list[dict[str, object]] = [
     {"level": 1, "min": 0,   "max": 99,  "title": "Learner",   "color": "#22c55e"},  # Green
     {"level": 2, "min": 100, "max": 249, "title": "Achiever",  "color": "#f97316"},  # Orange
     {"level": 3, "min": 250, "max": 499, "title": "Explorer",  "color": "#3b82f6"},  # Blue
     {"level": 4, "min": 500, "max": 999, "title": "Champion",  "color": "#8b5cf6"},  # Purple
     {"level": 5, "min": 1000, "max": None, "title": "Legend", "color": "#fbbf24"},  # Gold
 ]
-
-
-# ensure the global symbol always exists, even if a stale module snapshot is reused
-LEVEL_BANDS: list[dict] = globals().get("LEVEL_BANDS", [])
-
-
-def _ensure_level_bands() -> list[dict]:
-    """Return the active level band configuration, repairing missing globals."""
-
-    bands = globals().get("LEVEL_BANDS")
-    if not bands:
-        # Streamlit reloads the file top-to-bottom, but some deployments cache an
-        # older module object.  Guarantee a definition so helper calls never see a
-        # NameError even if an outdated module snapshot is still around.
-        bands = DEFAULT_LEVEL_BANDS.copy()
-        globals()["LEVEL_BANDS"] = bands
-    return bands
-
-
-# expose the mutable reference expected elsewhere in the file
-LEVEL_BANDS = _ensure_level_bands()
 
 
 BADGE_DEFINITIONS = {
@@ -483,21 +462,19 @@ def mastered_count(user_id, lesson_id):
 
 def level_for_xp(xp_total: int):
     xp_total = int(xp_total or 0)
-    for band in _ensure_level_bands():
+    for band in LEVEL_BANDS:
         upper = band["max"]
         if upper is None or xp_total <= upper:
             return band
-    bands = _ensure_level_bands()
-    return bands[-1]
+    return LEVEL_BANDS[-1]
 
 
 def next_level_band(current_band: dict | None):
     if not current_band:
         return None
-    bands = _ensure_level_bands()
-    for idx, band in enumerate(bands):
+    for idx, band in enumerate(LEVEL_BANDS):
         if band["level"] == current_band["level"]:
-            return bands[idx + 1] if idx + 1 < len(bands) else None
+            return LEVEL_BANDS[idx + 1] if idx + 1 < len(LEVEL_BANDS) else None
     return None
 
 
