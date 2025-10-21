@@ -1473,47 +1473,16 @@ def render_q_header(q_now: int, total_q: int, pct: int, *,
     q_now   = max(1, min(int(q_now or 1), total_q))
     pct     = max(0, min(100, int(math.floor(pct or 0))))
 
+    # ── UI Enhancement · Quiz header progress (duplicate white bar removed) ─────
     css = f"""
     <style>
       .qhdr {{
         display:flex;
         align-items:center;
-        gap:14px;
+        gap:12px;
         line-height:1;
         flex-wrap:wrap;
         font-size: clamp(0.95rem, 0.4vw + 0.8rem, 1rem);
-      }}
-      .qhdr .track {{
-        position:relative;
-        width:min(360px, 45vw);
-        height:10px;
-        border-radius:999px;
-        overflow:hidden;
-        background:var(--quiz-progress-track, {track_light});
-        box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.05);
-      }}
-      @media (prefers-color-scheme: dark) {{
-        .qhdr .track {{ background:var(--quiz-progress-track-dark, {track_dark}); box-shadow:none; }}
-      }}
-      .qhdr .track::after {{
-        content:"";
-        position:absolute;
-        inset:0;
-        background:linear-gradient(120deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.4) 50%, rgba(255,255,255,0) 100%);
-        transform:translateX(-100%);
-        animation:qhdrShimmer 2.2s ease-in-out infinite;
-        mix-blend-mode: soft-light;
-      }}
-      .qhdr .fill {{
-        position:absolute;
-        inset:0;
-        width:var(--progress-target, {pct}%);
-        background:linear-gradient(90deg, var(--quiz-progress-fill, {fill}) 0%, var(--quiz-progress-fill, {fill}) 100%);
-        transition:width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
-      }}
-      .qhdr .pct {{
-        opacity:.75;
-        font-weight:600;
       }}
       .qhdr .label {{
         font-weight:700;
@@ -1521,17 +1490,34 @@ def render_q_header(q_now: int, total_q: int, pct: int, *,
         letter-spacing:0.01em;
       }}
       .qhdr .sub {{
-        font-weight:500;
+        font-weight:600;
         opacity:.7;
-        margin-right:4px;
         text-transform:uppercase;
         letter-spacing:0.12em;
-        font-size:0.78rem;
+        font-size:0.75rem;
       }}
-      @keyframes qhdrShimmer {{
-        0% {{ transform:translateX(-100%); }}
-        60% {{ transform:translateX(100%); }}
-        100% {{ transform:translateX(100%); }}
+      .qhdr .track {{
+        position:relative;
+        width:min(340px, 44vw);
+        height:8px;
+        border-radius:999px;
+        overflow:hidden;
+        background:transparent;
+      }}
+      .qhdr .fill {{
+        position:relative;
+        z-index:1;
+        display:block;
+        height:100%;
+        width:var(--progress-target, {pct}%);
+        border-radius:inherit;
+        background:linear-gradient(90deg, var(--quiz-progress-fill, {fill}) 0%, var(--quiz-progress-fill, {fill}) 100%);
+        box-shadow:0 0 6px rgba(59, 130, 246, 0.55);
+        transition:width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
+      }}
+      .qhdr .pct {{
+        opacity:.75;
+        font-weight:600;
       }}
     </style>
     """
