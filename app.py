@@ -2072,7 +2072,7 @@ if st.session_state["auth"]["role"] == "student":
         st.subheader("My courses")
         if courses.empty:
             st.info("No courses assigned yet.")
-            st.markdown(sidebar_card, unsafe_allow_html=True)
+    #        st.markdown(sidebar_card, unsafe_allow_html=True)
             st.stop()
         else:
             labels = []
@@ -2096,7 +2096,7 @@ if st.session_state["auth"]["role"] == "student":
 
             c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
             st.caption(f"Selected: {selected_label} — {c_pct}% complete")
-            st.markdown(sidebar_card, unsafe_allow_html=True)
+#            st.markdown(sidebar_card, unsafe_allow_html=True)
 
     st.markdown(mobile_card, unsafe_allow_html=True)
 
