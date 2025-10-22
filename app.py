@@ -2526,7 +2526,7 @@ if st.session_state["auth"]["role"] == "student":
             diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
             safe_word = html.escape(active)
 
-            st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
+   #         st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
             st.markdown(
                 f"<div class='quiz-heading'><h3>Word: <strong>{safe_word}</strong></h3>"
                 f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
@@ -2559,7 +2559,7 @@ if st.session_state["auth"]["role"] == "student":
             nextq = st.button("Next ▶", key="btn_next_quiz")
             st.markdown("</div>", unsafe_allow_html=True)
 
-            st.markdown("</div>", unsafe_allow_html=True)
+    #        st.markdown("</div>", unsafe_allow_html=True)
 
         # Allow going back even before submitting
         #if st.button("◀ Back", key="btn_back_form"):
@@ -2668,7 +2668,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
     diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
     safe_word_feedback = html.escape(st.session_state.active_word)
 
-    st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
+#    st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
     st.markdown(
         f"<div class='quiz-heading'><h3>Word: <strong>{safe_word_feedback}</strong></h3>"
         f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
@@ -2775,7 +2775,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+#    st.markdown("</div>", unsafe_allow_html=True)
 
 
     # ─────────────────────────────────────────────────────────────────────
