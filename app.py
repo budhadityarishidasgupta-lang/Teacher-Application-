@@ -1322,37 +1322,155 @@ if st.session_state["auth"]["role"] == "admin":
     _hide_default_h1_and_set("welcome to English Learning made easy - Teacher Console")
     tab_admin, tab_teacher, tab_student = st.tabs(["Admin Section","Teacher Dashboard","Student Dashboard"])
 
-    # Admin Section — manage student accounts
+    # ==== LEGACY ADMIN SECTION (commented for v3 redesign) ====
+    # with tab_admin:
+    #     st.subheader("Manage Students")
+    #     df = all_students_df()
+    #     st.dataframe(df, use_container_width=True)
+    #
+    #     st.markdown("**Create Student**")
+    #     with st.form("create_student"):
+    #         c1,c2,c3=st.columns(3)
+    #         with c1: s_name  = st.text_input("Name", key="adm_create_name")
+    #         with c2: s_email = st.text_input("Email", key="adm_create_email")
+    #         with c3: s_pwd   = st.text_input("Temp Password", value="Learn123!", type="password", key="adm_create_pwd")
+    #         go = st.form_submit_button("Create")
+    #         if go and s_name and s_email and s_pwd:
+    #             try:
+    #                 create_user(s_name, s_email.strip().lower(), s_pwd, "student")
+    #                 st.success("Student created.")
+    #             except Exception as ex:
+    #                 st.error(f"Could not create user: {ex}")
+    #
+    #     if not df.empty:
+    #         st.markdown("**Enable / Disable**")
+    #         sid = st.selectbox(
+    #             "Student",
+    #             df["user_id"].tolist(),
+    #             format_func=lambda x: df.loc[df["user_id"]==x,"name"].values[0],
+    #             key="admin_toggle_student"
+    #         )
+    #         active = st.radio("Status", ["Enable","Disable"], horizontal=True, key="admin_status_radio")
+    #         if st.button("Apply status", key="admin_apply_status"):
+    #             set_user_active(sid, active=="Enable"); st.success("Updated.")
+
     with tab_admin:
-        st.subheader("Manage Students")
-        df = all_students_df()
-        st.dataframe(df, use_container_width=True)
+        # ==== START: ADMIN CONSOLE v3 (Sprint 1) ====
+        tab_students, tab_teachers, tab_courses = st.tabs(["Students", "Teachers", "Courses & Lessons"])
 
-        st.markdown("**Create Student**")
-        with st.form("create_student"):
-            c1,c2,c3=st.columns(3)
-            with c1: s_name  = st.text_input("Name", key="adm_create_name")
-            with c2: s_email = st.text_input("Email", key="adm_create_email")
-            with c3: s_pwd   = st.text_input("Temp Password", value="Learn123!", type="password", key="adm_create_pwd")
-            go = st.form_submit_button("Create")
-            if go and s_name and s_email and s_pwd:
-                try:
-                    create_user(s_name, s_email.strip().lower(), s_pwd, "student")
-                    st.success("Student created.")
-                except Exception as ex:
-                    st.error(f"Could not create user: {ex}")
+        # ───────────────────────────────────────────────
+        # TAB 1 — STUDENTS MANAGEMENT
+        # ───────────────────────────────────────────────
+        with tab_students:
+            st.subheader("👩‍🎓 Students Management")
 
-        if not df.empty:
-            st.markdown("**Enable / Disable**")
-            sid = st.selectbox(
-                "Student",
-                df["user_id"].tolist(),
-                format_func=lambda x: df.loc[df["user_id"]==x,"name"].values[0],
-                key="admin_toggle_student"
+            search_q = st.text_input("Search student by name or email", key="adm_stu_search")
+            df_students = all_students_df()
+            if search_q.strip():
+                m = df_students["name"].str.contains(search_q, case=False, na=False) | \
+                    df_students["email"].str.contains(search_q, case=False, na=False)
+                df_students = df_students[m]
+            st.dataframe(df_students, use_container_width=True)
+
+            st.markdown("### ➕ Add / Enroll Student")
+            with st.form("adm_add_student"):
+                c1, c2, c3 = st.columns(3)
+                with c1: s_name = st.text_input("Name")
+                with c2: s_email = st.text_input("Email")
+                with c3: s_pwd = st.text_input("Temp Password", value="Learn123!", type="password")
+                if st.form_submit_button("Create Student", type="primary"):
+                    if s_name and s_email:
+                        try:
+                            create_user(s_name, s_email.strip().lower(), s_pwd, "student")
+                            st.success("✅ Student created successfully.")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Creation failed: {ex}")
+                    else:
+                        st.warning("Please fill all fields.")
+
+            st.markdown("### ⚙️ Manage Status")
+            if not df_students.empty:
+                selected_ids = st.multiselect(
+                    "Select students",
+                    df_students["user_id"].tolist(),
+                    format_func=lambda x: f"{df_students.loc[df_students['user_id']==x,'name'].values[0]}"
+                )
+                action = st.selectbox("Action", ["Deactivate", "Reactivate", "Delete"])
+                if st.button("Apply Action", type="primary"):
+                    with engine.begin() as conn:
+                        for sid in selected_ids:
+                            if action == "Deactivate":
+                                conn.execute(text("UPDATE users SET is_active=FALSE WHERE user_id=:u"), {"u": sid})
+                            elif action == "Reactivate":
+                                conn.execute(text("UPDATE users SET is_active=TRUE WHERE user_id=:u"), {"u": sid})
+                            elif action == "Delete":
+                                conn.execute(text("DELETE FROM users WHERE user_id=:u AND role='student'"), {"u": sid})
+                    st.success(f"{action} applied to {len(selected_ids)} student(s).")
+                    st.rerun()
+            else:
+                st.info("No students available yet.")
+
+        # ───────────────────────────────────────────────
+        # TAB 2 — TEACHERS MANAGEMENT
+        # ───────────────────────────────────────────────
+        with tab_teachers:
+            st.subheader("👨‍🏫 Teachers Management")
+            df_teachers = pd.read_sql(
+                text("SELECT user_id,name,email,is_active FROM users WHERE role='admin' ORDER BY name"),
+                con=engine
             )
-            active = st.radio("Status", ["Enable","Disable"], horizontal=True, key="admin_status_radio")
-            if st.button("Apply status", key="admin_apply_status"):
-                set_user_active(sid, active=="Enable"); st.success("Updated.")
+            st.dataframe(df_teachers, use_container_width=True)
+
+            st.markdown("### ➕ Add Teacher Account")
+            with st.form("adm_add_teacher"):
+                c1, c2 = st.columns(2)
+                with c1: t_name = st.text_input("Name")
+                with c2: t_email = st.text_input("Email")
+                pwd = st.text_input("Temp Password", value="Teach123!", type="password")
+                if st.form_submit_button("Create Teacher", type="primary"):
+                    if t_name and t_email:
+                        try:
+                            create_user(t_name, t_email.strip().lower(), pwd, "admin")
+                            st.success("✅ Teacher account created.")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Failed: {ex}")
+                    else:
+                        st.warning("Please fill all fields.")
+
+        # ───────────────────────────────────────────────
+        # TAB 3 — COURSES & LESSONS OVERVIEW
+        # ───────────────────────────────────────────────
+        with tab_courses:
+            st.subheader("📘 Courses & Lessons Overview")
+            df_courses = td2_get_courses()
+            if df_courses.empty:
+                st.info("No courses found. Create new ones in the Teacher Dashboard.")
+            else:
+                search_course = st.text_input("Search course")
+                if search_course.strip():
+                    m = df_courses["title"].str.contains(search_course, case=False, na=False)
+                    df_courses = df_courses[m]
+                st.dataframe(df_courses, use_container_width=True)
+
+                st.markdown("### 🧾 Quick Actions")
+                selected_course = st.selectbox(
+                    "Select course for details",
+                    df_courses["course_id"].tolist(),
+                    format_func=lambda x: df_courses.loc[df_courses["course_id"]==x,"title"].values[0],
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("View Lessons"):
+                        dfl = td2_get_lessons(selected_course)
+                        st.dataframe(dfl, use_container_width=True)
+                with c2:
+                    if st.button("View Enrolled Students"):
+                        dfe = td2_get_enrollments_for_course(selected_course)
+                        st.dataframe(dfe, use_container_width=True)
+
+        # ==== END: ADMIN CONSOLE v3 (Sprint 1) ====
 
     # Teacher Dashboard
     with tab_teacher:
@@ -1960,7 +2078,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
 # ─────────────────────────────────────────────────────────────────────
-APP_VERSION = os.getenv("APP_VERSION", "dev")
+APP_VERSION = "v3-admin-sprint1"
 st.markdown(f"<div style='text-align:center;opacity:0.6;'>Version: {APP_VERSION}</div>", unsafe_allow_html=True)
 
 
