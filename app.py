@@ -1,6 +1,6 @@
 import os, time, random, sqlite3, html, base64
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 
 import numpy as np
@@ -247,6 +247,24 @@ def init_db():
         );
         """
         """
+        CREATE TABLE IF NOT EXISTS classes (
+          class_id    SERIAL PRIMARY KEY,
+          name        TEXT NOT NULL,
+          start_date  DATE,
+          is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+          archived_at TIMESTAMPTZ,
+          created_at  TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        """
+        CREATE TABLE IF NOT EXISTS class_students (
+          class_id    INTEGER NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+          user_id     INTEGER NOT NULL REFERENCES users(user_id)   ON DELETE CASCADE,
+          assigned_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (class_id, user_id)
+        );
+        """
+        """
         CREATE TABLE IF NOT EXISTS achievements (
           achievement_id SERIAL PRIMARY KEY,
           user_id        INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -424,6 +442,101 @@ def all_students_df():
     for c in ["correct_total","attempts_total","mastered_count"]:
         df[c] = df[c].fillna(0).astype(int)
     return df.sort_values("name")
+
+def create_classroom(name: str, start_date=None):
+    with engine.begin() as conn:
+        cid = conn.execute(
+            text(
+                """INSERT INTO classes(name,start_date)
+                        VALUES (:n,:d)
+                        RETURNING class_id"""
+            ),
+            {"n": name, "d": start_date},
+        ).scalar()
+    return cid
+
+def get_classrooms(include_archived: bool = False) -> pd.DataFrame:
+    sql = "SELECT class_id,name,start_date,is_archived,archived_at,created_at FROM classes"
+    if not include_archived:
+        sql += " WHERE is_archived=FALSE"
+    sql += " ORDER BY is_archived, COALESCE(start_date, '1970-01-01'::date), name"
+    return pd.read_sql(text(sql), con=engine)
+
+def get_class_students(class_id: int) -> pd.DataFrame:
+    sql = text(
+        """
+        SELECT u.user_id, u.name, u.email, u.is_active, cs.assigned_at
+        FROM class_students cs
+        JOIN users u ON u.user_id = cs.user_id
+        WHERE cs.class_id = :cid
+        ORDER BY u.name
+        """
+    )
+    return pd.read_sql(sql, con=engine, params={"cid": int(class_id)})
+
+def assign_students_to_class(class_id: int, student_ids: list[int]):
+    if not student_ids:
+        return
+    with engine.begin() as conn:
+        for sid in student_ids:
+            conn.execute(
+                text(
+                    """INSERT INTO class_students(class_id,user_id)
+                            VALUES (:c,:s)
+                            ON CONFLICT (class_id,user_id) DO NOTHING"""
+                ),
+                {"c": int(class_id), "s": int(sid)},
+            )
+
+def unassign_students_from_class(class_id: int, student_ids: list[int]):
+    if not student_ids:
+        return
+    with engine.begin() as conn:
+        for sid in student_ids:
+            conn.execute(
+                text("DELETE FROM class_students WHERE class_id=:c AND user_id=:s"),
+                {"c": int(class_id), "s": int(sid)},
+            )
+
+def set_class_archived(class_id: int, archive: bool):
+    with engine.begin() as conn:
+        if archive:
+            conn.execute(
+                text(
+                    """UPDATE classes
+                        SET is_archived=TRUE,
+                            archived_at=COALESCE(archived_at, CURRENT_TIMESTAMP)
+                      WHERE class_id=:c"""
+                ),
+                {"c": int(class_id)},
+            )
+        else:
+            conn.execute(
+                text(
+                    """UPDATE classes
+                        SET is_archived=FALSE,
+                            archived_at=NULL
+                      WHERE class_id=:c"""
+                ),
+                {"c": int(class_id)},
+            )
+
+def get_classes_for_student(user_id: int, include_archived: bool = True) -> pd.DataFrame:
+    sql = """
+        SELECT c.class_id,
+               c.name,
+               c.start_date,
+               c.is_archived,
+               c.archived_at,
+               cs.assigned_at
+        FROM class_students cs
+        JOIN classes c ON c.class_id = cs.class_id
+        WHERE cs.user_id = :uid
+    """
+    if not include_archived:
+        sql += " AND c.is_archived=FALSE"
+    sql += " ORDER BY c.is_archived, COALESCE(c.start_date, '1970-01-01'::date), c.name"
+    return pd.read_sql(text(sql), con=engine, params={"uid": int(user_id)})
 
 def lesson_words(course_id, lesson_id):
     sql = """
@@ -2086,6 +2199,89 @@ if st.session_state["auth"]["role"] == "admin":
             else:
                 st.info("No students available yet.")
 
+            st.markdown("### 🏫 Classrooms")
+            show_archived = st.checkbox("Show archived classes", value=False, key="adm_show_archived_classes")
+            df_classes = get_classrooms(include_archived=show_archived)
+            if df_classes.empty:
+                st.info("No classrooms yet. Create one below.")
+            else:
+                df_display = df_classes.copy()
+                for col in ["start_date", "created_at", "archived_at"]:
+                    if col in df_display:
+                        df_display[col] = df_display[col].astype(str)
+                st.dataframe(df_display, use_container_width=True)
+
+            with st.form("adm_create_classroom"):
+                c1, c2 = st.columns([2, 1])
+                with c1:
+                    class_name = st.text_input("Class name")
+                with c2:
+                    default_date = date.today()
+                    class_start = st.date_input("Commencement date", value=default_date)
+                if st.form_submit_button("Create Classroom", type="primary"):
+                    if class_name and class_name.strip():
+                        create_classroom(class_name.strip(), class_start)
+                        st.success("Classroom created.")
+                        st.rerun()
+                    else:
+                        st.warning("Please provide a class name.")
+
+            if not df_classes.empty:
+                st.markdown("#### Manage classroom roster")
+                class_options = df_classes["class_id"].tolist()
+                selected_class = st.selectbox(
+                    "Select classroom",
+                    class_options,
+                    format_func=lambda x: f"{df_classes.loc[df_classes['class_id']==x,'name'].values[0]}",
+                    key="adm_class_select",
+                )
+
+                class_row = df_classes[df_classes["class_id"] == selected_class].iloc[0]
+                start_label = class_row.get("start_date")
+                status_label = "Archived" if class_row.get("is_archived") else "Active"
+                st.caption(
+                    f"Status: **{status_label}** • Commences: {start_label if start_label else 'TBD'}"
+                )
+
+                class_students_df = get_class_students(int(selected_class))
+                if class_students_df.empty:
+                    st.info("No students assigned yet.")
+                else:
+                    df_roster = class_students_df.copy()
+                    df_roster["assigned_at"] = df_roster["assigned_at"].astype(str)
+                    st.dataframe(df_roster[["name", "email", "is_active", "assigned_at"]], use_container_width=True)
+
+                current_student_ids = (
+                    class_students_df["user_id"].tolist() if not class_students_df.empty else []
+                )
+                available_students = df_students[~df_students["user_id"].isin(current_student_ids)]
+                with st.form("adm_update_class_roster"):
+                    add_choices = available_students["user_id"].tolist()
+                    add_selection = st.multiselect(
+                        "Add students",
+                        add_choices,
+                        format_func=lambda x: f"{available_students.loc[available_students['user_id']==x,'name'].values[0]}"
+                        if not available_students.empty else str(x),
+                    )
+                    remove_selection = st.multiselect(
+                        "Remove students",
+                        class_students_df["user_id"].tolist() if not class_students_df.empty else [],
+                        format_func=lambda x: f"{class_students_df.loc[class_students_df['user_id']==x,'name'].values[0]}"
+                        if not class_students_df.empty else str(x),
+                    )
+                    if st.form_submit_button("Update Classroom", type="primary"):
+                        assign_students_to_class(int(selected_class), add_selection)
+                        unassign_students_from_class(int(selected_class), remove_selection)
+                        st.success("Classroom roster updated.")
+                        st.rerun()
+
+                archive_label = "Restore Classroom" if class_row.get("is_archived") else "Archive Classroom"
+                if st.button(archive_label, key="adm_toggle_archive_class", type="secondary"):
+                    current_archived = bool(class_row.get("is_archived"))
+                    set_class_archived(int(selected_class), not current_archived)
+                    st.success("Classroom archived." if not current_archived else "Classroom restored.")
+                    st.rerun()
+
         # ───────────────────────────────────────────────
         # TAB 2 — TEACHERS MANAGEMENT
         # ───────────────────────────────────────────────
@@ -2168,6 +2364,29 @@ if st.session_state["auth"]["role"] == "admin":
         st.dataframe(attempts, use_container_width=True)
         st.caption("Latest attempts across students. Filter/export via table menu.")
 
+        st.markdown("### 🏫 Classrooms Snapshot")
+        classes_overview = get_classrooms(include_archived=True)
+        if classes_overview.empty:
+            st.info("No classrooms have been created yet.")
+        else:
+            df_classes = classes_overview.copy()
+            for col in ["start_date", "created_at", "archived_at"]:
+                df_classes[col] = df_classes[col].astype(str)
+            st.dataframe(df_classes, use_container_width=True)
+
+            selected_class = st.selectbox(
+                "View roster for",
+                df_classes["class_id"].tolist(),
+                format_func=lambda x: f"{classes_overview.loc[classes_overview['class_id']==x,'name'].values[0]}",
+                key="student_tab_class_select",
+            )
+            roster_df = get_class_students(int(selected_class))
+            if roster_df.empty:
+                st.info("This classroom has no students assigned yet.")
+            else:
+                roster_df["assigned_at"] = roster_df["assigned_at"].astype(str)
+                st.dataframe(roster_df[["name", "email", "is_active", "assigned_at"]], use_container_width=True)
+
 # Student experience
 if st.session_state["auth"]["role"] == "student":
     _hide_default_h1_and_set("welcome to English Learning made easy - Student login")
@@ -2185,13 +2404,15 @@ if st.session_state["auth"]["role"] == "student":
         con=engine, params={"u": USER_ID}
     )
 
+    student_classes = get_classes_for_student(USER_ID, include_archived=True)
+
+    selected_course_id = None
+
     # Sidebar is truly inside the student block ↓
     with st.sidebar:
         st.subheader("My courses")
         if courses.empty:
             st.info("No courses assigned yet.")
-    #        st.markdown(sidebar_card, unsafe_allow_html=True)
-            st.stop()
         else:
             labels = []
             id_by_label = {}
@@ -2209,14 +2430,36 @@ if st.session_state["auth"]["role"] == "student":
                 default_index = 0
 
             selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
-            cid = id_by_label[selected_label]
-            st.session_state["active_cid"] = cid
+            selected_course_id = id_by_label[selected_label]
+            st.session_state["active_cid"] = selected_course_id
 
-            c_completed, c_total, c_pct = course_progress(USER_ID, int(cid))
+            c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
             st.caption(f"Selected: {selected_label} — {c_pct}% complete")
-#            st.markdown(sidebar_card, unsafe_allow_html=True)
 
     st.markdown(mobile_card, unsafe_allow_html=True)
+
+    st.markdown("### 🏫 My Classes")
+    show_archived_classes = st.checkbox("Show archived classes", value=False, key="student_show_archived_classes")
+    classes_view = student_classes.copy()
+    if not show_archived_classes:
+        classes_view = classes_view[~classes_view["is_archived"]]
+
+    if classes_view.empty:
+        st.info("You are not assigned to any classrooms yet.")
+    else:
+        display_cols = classes_view.copy()
+        display_cols = display_cols.sort_values(
+            by=["is_archived", "start_date", "name"], ascending=[True, True, True], ignore_index=True
+        )
+        display_cols["start_date"] = display_cols["start_date"].astype(str)
+        display_cols["assigned_at"] = display_cols["assigned_at"].astype(str)
+        display_cols["Status"] = np.where(display_cols["is_archived"], "Archived", "Active")
+        st.dataframe(
+            display_cols[["name", "start_date", "Status", "assigned_at"]].rename(
+                columns={"name": "Class", "start_date": "Commences", "assigned_at": "Assigned"}
+            ),
+            use_container_width=True,
+        )
 
 
 
