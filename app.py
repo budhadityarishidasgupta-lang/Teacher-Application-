@@ -2887,7 +2887,6 @@ if st.session_state["auth"]["role"] == "student":
             diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
             safe_word = html.escape(active)
 
-   #         st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
             st.markdown(
                 f"<div class='quiz-heading'><h3>Word: <strong>{safe_word}</strong></h3>"
                 f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
@@ -2899,26 +2898,36 @@ if st.session_state["auth"]["role"] == "student":
             )
 
             keys = st.session_state.grid_keys
-            st.markdown("<div class='quiz-options-grid'>", unsafe_allow_html=True)
-            for i, opt in enumerate(choices):
-                selected = opt in temp_selection
-                clicked = st.button(
-                    opt,
-                    key=keys[i],
-                    use_container_width=True,
-                    type="primary" if selected else "secondary",
-                )
-                if clicked:
-                    if selected:
-                        temp_selection.discard(opt)
-                    else:
-                        temp_selection.add(opt)
-            st.markdown("</div>", unsafe_allow_html=True)
+            # Ensure checkbox widgets reflect any persisted selection
+            for idx, opt in enumerate(choices):
+                state_key = keys[idx]
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = opt in temp_selection
 
-            st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
-            submitted = st.button("Submit", key="btn_submit_quiz", type="primary")
-            nextq = st.button("Next ▶", key="btn_next_quiz")
-            st.markdown("</div>", unsafe_allow_html=True)
+            form_id = f"quiz_form_{st.session_state.active_word}"
+            with st.form(form_id):
+                st.markdown("<div class='quiz-options-grid'>", unsafe_allow_html=True)
+                # Render options in a responsive 3-column grid
+                for start in range(0, len(choices), 3):
+                    row_choices = choices[start : start + 3]
+                    row_keys = keys[start : start + 3]
+                    cols = st.columns(len(row_choices))
+                    for col, opt, state_key in zip(cols, row_choices, row_keys):
+                        with col:
+                            st.checkbox(opt, key=state_key)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
+                action_cols = st.columns(2)
+                with action_cols[0]:
+                    submitted = st.form_submit_button(
+                        "Submit", key="btn_submit_quiz", type="primary", use_container_width=True
+                    )
+                with action_cols[1]:
+                    nextq = st.form_submit_button(
+                        "Next ▶", key="btn_next_quiz", use_container_width=True
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
 
     #        st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2927,7 +2936,12 @@ if st.session_state["auth"]["role"] == "student":
         #    _go_back_to_prev_word(lid, words_df)
 
         # Always persist selection each render
-        st.session_state.selection = temp_selection
+        st.session_state.selection = {
+            opt
+            for opt, state_key in zip(choices, st.session_state.grid_keys)
+            if st.session_state.get(state_key)
+        }
+        temp_selection = set(st.session_state.selection)
 
         # Handle Submit
         if submitted:
