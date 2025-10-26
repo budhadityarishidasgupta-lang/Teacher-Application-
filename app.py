@@ -2558,6 +2558,42 @@ if st.session_state["auth"]["role"] == "student":
                     )
                 )
 
+            lessons = pd.read_sql(
+                text(
+                    """
+                    SELECT lesson_id, title
+                    FROM lessons
+                    WHERE course_id = :c
+                    ORDER BY sort_order
+                    """
+                ),
+                con=engine,
+                params={"c": int(selected_course_id)},
+            )
+
+            st.subheader("Lessons")
+            if lessons.empty:
+                st.info("No lessons yet for this course.")
+            else:
+                lesson_ids = lessons["lesson_id"].tolist()
+                title_map = dict(zip(lessons["lesson_id"], lessons["title"]))
+
+                prev_lesson = st.session_state.get("student_lesson_select")
+                if prev_lesson in lesson_ids:
+                    default_lesson_index = lesson_ids.index(prev_lesson)
+                else:
+                    default_lesson_index = 0
+                    if lesson_ids:
+                        st.session_state["student_lesson_select"] = lesson_ids[0]
+
+                selected_lesson_id = st.radio(
+                    "Lessons",
+                    lesson_ids,
+                    index=default_lesson_index if lesson_ids else 0,
+                    format_func=lambda x: title_map.get(x, str(x)),
+                    key="student_lesson_select",
+                )
+
 # ─────────────────────────────────────────────────────────────────────
 # Helper for lesson progress (canonical — keep only ONE copy in file)
 # ─────────────────────────────────────────────────────────────────────
