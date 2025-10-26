@@ -1226,33 +1226,88 @@ def choose_next_word(user_id, course_id, lesson_id, df_words):
     pool = [w for w in candidates if w not in hist[-3:]] or candidates
     return random.choice(pool)
 
-def build_question_payload(headword: str, synonyms_str: str):
+def build_question_payload(
+    headword: str,
+    synonyms_str: str,
+    lesson_df: pd.DataFrame | None = None,
+):
+    """Construct a multiple-choice payload for the active headword.
+
+    Correct answers come from the word's synonyms. Distractors are built from
+    other words in the same lesson when available so each run feels fresh and
+    contextually relevant. Remaining slots fall back to a small generic pool
+    to ensure six options are always presented.
     """
-    Build a 6-option question:
-      - 2 correct (first two synonyms or 1 + '(close)')
-      - 4 distractors from a small safe pool (stable per word)
-    """
+
     syn_list = [s.strip() for s in str(synonyms_str).split(",") if s.strip()]
     correct = syn_list[:2] if len(syn_list) >= 2 else syn_list[:1]
     if len(correct) == 1:
         correct = [correct[0], f"{correct[0]} (close)"]
 
-    distractor_pool = [
-        "banana","pencil","soccer","window","pizza","rainbow","kitten","tractor","marble","backpack",
-        "ladder","ocean","camera","blanket","sandwich","rocket","helmet","garden","notebook","button"
-    ]
-    pool = [d for d in distractor_pool if d.lower() not in {c.lower() for c in correct}]
-    seed = int(hashlib.md5(headword.encode("utf-8")).hexdigest(), 16) % (2**32)
-    rnd = random.Random(seed) # stable per word across restarts
-    distractors = []
-    while len(distractors) < 4 and pool:
-        cand = rnd.choice(pool)
-        pool.remove(cand)
-        if cand not in distractors:
-            distractors.append(cand)
+    seen_lower = {c.lower() for c in correct}
 
-    choices = correct + distractors
-    rnd.shuffle(choices)
+    distractors: list[str] = []
+    if lesson_df is not None and not lesson_df.empty:
+        candidates: list[str] = []
+        for _, row in lesson_df.iterrows():
+            other_headword = str(row.get("headword", "")).strip()
+            if other_headword.lower() == headword.lower():
+                continue
+
+            # Add the other headword and its synonyms as potential distractors.
+            if other_headword:
+                candidates.append(other_headword)
+
+            other_synonyms = [
+                s.strip() for s in str(row.get("synonyms", "")).split(",") if s.strip()
+            ]
+            candidates.extend(other_synonyms)
+
+        random.shuffle(candidates)
+        for cand in candidates:
+            cand_l = cand.lower()
+            if cand_l in seen_lower:
+                continue
+            distractors.append(cand)
+            seen_lower.add(cand_l)
+            if len(distractors) >= 4:
+                break
+
+    if len(distractors) < 4:
+        fallback_pool = [
+            "banana",
+            "pencil",
+            "soccer",
+            "window",
+            "pizza",
+            "rainbow",
+            "kitten",
+            "tractor",
+            "marble",
+            "backpack",
+            "ladder",
+            "ocean",
+            "camera",
+            "blanket",
+            "sandwich",
+            "rocket",
+            "helmet",
+            "garden",
+            "notebook",
+            "button",
+        ]
+        random.shuffle(fallback_pool)
+        for cand in fallback_pool:
+            cand_l = cand.lower()
+            if cand_l in seen_lower:
+                continue
+            distractors.append(cand)
+            seen_lower.add(cand_l)
+            if len(distractors) >= 4:
+                break
+
+    choices = correct + distractors[:4]
+    random.shuffle(choices)
     return {"headword": headword, "choices": choices, "correct": set(correct)}
 
 def gpt_feedback_examples(headword: str, correct_word: str):
@@ -2407,34 +2462,192 @@ if st.session_state["auth"]["role"] == "student":
     student_classes = get_classes_for_student(USER_ID, include_archived=True)
 
     selected_course_id = None
+    selected_lesson_id = None
+    lessons = pd.DataFrame()
 
     # Sidebar is truly inside the student block ↓
     with st.sidebar:
-        st.subheader("My courses")
+        st.subheader("My courses & lessons")
         if courses.empty:
             st.info("No courses assigned yet.")
         else:
-            labels = []
-            id_by_label = {}
+            # Improve readability for multiline labels
+            st.markdown(
+                """
+                <style>
+                [data-testid="stSidebar"] .stRadio label {
+                    align-items: flex-start;
+                }
+                [data-testid="stSidebar"] .stRadio label p {
+                    white-space: pre-line;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            option_pairs: list[tuple[int, int]] = []
+            display_map: dict[tuple[int, int], tuple[str, str]] = {}
+            course_lessons: dict[int, pd.DataFrame] = {}
+            empty_courses: list[str] = []
+
+            prev_course = int(st.session_state.get("active_cid") or 0)
+            prev_lesson = st.session_state.get("student_lesson_select")
+            default_index = 0
+
             for _, rowc in courses.iterrows():
-                c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
-                label = f"{rowc['title']}"
-                labels.append(label)
-                id_by_label[label] = int(rowc["course_id"])
+                cid = int(rowc["course_id"])
+                lesson_df = pd.read_sql(
+                    text(
+                        """
+                        SELECT lesson_id, title
+                        FROM lessons
+                        WHERE course_id = :c
+                        ORDER BY sort_order
+                        """
+                    ),
+                    con=engine,
+                    params={"c": cid},
+                )
+                course_lessons[cid] = lesson_df
 
-            prev = st.session_state.get("active_cid")
-            if prev in id_by_label.values() and "student_course_select" not in st.session_state:
-                default_label = [k for k, v in id_by_label.items() if v == prev][0]
-                default_index = labels.index(default_label)
+                if lesson_df.empty:
+                    empty_courses.append(str(rowc["title"]))
+                    continue
+
+                for _, lesson_row in lesson_df.iterrows():
+                    pair = (cid, int(lesson_row["lesson_id"]))
+                    display_map[pair] = (str(rowc["title"]), str(lesson_row["title"]))
+                    option_pairs.append(pair)
+                    if prev_course == cid and prev_lesson == pair[1]:
+                        default_index = len(option_pairs) - 1
+
+            if not option_pairs:
+                st.info("No lessons yet for your assigned courses.")
             else:
-                default_index = 0
+                def _format_pair(pair: tuple[int, int]) -> str:
+                    course_title, lesson_title = display_map[pair]
+                    return f"{course_title}\n    • {lesson_title}"
 
-            selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
-            selected_course_id = id_by_label[selected_label]
-            st.session_state["active_cid"] = selected_course_id
+                selected_pair = st.radio(
+                    "Course and lesson selection",
+                    option_pairs,
+                    index=default_index,
+                    format_func=_format_pair,
+                    key="student_course_lesson",
+                    label_visibility="collapsed",
+                )
 
-            c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
-            st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+                st.markdown(
+                    """
+                    <style>
+                    [data-testid="stSidebar"] [role="radiogroup"].lesson-tree {
+                        padding-left: 0;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree .course-group {
+                        display: flex;
+                        flex-direction: column;
+                        gap: 0.25rem;
+                        margin-bottom: 0.65rem;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree .course-group:last-child {
+                        margin-bottom: 0;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree .course-header {
+                        font-weight: 600;
+                        margin-top: 0.15rem;
+                        position: relative;
+                        padding-left: 1.1rem;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree .course-header::before {
+                        content: "•";
+                        position: absolute;
+                        left: 0;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree .course-group:first-child .course-header {
+                        margin-top: 0;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree div[role="radio"] {
+                        margin-left: 1.6rem;
+                    }
+                    [data-testid="stSidebar"] .lesson-tree div[role="radio"] label {
+                        font-weight: 500;
+                    }
+                    </style>
+                    <script>
+                    (function () {
+                        const doc = window.parent.document;
+                        const root = doc.querySelector('[data-testid="stSidebar"] [role="radiogroup"][aria-label="Course and lesson selection"]');
+                        if (!root || root.dataset.enhanced === "1") {
+                            return;
+                        }
+                        root.dataset.enhanced = "1";
+                        root.classList.add("lesson-tree");
+                        const wrappers = Array.from(root.querySelectorAll('div[role="radio"]'));
+                        const courseOrder = [];
+                        const grouped = {};
+                        wrappers.forEach((wrapper) => {
+                            const label = wrapper.querySelector("label");
+                            if (!label) {
+                                return;
+                            }
+                            const lines = label.innerText
+                                .split('\n')
+                                .map((line) => line.trim())
+                                .filter(Boolean);
+                            if (!lines.length) {
+                                return;
+                            }
+                            const course = lines[0];
+                            const lessonLine = lines.slice(1).join(' ');
+                            const lesson = lessonLine.replace(/^•\s*/, "");
+                            const safeLesson = lesson
+                                .replace(/&/g, "&amp;")
+                                .replace(/</g, "&lt;")
+                                .replace(/>/g, "&gt;");
+                            label.innerHTML = `<span class="lesson-label">${safeLesson}</span>`;
+                            if (!grouped[course]) {
+                                grouped[course] = [];
+                                courseOrder.push(course);
+                            }
+                            grouped[course].push(wrapper);
+                        });
+                        root.innerHTML = "";
+                        courseOrder.forEach((course) => {
+                            const group = doc.createElement("div");
+                            group.className = "course-group";
+                            const header = doc.createElement("div");
+                            header.className = "course-header";
+                            header.textContent = course;
+                            group.appendChild(header);
+                            grouped[course].forEach((wrapper) => group.appendChild(wrapper));
+                            root.appendChild(group);
+                        });
+                    })();
+                    </script>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                selected_course_id, selected_lesson_id = selected_pair
+                lessons = course_lessons.get(selected_course_id, pd.DataFrame())
+
+                selected_course_title, _ = display_map[selected_pair]
+                c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
+                st.caption(f"Selected: {selected_course_title} — {c_pct}% complete")
+
+                st.session_state["active_cid"] = selected_course_id
+                st.session_state["student_lesson_select"] = selected_lesson_id
+
+            if empty_courses:
+                st.caption(
+                    "\n".join(
+                        [
+                            "Lessons coming soon:",
+                            *[f"• {title}" for title in empty_courses],
+                        ]
+                    )
+                )
 
 # ─────────────────────────────────────────────────────────────────────
 # Helper for lesson progress (canonical — keep only ONE copy in file)
@@ -2708,7 +2921,11 @@ def _go_back_to_prev_word(lid: int, words_df: pd.DataFrame):
         row_prev = words_df[words_df["headword"] == st.session_state.active_word]
 
     row_prev = row_prev.iloc[0]
-    st.session_state.qdata = build_question_payload(st.session_state.active_word, row_prev["synonyms"])
+    st.session_state.qdata = build_question_payload(
+        st.session_state.active_word,
+        row_prev["synonyms"],
+        lesson_df=words_df,
+    )
     st.session_state.grid_for_word = st.session_state.active_word
     st.session_state.grid_keys = [
         f"opt_{st.session_state.active_word}_{i}"
@@ -2729,30 +2946,31 @@ def _go_back_to_prev_word(lid: int, words_df: pd.DataFrame):
 # STUDENT FLOW (main content)
 # -----------------------------
 if st.session_state["auth"]["role"] == "student":
-    lessons = pd.read_sql(
-        text("SELECT lesson_id,title FROM lessons WHERE course_id=:c ORDER BY sort_order"),
-        con=engine, params={"c": int(cid)}
-    )
+    if selected_course_id is None:
+        st.info("Select a course from the sidebar to begin.")
+        st.stop()
+
+    cid = int(selected_course_id)
+
     if lessons.empty:
         st.info("This course has no lessons yet.")
         st.stop()
 
     l_map = dict(zip(lessons["lesson_id"], lessons["title"]))
-    lid = st.selectbox(
-        "Lesson",
-        list(l_map.keys()),
-        format_func=lambda x: l_map[x],
-        key="student_lesson_select"
-    )
 
-    # Initialize per-lesson question counter (once per lesson)
-    if st.session_state.q_index_per_lesson.get(int(lid)) is None:
-        st.session_state.q_index_per_lesson[int(lid)] = 1
+    if selected_lesson_id is None:
+        selected_lesson_id = lessons["lesson_id"].iloc[0]
+
+    lid = int(selected_lesson_id)
 
     # NEW: lesson-level progress and question count
     total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
     basis = mastered_q if mastered_q > 0 else attempted_q
     pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
+
+    if st.session_state.q_index_per_lesson.get(int(lid)) is None:
+        baseline = max(1, min(int(total_q or 1), int(attempted_q or 0) + 1))
+        st.session_state.q_index_per_lesson[int(lid)] = baseline
 
     # Ensure a counter exists
     q_now = st.session_state.q_index_per_lesson.get(int(lid), 1)
@@ -2774,7 +2992,11 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+        st.session_state.qdata = build_question_payload(
+            st.session_state.active_word,
+            row_init["synonyms"],
+            lesson_df=words_df,
+        )
         st.session_state.grid_for_word = st.session_state.active_word
         st.session_state.grid_keys = [
             f"opt_{st.session_state.active_word}_{i}" for i in range(len(st.session_state.qdata['choices']))
@@ -2799,7 +3021,11 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
-        st.session_state.qdata = build_question_payload(st.session_state.active_word, row_init["synonyms"])
+        st.session_state.qdata = build_question_payload(
+            st.session_state.active_word,
+            row_init["synonyms"],
+            lesson_df=words_df,
+        )
         st.session_state.grid_for_word = st.session_state.active_word
         st.session_state.grid_keys = [
             f"opt_{st.session_state.active_word}_{i}"
@@ -2853,7 +3079,6 @@ if st.session_state["auth"]["role"] == "student":
         temp_selection = set(st.session_state.get("selection", set()))
 
         submitted = False
-        nextq = False
 
         if not st.session_state.answered:
             difficulty_level = int(row.get("difficulty", 2) or 2)
@@ -2891,15 +3116,7 @@ if st.session_state["auth"]["role"] == "student":
                 st.markdown("</div>", unsafe_allow_html=True)
 
                 st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
-                action_cols = st.columns(2)
-                with action_cols[0]:
-                    submitted = st.form_submit_button(
-                        "Submit", key="btn_submit_quiz", type="primary", use_container_width=True
-                    )
-                with action_cols[1]:
-                    nextq = st.form_submit_button(
-                        "Next ▶", key="btn_next_quiz", use_container_width=True
-                    )
+                submitted = st.form_submit_button("Submit")
                 st.markdown("</div>", unsafe_allow_html=True)
 
     #        st.markdown("</div>", unsafe_allow_html=True)
@@ -2962,8 +3179,7 @@ if st.session_state["auth"]["role"] == "student":
 
             st.rerun()
 
-        elif nextq:
-            st.warning("Please **Submit** your answer first, then click **Next**.")
+        # No direct "Next" action here; students continue from the feedback view.
 
 # ========== PATCH START: Dynamic feedback by lesson type (Option A) ==========
 # Detect lesson kind from course/lesson titles (synonym | antonym)
@@ -3103,7 +3319,11 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         st.session_state.active_word = next_word
         st.session_state.q_started_at = time.time()
         next_row = words_df[words_df["headword"] == next_word].iloc[0]
-        st.session_state.qdata = build_question_payload(next_word, next_row["synonyms"])
+        st.session_state.qdata = build_question_payload(
+            next_word,
+            next_row["synonyms"],
+            lesson_df=words_df,
+        )
         st.session_state.grid_for_word = next_word
         st.session_state.grid_keys = [
             f"opt_{next_word}_{i}"
@@ -3151,7 +3371,11 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
                         st.session_state.q_started_at = time.time()
 
                         row_retry = words_df[words_df["headword"] == hw].iloc[0]
-                        st.session_state.qdata = build_question_payload(hw, row_retry["synonyms"])
+                        st.session_state.qdata = build_question_payload(
+                            hw,
+                            row_retry["synonyms"],
+                            lesson_df=words_df,
+                        )
                         st.session_state.grid_for_word = hw
                         st.session_state.grid_keys = [
                             f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
