@@ -2491,18 +2491,9 @@ if st.session_state["auth"]["role"] == "student":
             course_lessons: dict[int, pd.DataFrame] = {}
             empty_courses: list[str] = []
 
-            prev_course = st.session_state.get("active_cid")
-            if prev_course is not None:
-                try:
-                    prev_course = int(prev_course)
-                except (TypeError, ValueError):
-                    prev_course = None
+            prev_course = int(st.session_state.get("active_cid") or 0)
             prev_lesson = st.session_state.get("student_lesson_select")
-            if prev_lesson is not None:
-                try:
-                    prev_lesson = int(prev_lesson)
-                except (TypeError, ValueError):
-                    prev_lesson = None
+            default_index = 0
 
             for _, rowc in courses.iterrows():
                 cid = int(rowc["course_id"])
@@ -2528,75 +2519,24 @@ if st.session_state["auth"]["role"] == "student":
                     pair = (cid, int(lesson_row["lesson_id"]))
                     display_map[pair] = (str(rowc["title"]), str(lesson_row["title"]))
                     option_pairs.append(pair)
+                    if prev_course == cid and prev_lesson == pair[1]:
+                        default_index = len(option_pairs) - 1
 
             if not option_pairs:
                 st.info("No lessons yet for your assigned courses.")
             else:
-                def _handle_radio_change(course_id: int) -> None:
-                    lesson_value = st.session_state.get(f"lesson_{course_id}")
-                    if lesson_value is None:
-                        return
-                    try:
-                        lesson_value = int(lesson_value)
-                    except (TypeError, ValueError):
-                        return
-                    st.session_state["active_cid"] = int(course_id)
-                    st.session_state["student_lesson_select"] = lesson_value
+                def _format_pair(pair: tuple[int, int]) -> str:
+                    course_title, lesson_title = display_map[pair]
+                    return f"{course_title}\n    • {lesson_title}"
 
-                selected_pair: tuple[int, int] | None = None
-
-                active_course = prev_course
-                active_lesson = prev_lesson
-
-                for _, rowc in courses.iterrows():
-                    cid = int(rowc["course_id"])
-                    lesson_df = course_lessons.get(cid, pd.DataFrame())
-                    if lesson_df.empty:
-                        continue
-
-                    st.write(f"**{rowc['title']}**")
-
-                    lesson_ids = [int(lesson_row["lesson_id"]) for _, lesson_row in lesson_df.iterrows()]
-
-                    stored_value = st.session_state.get(f"lesson_{cid}")
-                    if stored_value is not None:
-                        try:
-                            stored_value = int(stored_value)
-                        except (TypeError, ValueError):
-                            stored_value = None
-
-                    index = 0
-                    if stored_value in lesson_ids:
-                        index = lesson_ids.index(stored_value)
-                    elif active_course == cid and active_lesson in lesson_ids:
-                        index = lesson_ids.index(active_lesson)
-                    else:
-                        stored_value = lesson_ids[index]
-                        st.session_state[f"lesson_{cid}"] = stored_value
-
-                    selected_value = st.radio(
-                        "",
-                        lesson_ids,
-                        index=index,
-                        format_func=lambda lid, _cid=cid: display_map[(_cid, int(lid))][1],
-                        key=f"lesson_{cid}",
-                        on_change=lambda cid=cid: _handle_radio_change(cid),
-                    )
-
-                    if st.session_state.get("active_cid") == cid:
-                        selected_pair = (cid, int(st.session_state.get("student_lesson_select", selected_value)))
-
-                if not selected_pair:
-                    candidate_course = st.session_state.get("active_cid")
-                    candidate_lesson = st.session_state.get("student_lesson_select")
-                    candidate = None
-                    if candidate_course is not None and candidate_lesson is not None:
-                        candidate = (int(candidate_course), int(candidate_lesson))
-                    if candidate in option_pairs:
-                        selected_pair = candidate
-                    else:
-                        selected_pair = option_pairs[0]
-                        st.session_state["active_cid"], st.session_state["student_lesson_select"] = selected_pair
+                selected_pair = st.radio(
+                    "Course and lesson",
+                    option_pairs,
+                    index=default_index,
+                    format_func=_format_pair,
+                    key="student_course_lesson",
+                    label_visibility="collapsed",
+                )
 
                 selected_course_id, selected_lesson_id = selected_pair
                 lessons = course_lessons.get(selected_course_id, pd.DataFrame())
@@ -2604,6 +2544,9 @@ if st.session_state["auth"]["role"] == "student":
                 selected_course_title, _ = display_map[selected_pair]
                 c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
                 st.caption(f"Selected: {selected_course_title} — {c_pct}% complete")
+
+                st.session_state["active_cid"] = selected_course_id
+                st.session_state["student_lesson_select"] = selected_lesson_id
 
             if empty_courses:
                 st.caption(
@@ -2613,6 +2556,42 @@ if st.session_state["auth"]["role"] == "student":
                             *[f"• {title}" for title in empty_courses],
                         ]
                     )
+                )
+
+            lessons = pd.read_sql(
+                text(
+                    """
+                    SELECT lesson_id, title
+                    FROM lessons
+                    WHERE course_id = :c
+                    ORDER BY sort_order
+                    """
+                ),
+                con=engine,
+                params={"c": int(selected_course_id)},
+            )
+
+            st.subheader("Lessons")
+            if lessons.empty:
+                st.info("No lessons yet for this course.")
+            else:
+                lesson_ids = lessons["lesson_id"].tolist()
+                title_map = dict(zip(lessons["lesson_id"], lessons["title"]))
+
+                prev_lesson = st.session_state.get("student_lesson_select")
+                if prev_lesson in lesson_ids:
+                    default_lesson_index = lesson_ids.index(prev_lesson)
+                else:
+                    default_lesson_index = 0
+                    if lesson_ids:
+                        st.session_state["student_lesson_select"] = lesson_ids[0]
+
+                selected_lesson_id = st.radio(
+                    "Lessons",
+                    lesson_ids,
+                    index=default_lesson_index if lesson_ids else 0,
+                    format_func=lambda x: title_map.get(x, str(x)),
+                    key="student_lesson_select",
                 )
 
 # ─────────────────────────────────────────────────────────────────────
