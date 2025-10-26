@@ -2436,33 +2436,6 @@ if st.session_state["auth"]["role"] == "student":
             c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
             st.caption(f"Selected: {selected_label} — {c_pct}% complete")
 
-    st.markdown(mobile_card, unsafe_allow_html=True)
-
-    st.markdown("### 🏫 My Classes")
-    show_archived_classes = st.checkbox("Show archived classes", value=False, key="student_show_archived_classes")
-    classes_view = student_classes.copy()
-    if not show_archived_classes:
-        classes_view = classes_view[~classes_view["is_archived"]]
-
-    if classes_view.empty:
-        st.info("You are not assigned to any classrooms yet.")
-    else:
-        display_cols = classes_view.copy()
-        display_cols = display_cols.sort_values(
-            by=["is_archived", "start_date", "name"], ascending=[True, True, True], ignore_index=True
-        )
-        display_cols["start_date"] = display_cols["start_date"].astype(str)
-        display_cols["assigned_at"] = display_cols["assigned_at"].astype(str)
-        display_cols["Status"] = np.where(display_cols["is_archived"], "Archived", "Active")
-        st.dataframe(
-            display_cols[["name", "start_date", "Status", "assigned_at"]].rename(
-                columns={"name": "Class", "start_date": "Commences", "assigned_at": "Assigned"}
-            ),
-            use_container_width=True,
-        )
-
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Helper for lesson progress (canonical — keep only ONE copy in file)
 # ─────────────────────────────────────────────────────────────────────
