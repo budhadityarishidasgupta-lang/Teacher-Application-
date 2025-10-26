@@ -2530,103 +2530,12 @@ if st.session_state["auth"]["role"] == "student":
                     return f"{course_title}\n    • {lesson_title}"
 
                 selected_pair = st.radio(
-                    "Course and lesson selection",
+                    "Course and lesson",
                     option_pairs,
                     index=default_index,
                     format_func=_format_pair,
                     key="student_course_lesson",
                     label_visibility="collapsed",
-                )
-
-                st.markdown(
-                    """
-                    <style>
-                    [data-testid="stSidebar"] [role="radiogroup"].lesson-tree {
-                        padding-left: 0;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree .course-group {
-                        display: flex;
-                        flex-direction: column;
-                        gap: 0.25rem;
-                        margin-bottom: 0.65rem;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree .course-group:last-child {
-                        margin-bottom: 0;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree .course-header {
-                        font-weight: 600;
-                        margin-top: 0.15rem;
-                        position: relative;
-                        padding-left: 1.1rem;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree .course-header::before {
-                        content: "•";
-                        position: absolute;
-                        left: 0;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree .course-group:first-child .course-header {
-                        margin-top: 0;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree div[role="radio"] {
-                        margin-left: 1.6rem;
-                    }
-                    [data-testid="stSidebar"] .lesson-tree div[role="radio"] label {
-                        font-weight: 500;
-                    }
-                    </style>
-                    <script>
-                    (function () {
-                        const doc = window.parent.document;
-                        const root = doc.querySelector('[data-testid="stSidebar"] [role="radiogroup"][aria-label="Course and lesson selection"]');
-                        if (!root || root.dataset.enhanced === "1") {
-                            return;
-                        }
-                        root.dataset.enhanced = "1";
-                        root.classList.add("lesson-tree");
-                        const wrappers = Array.from(root.querySelectorAll('div[role="radio"]'));
-                        const courseOrder = [];
-                        const grouped = {};
-                        wrappers.forEach((wrapper) => {
-                            const label = wrapper.querySelector("label");
-                            if (!label) {
-                                return;
-                            }
-                            const lines = label.innerText
-                                .split('\n')
-                                .map((line) => line.trim())
-                                .filter(Boolean);
-                            if (!lines.length) {
-                                return;
-                            }
-                            const course = lines[0];
-                            const lessonLine = lines.slice(1).join(' ');
-                            const lesson = lessonLine.replace(/^•\s*/, "");
-                            const safeLesson = lesson
-                                .replace(/&/g, "&amp;")
-                                .replace(/</g, "&lt;")
-                                .replace(/>/g, "&gt;");
-                            label.innerHTML = `<span class="lesson-label">${safeLesson}</span>`;
-                            if (!grouped[course]) {
-                                grouped[course] = [];
-                                courseOrder.push(course);
-                            }
-                            grouped[course].push(wrapper);
-                        });
-                        root.innerHTML = "";
-                        courseOrder.forEach((course) => {
-                            const group = doc.createElement("div");
-                            group.className = "course-group";
-                            const header = doc.createElement("div");
-                            header.className = "course-header";
-                            header.textContent = course;
-                            group.appendChild(header);
-                            grouped[course].forEach((wrapper) => group.appendChild(wrapper));
-                            root.appendChild(group);
-                        });
-                    })();
-                    </script>
-                    """,
-                    unsafe_allow_html=True,
                 )
 
                 selected_course_id, selected_lesson_id = selected_pair
@@ -2647,6 +2556,42 @@ if st.session_state["auth"]["role"] == "student":
                             *[f"• {title}" for title in empty_courses],
                         ]
                     )
+                )
+
+            lessons = pd.read_sql(
+                text(
+                    """
+                    SELECT lesson_id, title
+                    FROM lessons
+                    WHERE course_id = :c
+                    ORDER BY sort_order
+                    """
+                ),
+                con=engine,
+                params={"c": int(selected_course_id)},
+            )
+
+            st.subheader("Lessons")
+            if lessons.empty:
+                st.info("No lessons yet for this course.")
+            else:
+                lesson_ids = lessons["lesson_id"].tolist()
+                title_map = dict(zip(lessons["lesson_id"], lessons["title"]))
+
+                prev_lesson = st.session_state.get("student_lesson_select")
+                if prev_lesson in lesson_ids:
+                    default_lesson_index = lesson_ids.index(prev_lesson)
+                else:
+                    default_lesson_index = 0
+                    if lesson_ids:
+                        st.session_state["student_lesson_select"] = lesson_ids[0]
+
+                selected_lesson_id = st.radio(
+                    "Lessons",
+                    lesson_ids,
+                    index=default_lesson_index if lesson_ids else 0,
+                    format_func=lambda x: title_map.get(x, str(x)),
+                    key="student_lesson_select",
                 )
 
 # ─────────────────────────────────────────────────────────────────────
