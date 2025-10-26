@@ -2467,31 +2467,96 @@ if st.session_state["auth"]["role"] == "student":
 
     # Sidebar is truly inside the student block ↓
     with st.sidebar:
-        st.subheader("My courses")
+        st.subheader("My courses & lessons")
         if courses.empty:
             st.info("No courses assigned yet.")
         else:
-            labels = []
-            id_by_label = {}
+            # Improve readability for multiline labels
+            st.markdown(
+                """
+                <style>
+                [data-testid="stSidebar"] .stRadio label {
+                    align-items: flex-start;
+                }
+                [data-testid="stSidebar"] .stRadio label p {
+                    white-space: pre-line;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            option_pairs: list[tuple[int, int]] = []
+            display_map: dict[tuple[int, int], tuple[str, str]] = {}
+            course_lessons: dict[int, pd.DataFrame] = {}
+            empty_courses: list[str] = []
+
+            prev_course = int(st.session_state.get("active_cid") or 0)
+            prev_lesson = st.session_state.get("student_lesson_select")
+            default_index = 0
+
             for _, rowc in courses.iterrows():
-                c_completed, c_total, c_pct = course_progress(USER_ID, int(rowc["course_id"]))
-                label = f"{rowc['title']}"
-                labels.append(label)
-                id_by_label[label] = int(rowc["course_id"])
+                cid = int(rowc["course_id"])
+                lesson_df = pd.read_sql(
+                    text(
+                        """
+                        SELECT lesson_id, title
+                        FROM lessons
+                        WHERE course_id = :c
+                        ORDER BY sort_order
+                        """
+                    ),
+                    con=engine,
+                    params={"c": cid},
+                )
+                course_lessons[cid] = lesson_df
 
-            prev = st.session_state.get("active_cid")
-            if prev in id_by_label.values() and "student_course_select" not in st.session_state:
-                default_label = [k for k, v in id_by_label.items() if v == prev][0]
-                default_index = labels.index(default_label)
+                if lesson_df.empty:
+                    empty_courses.append(str(rowc["title"]))
+                    continue
+
+                for _, lesson_row in lesson_df.iterrows():
+                    pair = (cid, int(lesson_row["lesson_id"]))
+                    display_map[pair] = (str(rowc["title"]), str(lesson_row["title"]))
+                    option_pairs.append(pair)
+                    if prev_course == cid and prev_lesson == pair[1]:
+                        default_index = len(option_pairs) - 1
+
+            if not option_pairs:
+                st.info("No lessons yet for your assigned courses.")
             else:
-                default_index = 0
+                def _format_pair(pair: tuple[int, int]) -> str:
+                    course_title, lesson_title = display_map[pair]
+                    return f"{course_title}\n    • {lesson_title}"
 
-            selected_label = st.radio("Courses", labels, index=default_index, key="student_course_select")
-            selected_course_id = id_by_label[selected_label]
-            st.session_state["active_cid"] = selected_course_id
+                selected_pair = st.radio(
+                    "Course and lesson",
+                    option_pairs,
+                    index=default_index,
+                    format_func=_format_pair,
+                    key="student_course_lesson",
+                    label_visibility="collapsed",
+                )
 
-            c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
-            st.caption(f"Selected: {selected_label} — {c_pct}% complete")
+                selected_course_id, selected_lesson_id = selected_pair
+                lessons = course_lessons.get(selected_course_id, pd.DataFrame())
+
+                selected_course_title, _ = display_map[selected_pair]
+                c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
+                st.caption(f"Selected: {selected_course_title} — {c_pct}% complete")
+
+                st.session_state["active_cid"] = selected_course_id
+                st.session_state["student_lesson_select"] = selected_lesson_id
+
+            if empty_courses:
+                st.caption(
+                    "\n".join(
+                        [
+                            "Lessons coming soon:",
+                            *[f"• {title}" for title in empty_courses],
+                        ]
+                    )
+                )
 
             lessons = pd.read_sql(
                 text(
@@ -2996,9 +3061,7 @@ if st.session_state["auth"]["role"] == "student":
                 st.markdown("</div>", unsafe_allow_html=True)
 
                 st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
-                submitted = st.form_submit_button(
-                    "Submit", key="btn_submit_quiz", type="primary", use_container_width=True
-                )
+                submitted = st.form_submit_button("Submit")
                 st.markdown("</div>", unsafe_allow_html=True)
 
     #        st.markdown("</div>", unsafe_allow_html=True)
