@@ -2464,6 +2464,7 @@ if st.session_state["auth"]["role"] == "student":
     selected_course_id = None
     selected_lesson_id = None
     lessons = pd.DataFrame()
+    course_lessons: dict[int, pd.DataFrame] = {}
 
     # Sidebar is truly inside the student block ↓
     with st.sidebar:
@@ -2471,7 +2472,6 @@ if st.session_state["auth"]["role"] == "student":
         if courses.empty:
             st.info("No courses assigned yet.")
         else:
-            # Improve readability for multiline labels
             st.markdown(
                 """
                 <style>
@@ -2480,6 +2480,10 @@ if st.session_state["auth"]["role"] == "student":
                 }
                 [data-testid="stSidebar"] .stRadio label p {
                     white-space: pre-line;
+                    margin: 0;
+                    font-size: 0.95rem;
+                    text-indent: -0.75rem;
+                    padding-left: 0.75rem;
                 }
                 </style>
                 """,
@@ -2525,9 +2529,18 @@ if st.session_state["auth"]["role"] == "student":
             if not option_pairs:
                 st.info("No lessons yet for your assigned courses.")
             else:
-                def _format_pair(pair: tuple[int, int]) -> str:
+                labels: dict[tuple[int, int], str] = {}
+                last_course_title = ""
+                for pair in option_pairs:
                     course_title, lesson_title = display_map[pair]
-                    return f"{course_title}\n    • {lesson_title}"
+                    prefix = ""
+                    if course_title != last_course_title:
+                        prefix = f"* {course_title}\n"
+                        last_course_title = course_title
+                    labels[pair] = f"{prefix}* {lesson_title}"
+
+                def _format_pair(pair: tuple[int, int]) -> str:
+                    return labels.get(pair, "")
 
                 selected_pair = st.radio(
                     "Course and lesson",
@@ -2558,41 +2571,7 @@ if st.session_state["auth"]["role"] == "student":
                     )
                 )
 
-            lessons = pd.read_sql(
-                text(
-                    """
-                    SELECT lesson_id, title
-                    FROM lessons
-                    WHERE course_id = :c
-                    ORDER BY sort_order
-                    """
-                ),
-                con=engine,
-                params={"c": int(selected_course_id)},
-            )
-
-            st.subheader("Lessons")
-            if lessons.empty:
-                st.info("No lessons yet for this course.")
-            else:
-                lesson_ids = lessons["lesson_id"].tolist()
-                title_map = dict(zip(lessons["lesson_id"], lessons["title"]))
-
-                prev_lesson = st.session_state.get("student_lesson_select")
-                if prev_lesson in lesson_ids:
-                    default_lesson_index = lesson_ids.index(prev_lesson)
-                else:
-                    default_lesson_index = 0
-                    if lesson_ids:
-                        st.session_state["student_lesson_select"] = lesson_ids[0]
-
-                selected_lesson_id = st.radio(
-                    "Lessons",
-                    lesson_ids,
-                    index=default_lesson_index if lesson_ids else 0,
-                    format_func=lambda x: title_map.get(x, str(x)),
-                    key="student_lesson_select",
-                )
+    lessons = course_lessons.get(int(selected_course_id), pd.DataFrame()) if selected_course_id else pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────────────
 # Helper for lesson progress (canonical — keep only ONE copy in file)
