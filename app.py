@@ -1241,8 +1241,8 @@ def build_question_payload(
 
     syn_list = [s.strip() for s in str(synonyms_str).split(",") if s.strip()]
     correct = syn_list[:2] if len(syn_list) >= 2 else syn_list[:1]
-    if len(correct) == 1:
-        correct = [correct[0], f"{correct[0]} (close)"]
+ #   if len(correct) == 1:
+ #       correct = [correct[0], f"{correct[0]} (close)"]
 
     seen_lower = {c.lower() for c in correct}
 
