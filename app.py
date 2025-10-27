@@ -1998,15 +1998,15 @@ def login_form():
 if "auth" not in st.session_state:
     login_form()
     st.title("Learning English Made Easy")
-    st.write("Sign in as **Admin** to manage students, courses and tests; or as **Student** to learn and take tests.")
-    st.sidebar.header("Health")
-    if st.sidebar.button("DB ping"):
-        try:
-            with engine.connect() as conn:
-                one = conn.execute(text("SELECT 1")).scalar()
-            st.sidebar.success(f"DB OK (result={one})")
-        except Exception as e:
-            st.sidebar.error(f"DB error: {e}")
+    st.write("Turn 11+ preparation into an engaging adventure with our interactive online platform, designed to make learning feel like a game. Every quiz is adaptive, rewarding, and intelligently structured to strengthen your child’s core English and reasoning skills — without the stress of traditional revision.")
+   # st.sidebar.header("Health")
+   # if st.sidebar.button("DB ping"):
+   #     try:
+   #         with engine.connect() as conn:
+   #             one = conn.execute(text("SELECT 1")).scalar()
+   #         st.sidebar.success(f"DB OK (result={one})")
+   #     except Exception as e:
+   #         st.sidebar.error(f"DB error: {e}")
     st.stop()
 
 # Session basics
