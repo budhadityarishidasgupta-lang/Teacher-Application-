@@ -1998,7 +1998,7 @@ def login_form():
 if "auth" not in st.session_state:
     login_form()
     st.title("Learning English Made Easy")
-    st.write("Turn 11+ preparation into an engaging adventure with our interactive online platform, designed to make learning feel like a game. Every quiz is adaptive, rewarding, and intelligently structured to strengthen your child’s core English and reasoning skills — without the stress of traditional revision.")
+    st.write("Turn 11+ preparation into an engaging adventure with our interactive online platform, designed to make learning feel like a game. Every quiz is adaptive, rewarding, and intelligently structured to strengthen your child’s core English and reasoning skills — without the stress of traditional revision. Our system automatically adjusts between Lower, Medium, and Hard levels, ensuring that each learner is challenged at the right pace. Questions answered incorrectly are repeated in later sessions, helping students reinforce knowledge, close learning gaps, and achieve lasting progress — a proven method to boost confidence and results.")
    # st.sidebar.header("Health")
    # if st.sidebar.button("DB ping"):
    #     try:
