@@ -2501,9 +2501,6 @@ if st.session_state["auth"]["role"] == "student":
                     margin: 0.5rem 0 0.25rem;
                     font-weight: 600;
                 }
-                .lesson-picker [data-testid="stRadio"] > div[role="radiogroup"] > div:first-child {
-                    display: none;
-                }
                 .lesson-picker [data-testid="stRadio"] > div[role="radiogroup"] > div label {
                     align-items: center;
                 }
@@ -2556,7 +2553,6 @@ if st.session_state["auth"]["role"] == "student":
             if not option_pairs:
                 st.info("No lessons yet for your assigned courses.")
             else:
-                NO_SELECTION: tuple[int, int] = (-1, -1)
                 selected_pair = st.session_state.get("student_course_lesson")
                 if selected_pair not in option_pairs:
                     selected_pair = None
@@ -2578,42 +2574,48 @@ if st.session_state["auth"]["role"] == "student":
                         unsafe_allow_html=True,
                     )
 
-                    options = [NO_SELECTION, *lesson_pairs]
                     state_key = f"lesson_radio_{cid}"
+                    options = lesson_pairs
                     current_value = st.session_state.get(state_key)
-                    if current_value not in options:
-                        if selected_pair in lesson_pairs:
-                            st.session_state[state_key] = selected_pair
-                        else:
-                            st.session_state[state_key] = NO_SELECTION
-                    elif current_value != NO_SELECTION and current_value not in lesson_pairs:
-                        st.session_state[state_key] = NO_SELECTION
+
+                    if selected_pair in lesson_pairs:
+                        st.session_state[state_key] = selected_pair
+                        current_value = selected_pair
+                    elif current_value not in lesson_pairs:
+                        if state_key in st.session_state:
+                            del st.session_state[state_key]
+                        current_value = None
 
                     def _format_option(pair: tuple[int, int]) -> str:
-                        if pair == NO_SELECTION:
-                            return ""
                         _, lesson_title = display_map[pair]
                         return lesson_title
 
                     def _on_change(selected_course: int = cid, key: str = state_key) -> None:
-                        choice = st.session_state.get(key, NO_SELECTION)
-                        if choice == NO_SELECTION:
+                        choice = st.session_state.get(key)
+                        if not choice:
                             return
                         st.session_state["student_course_lesson"] = choice
                         st.session_state["active_cid"] = choice[0]
                         st.session_state["student_lesson_select"] = choice[1]
                         for other_cid in lessons_by_course.keys():
                             if other_cid != selected_course:
-                                st.session_state[f"lesson_radio_{other_cid}"] = NO_SELECTION
+                                other_key = f"lesson_radio_{other_cid}"
+                                if other_key in st.session_state:
+                                    del st.session_state[other_key]
 
-                    st.radio(
-                        "Lesson selection",
-                        options,
+                    radio_kwargs = dict(
+                        label="Lesson selection",
+                        options=options,
                         key=state_key,
                         format_func=_format_option,
                         label_visibility="collapsed",
                         on_change=_on_change,
                     )
+
+                    if current_value is None:
+                        radio_kwargs["index"] = None
+
+                    st.radio(**radio_kwargs)
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
