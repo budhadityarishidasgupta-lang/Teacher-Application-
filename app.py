@@ -3,6 +3,8 @@ from contextlib import closing
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -77,6 +79,22 @@ if ENABLE_GPT and OPENAI_API_KEY:
 ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@example.com").strip().lower()
 ADMIN_NAME     = os.getenv("ADMIN_NAME", "Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe!123")
+
+# Student defaults & editable copy fallbacks
+DEFAULT_STUDENT_PASSWORD = os.getenv("DEFAULT_STUDENT_PASSWORD", "Learn123!")
+DEFAULT_HEADER_COPY = (
+    "Learning English Made Easy\n"
+    "Turn 11+ preparation into an engaging adventure with our interactive online platform, "
+    "designed to make learning feel like a game. Every quiz is adaptive, rewarding, and "
+    "intelligently structured to strengthen your child’s core English and reasoning skills — "
+    "without the stress of traditional revision. Our system automatically adjusts between "
+    "Lower, Medium, and Hard levels, ensuring that each learner is challenged at the right pace. "
+    "Questions answered incorrectly are repeated in later sessions, helping students reinforce "
+    "knowledge, close learning gaps, and achieve lasting progress — a proven method to boost "
+    "confidence and results."
+)
+DEFAULT_INSTRUCTIONS_COPY = ""
+DEFAULT_NEW_REG_COPY = ""
 
 # Feature flags (define early!)
 TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
@@ -279,6 +297,27 @@ def init_db():
           UNIQUE (user_id, badge_name)
         );
         """
+        ,
+        """
+        CREATE TABLE IF NOT EXISTS portal_content (
+          section    TEXT PRIMARY KEY,
+          content    TEXT,
+          updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        ,
+        """
+        CREATE TABLE IF NOT EXISTS pending_registrations (
+          pending_id       SERIAL PRIMARY KEY,
+          name             TEXT NOT NULL,
+          email            TEXT NOT NULL UNIQUE,
+          status           TEXT NOT NULL DEFAULT 'to be registered',
+          default_password TEXT NOT NULL,
+          created_at       TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          processed_at     TIMESTAMPTZ,
+          created_user_id  INTEGER REFERENCES users(user_id)
+        );
+        """
     ]
     with engine.begin() as conn:
         for q in ddl:
@@ -311,7 +350,7 @@ def patch_users_table():
     if rows:
         with engine.begin() as conn:
             for r in rows:
-                raw_pwd = ADMIN_PASSWORD if r["role"] == "admin" else "Learn123!"
+                raw_pwd = ADMIN_PASSWORD if r["role"] == "admin" else DEFAULT_STUDENT_PASSWORD
                 conn.execute(
                     text("UPDATE users SET password_hash=:p WHERE user_id=:u"),
                     {"p": bcrypt.hash(raw_pwd), "u": r["user_id"]}
@@ -524,6 +563,82 @@ def set_class_archived(class_id: int, archive: bool):
                 ),
                 {"c": int(class_id)},
             )
+
+
+def get_portal_content(section: str) -> str:
+    sql = text(
+        "SELECT content FROM portal_content WHERE section=:s"
+    )
+    with engine.begin() as conn:
+        value = conn.execute(sql, {"s": section}).scalar()
+    return value or ""
+
+
+def set_portal_content(section: str, content: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """INSERT INTO portal_content(section, content, updated_at)
+                        VALUES (:s, :c, CURRENT_TIMESTAMP)
+                        ON CONFLICT(section)
+                        DO UPDATE SET content=EXCLUDED.content,
+                                      updated_at=CURRENT_TIMESTAMP"""
+            ),
+            {"s": section, "c": content},
+        )
+
+
+def get_all_portal_content() -> dict[str, str]:
+    df = pd.read_sql(
+        text("SELECT section, content FROM portal_content"),
+        con=engine,
+    )
+    return {row["section"]: row["content"] or "" for _, row in df.iterrows()}
+
+
+def add_pending_registration(name: str, email: str, default_password: str) -> None:
+    email_lc = email.strip().lower()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """INSERT INTO pending_registrations(name, email, status, default_password, created_at)
+                        VALUES (:n, :e, 'to be registered', :p, CURRENT_TIMESTAMP)
+                        ON CONFLICT(email) DO UPDATE
+                        SET name=EXCLUDED.name,
+                            status='to be registered',
+                            default_password=EXCLUDED.default_password,
+                            created_at=CURRENT_TIMESTAMP,
+                            processed_at=NULL,
+                            created_user_id=NULL"""
+            ),
+            {"n": name, "e": email_lc, "p": default_password},
+        )
+
+
+def list_pending_registrations(include_processed: bool = False) -> pd.DataFrame:
+    base_sql = "SELECT pending_id, name, email, status, default_password, created_at, processed_at, created_user_id FROM pending_registrations"
+    if not include_processed:
+        base_sql += " WHERE status='to be registered'"
+    base_sql += " ORDER BY created_at"
+    return pd.read_sql(text(base_sql), con=engine)
+
+
+def mark_pending_registration_processed(
+    pending_id: int,
+    created_user_id: Optional[int],
+    status: str = "registered",
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """UPDATE pending_registrations
+                        SET status=:st,
+                            processed_at=CURRENT_TIMESTAMP,
+                            created_user_id=:uid
+                      WHERE pending_id=:pid"""
+            ),
+            {"st": status, "uid": created_user_id, "pid": int(pending_id)},
+        )
 
 def get_classes_for_student(user_id: int, include_archived: bool = True) -> pd.DataFrame:
     sql = """
@@ -1911,17 +2026,41 @@ def render_teacher_dashboard_v2():
         teacher_manage_ui()
 
     with tab_help:
-        st.markdown(
-            """
-            **CSV Tips**
+        st.markdown("### Help & Student Portal Messaging")
+        st.caption("Update the copy that appears on the student login portal.")
 
-            * Words CSV files must include `headword` and `synonyms` columns.
-            * Bulk course imports support `lesson_title`, `headword`, `synonyms`, and optional `sort_order`.
-            * Use the refresh checkbox to replace existing lesson vocabulary when re-importing.
+        portal_copy = get_all_portal_content()
+        header_default = portal_copy.get("header", DEFAULT_HEADER_COPY)
+        instructions_default = portal_copy.get("instructions", DEFAULT_INSTRUCTIONS_COPY)
+        new_reg_default = portal_copy.get("new_registration", DEFAULT_NEW_REG_COPY)
 
-            **Need a reset?** Use the delete expanders inside the *Manage* tab to remove courses or lessons.
-            """
-        )
+        with st.form("portal_copy_form"):
+            header_text = st.text_area(
+                "Header",
+                value=header_default,
+                height=220,
+                help="Appears above the student portal. Leave blank to hide.",
+            )
+            instructions_text = st.text_area(
+                "Instructions",
+                value=instructions_default,
+                height=220,
+                help="Shown on the left side of the student login portal.",
+            )
+            new_registration_text = st.text_area(
+                "New registration",
+                value=new_reg_default,
+                height=220,
+                help="Shown above the student self-registration form.",
+            )
+            submitted = st.form_submit_button("Save messaging", type="primary")
+
+        if submitted:
+            set_portal_content("header", header_text)
+            set_portal_content("instructions", instructions_text)
+            set_portal_content("new_registration", new_registration_text)
+            st.success("Saved portal messaging.")
+            st.rerun()
 # ─────────────────────────────────────────────────────────────────────
 # AUTH INTEGRATION (optional / append-only)
 # ─────────────────────────────────────────────────────────────────────
@@ -2019,8 +2158,56 @@ def login_form():
 # Gate: not logged in yet
 if "auth" not in st.session_state:
     login_form()
-    st.title("Learning English Made Easy")
-    st.write("Turn 11+ preparation into an engaging adventure with our interactive online platform, designed to make learning feel like a game. Every quiz is adaptive, rewarding, and intelligently structured to strengthen your child’s core English and reasoning skills — without the stress of traditional revision. Our system automatically adjusts between Lower, Medium, and Hard levels, ensuring that each learner is challenged at the right pace. Questions answered incorrectly are repeated in later sessions, helping students reinforce knowledge, close learning gaps, and achieve lasting progress — a proven method to boost confidence and results.")
+    portal_copy = get_all_portal_content()
+    header_text = portal_copy.get("header")
+    instructions_text = portal_copy.get("instructions")
+    new_registration_text = portal_copy.get("new_registration")
+
+    if header_text is None:
+        header_text = DEFAULT_HEADER_COPY
+    if instructions_text is None:
+        instructions_text = DEFAULT_INSTRUCTIONS_COPY
+    if new_registration_text is None:
+        new_registration_text = DEFAULT_NEW_REG_COPY
+
+    header_text = header_text or ""
+    instructions_text = instructions_text or ""
+    new_registration_text = new_registration_text or ""
+
+    if header_text.strip():
+        st.markdown(header_text)
+
+    col_instructions, col_registration = st.columns([3, 2])
+    with col_instructions:
+        st.subheader("Instructions")
+        if instructions_text.strip():
+            st.markdown(instructions_text)
+
+    with col_registration:
+        st.subheader("New registration")
+        if new_registration_text.strip():
+            st.markdown(new_registration_text)
+
+        with st.form("student_self_registration"):
+            reg_name = st.text_input("Name", key="portal_reg_name")
+            reg_email = st.text_input("Email address", key="portal_reg_email")
+            submit_registration = st.form_submit_button("Submit", type="primary")
+
+        if submit_registration:
+            name_clean = reg_name.strip()
+            email_clean = reg_email.strip()
+            if not name_clean or not email_clean:
+                st.warning("Please provide both name and email address.")
+            elif "@" not in email_clean or "." not in email_clean.split("@")[-1]:
+                st.warning("Please provide a valid email address.")
+            else:
+                try:
+                    add_pending_registration(name_clean, email_clean, DEFAULT_STUDENT_PASSWORD)
+                    st.success("Thank you! Your registration request has been sent.")
+                    st.session_state["portal_reg_name"] = ""
+                    st.session_state["portal_reg_email"] = ""
+                except Exception as exc:
+                    st.error(f"Could not submit registration: {exc}")
    # st.sidebar.header("Health")
    # if st.sidebar.button("DB ping"):
    #     try:
@@ -2198,7 +2385,7 @@ if st.session_state["auth"]["role"] == "admin":
     #         c1,c2,c3=st.columns(3)
     #         with c1: s_name  = st.text_input("Name", key="adm_create_name")
     #         with c2: s_email = st.text_input("Email", key="adm_create_email")
-    #         with c3: s_pwd   = st.text_input("Temp Password", value="Learn123!", type="password", key="adm_create_pwd")
+    #         with c3: s_pwd   = st.text_input("Temp Password", value=DEFAULT_STUDENT_PASSWORD, type="password", key="adm_create_pwd")
     #         go = st.form_submit_button("Create")
     #         if go and s_name and s_email and s_pwd:
     #             try:
@@ -2237,12 +2424,54 @@ if st.session_state["auth"]["role"] == "admin":
                 df_students = df_students[m]
             st.dataframe(df_students, use_container_width=True)
 
+            pending_df = list_pending_registrations()
+            if not pending_df.empty:
+                st.markdown("### 📝 Pending student registrations")
+                pending_display = pending_df.copy()
+                pending_display["created_at"] = pending_display["created_at"].astype(str)
+                if "processed_at" in pending_display:
+                    pending_display["processed_at"] = pending_display["processed_at"].astype(str)
+                st.dataframe(
+                    pending_display[["name", "email", "status", "default_password", "created_at"]],
+                    use_container_width=True,
+                )
+
+                selection = st.radio(
+                    "Select a registration",
+                    pending_df["pending_id"].tolist(),
+                    format_func=lambda pid: f"{pending_df.loc[pending_df['pending_id']==pid, 'name'].values[0]} ({pending_df.loc[pending_df['pending_id']==pid, 'email'].values[0]})",
+                    key="pending_registration_select",
+                )
+
+                if st.button("Create Student", type="primary", key="pending_create_student"):
+                    pending_row = pending_df[pending_df["pending_id"] == selection].iloc[0]
+                    email_lc = pending_row["email"].strip().lower()
+                    existing = user_by_email(email_lc)
+                    if existing and existing.get("role") == "student":
+                        mark_pending_registration_processed(int(pending_row["pending_id"]), existing.get("user_id"), status="already registered")
+                        set_user_active(existing.get("user_id"), True)
+                        st.info("This email is already registered. The student has been reactivated if necessary.")
+                        st.rerun()
+                    elif existing:
+                        st.warning("An account with this email already exists with a different role.")
+                    else:
+                        try:
+                            password = pending_row.get("default_password") or DEFAULT_STUDENT_PASSWORD
+                            new_user_id = create_user(pending_row["name"], email_lc, password, "student")
+                            if new_user_id:
+                                set_user_active(new_user_id, True)
+                            mark_pending_registration_processed(int(pending_row["pending_id"]), new_user_id, status="registered")
+                            st.success("Student account created from registration.")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Failed to create student: {ex}")
+
             st.markdown("### ➕ Add / Enroll Student")
             with st.form("adm_add_student"):
                 c1, c2, c3 = st.columns(3)
                 with c1: s_name = st.text_input("Name")
                 with c2: s_email = st.text_input("Email")
-                with c3: s_pwd = st.text_input("Temp Password", value="Learn123!", type="password")
+                with c3: s_pwd = st.text_input("Temp Password", value=DEFAULT_STUDENT_PASSWORD, type="password")
                 if st.form_submit_button("Create Student", type="primary"):
                     if s_name and s_email:
                         try:
