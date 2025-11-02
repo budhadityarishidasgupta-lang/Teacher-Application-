@@ -2497,15 +2497,16 @@ if st.session_state["auth"]["role"] == "student":
             st.markdown(
                 """
                 <style>
-                [data-testid="stSidebar"] .stRadio label {
-                    align-items: flex-start;
+                .lesson-picker__course {
+                    margin: 0.5rem 0 0.25rem;
+                    font-weight: 600;
                 }
-                [data-testid="stSidebar"] .stRadio label p {
-                    white-space: pre-line;
+                .lesson-picker [data-testid="stRadio"] > div[role="radiogroup"] > div label {
+                    align-items: center;
+                }
+                .lesson-picker [data-testid="stRadio"] > div[role="radiogroup"] > div label p {
                     margin: 0;
                     font-size: 0.95rem;
-                    text-indent: -0.75rem;
-                    padding-left: 0.75rem;
                 }
                 </style>
                 """,
@@ -2515,11 +2516,11 @@ if st.session_state["auth"]["role"] == "student":
             option_pairs: list[tuple[int, int]] = []
             display_map: dict[tuple[int, int], tuple[str, str]] = {}
             course_lessons: dict[int, pd.DataFrame] = {}
+            lessons_by_course: dict[int, list[tuple[int, int]]] = {}
             empty_courses: list[str] = []
 
             prev_course = int(st.session_state.get("active_cid") or 0)
             prev_lesson = st.session_state.get("student_lesson_select")
-            default_index = 0
 
             for _, rowc in courses.iterrows():
                 cid = int(rowc["course_id"])
@@ -2541,47 +2542,90 @@ if st.session_state["auth"]["role"] == "student":
                     empty_courses.append(str(rowc["title"]))
                     continue
 
+                lesson_pairs: list[tuple[int, int]] = []
                 for _, lesson_row in lesson_df.iterrows():
                     pair = (cid, int(lesson_row["lesson_id"]))
                     display_map[pair] = (str(rowc["title"]), str(lesson_row["title"]))
                     option_pairs.append(pair)
-                    if prev_course == cid and prev_lesson == pair[1]:
-                        default_index = len(option_pairs) - 1
+                    lesson_pairs.append(pair)
+                lessons_by_course[cid] = lesson_pairs
 
             if not option_pairs:
                 st.info("No lessons yet for your assigned courses.")
             else:
-                labels: dict[tuple[int, int], str] = {}
-                last_course_title = ""
-                for pair in option_pairs:
-                    course_title, lesson_title = display_map[pair]
-                    prefix = ""
-                    if course_title != last_course_title:
-                        prefix = f"* {course_title}\n"
-                        last_course_title = course_title
-                    labels[pair] = f"{prefix}* {lesson_title}"
+                selected_pair = st.session_state.get("student_course_lesson")
+                if selected_pair not in option_pairs:
+                    selected_pair = None
+                    if prev_course and prev_lesson:
+                        candidate = (prev_course, int(prev_lesson))
+                        if candidate in option_pairs:
+                            selected_pair = candidate
+                    if selected_pair is None:
+                        selected_pair = option_pairs[0]
+                    st.session_state["student_course_lesson"] = selected_pair
+                    st.session_state["active_cid"] = selected_pair[0]
+                    st.session_state["student_lesson_select"] = selected_pair[1]
 
-                def _format_pair(pair: tuple[int, int]) -> str:
-                    return labels.get(pair, "")
+                st.markdown("<div class='lesson-picker'>", unsafe_allow_html=True)
+                for cid, lesson_pairs in lessons_by_course.items():
+                    course_title = display_map[lesson_pairs[0]][0] if lesson_pairs else ""
+                    st.markdown(
+                        f"<p class='lesson-picker__course'>{html.escape(course_title)}</p>",
+                        unsafe_allow_html=True,
+                    )
 
-                selected_pair = st.radio(
-                    "Course and lesson",
-                    option_pairs,
-                    index=default_index,
-                    format_func=_format_pair,
-                    key="student_course_lesson",
-                    label_visibility="collapsed",
-                )
+                    state_key = f"lesson_radio_{cid}"
+                    options = lesson_pairs
+                    current_value = st.session_state.get(state_key)
 
+                    if selected_pair in lesson_pairs:
+                        st.session_state[state_key] = selected_pair
+                        current_value = selected_pair
+                    elif current_value not in lesson_pairs:
+                        if state_key in st.session_state:
+                            del st.session_state[state_key]
+                        current_value = None
+
+                    def _format_option(pair: tuple[int, int]) -> str:
+                        _, lesson_title = display_map[pair]
+                        return lesson_title
+
+                    def _on_change(selected_course: int = cid, key: str = state_key) -> None:
+                        choice = st.session_state.get(key)
+                        if not choice:
+                            return
+                        st.session_state["student_course_lesson"] = choice
+                        st.session_state["active_cid"] = choice[0]
+                        st.session_state["student_lesson_select"] = choice[1]
+                        for other_cid in lessons_by_course.keys():
+                            if other_cid != selected_course:
+                                other_key = f"lesson_radio_{other_cid}"
+                                if other_key in st.session_state:
+                                    del st.session_state[other_key]
+
+                    radio_kwargs = dict(
+                        label="Lesson selection",
+                        options=options,
+                        key=state_key,
+                        format_func=_format_option,
+                        label_visibility="collapsed",
+                        on_change=_on_change,
+                    )
+
+                    if current_value is None:
+                        radio_kwargs["index"] = None
+
+                    st.radio(**radio_kwargs)
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                selected_pair = st.session_state.get("student_course_lesson", option_pairs[0])
                 selected_course_id, selected_lesson_id = selected_pair
                 lessons = course_lessons.get(selected_course_id, pd.DataFrame())
 
                 selected_course_title, _ = display_map[selected_pair]
                 c_completed, c_total, c_pct = course_progress(USER_ID, int(selected_course_id))
                 st.caption(f"Selected: {selected_course_title} — {c_pct}% complete")
-
-                st.session_state["active_cid"] = selected_course_id
-                st.session_state["student_lesson_select"] = selected_lesson_id
 
             if empty_courses:
                 st.caption(
