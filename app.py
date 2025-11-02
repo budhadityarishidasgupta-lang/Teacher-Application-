@@ -81,6 +81,8 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe!123")
 # Feature flags (define early!)
 TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
 
+DEFAULT_LESSON_INSTRUCTION = "Pick every option that matches the meaning of the word."
+
 # Gamification constants (declared early so helper functions can use them)
 LEVEL_BANDS: list[dict[str, object]] = [
     {"level": 1, "min": 0,   "max": 99,  "title": "Learner",   "color": "#22c55e"},  # Green
@@ -186,6 +188,7 @@ def init_db():
           lesson_id  SERIAL PRIMARY KEY,
           course_id  INTEGER NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
           title      TEXT NOT NULL,
+          instructions TEXT,
           sort_order INTEGER DEFAULT 0,
           created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );
@@ -318,6 +321,7 @@ def patch_courses_table():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE courses ADD COLUMN IF NOT EXISTS description TEXT"))
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS instructions TEXT"))
         conn.execute(text("ALTER TABLE words   ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 2"))
 
 def patch_gamification_tables():
@@ -1414,10 +1418,17 @@ def td2_get_courses():
 
 @st.cache_data(ttl=10)
 def td2_get_lessons(course_id: int):
-    return pd.read_sql(text("""
-        SELECT lesson_id, title, sort_order
-        FROM lessons WHERE course_id=:c ORDER BY sort_order, lesson_id
-    """), con=engine, params={"c": int(course_id)})
+    df = pd.read_sql(
+        text(
+            """
+            SELECT lesson_id, title, sort_order, COALESCE(instructions,'') AS instructions
+            FROM lessons WHERE course_id=:c ORDER BY sort_order, lesson_id
+            """
+        ),
+        con=engine,
+        params={"c": int(course_id)},
+    )
+    return df
 
 @st.cache_data(ttl=10)
 def td2_get_active_students():
@@ -1450,9 +1461,10 @@ def td2_save_lesson_edits(course_id: int, df):
     with engine.begin() as conn:
         for _, r in df.iterrows():
             conn.execute(text("""
-                UPDATE lessons SET title=:t, sort_order=:o
+                UPDATE lessons SET title=:t, sort_order=:o, instructions=:i
                 WHERE lesson_id=:l AND course_id=:c
             """), {"t": str(r["title"]).strip(), "o": int(r.get("sort_order") or 0),
+                   "i": str(r.get("instructions") or "").strip(),
                    "l": int(r["lesson_id"]), "c": int(course_id)})
 
 def td2_delete_course(course_id: int):
@@ -1623,14 +1635,19 @@ def teacher_create_ui():
                                format_func=lambda x: dfc.loc[dfc["course_id"]==x, "title"].values[0],
                                key="td2_lesson_course")
             lt  = st.text_input("Lesson title", key="td2_lesson_title")
+            instr = st.text_input(
+                "Practice instructions (1-2 lines)",
+                key="td2_lesson_instructions",
+                help="Shown to students at the top of the lesson. Leave blank to use the default message.",
+            )
             so  = st.number_input("Sort order", 0, 999, 0, key="td2_lesson_sort")
             if st.form_submit_button("Create lesson", type="primary"):
                 if lt.strip():
                     with engine.begin() as conn:
                         conn.execute(text("""
-                            INSERT INTO lessons(course_id, title, sort_order)
-                            VALUES(:c,:t,:o)
-                        """), {"c": int(cid), "t": lt.strip(), "o": int(so)})
+                            INSERT INTO lessons(course_id, title, sort_order, instructions)
+                            VALUES(:c,:t,:o,:i)
+                        """), {"c": int(cid), "t": lt.strip(), "o": int(so), "i": instr.strip()})
                     td2_invalidate()
                     st.success("Lesson created.")
                     st.rerun()
@@ -1702,13 +1719,18 @@ def teacher_manage_ui():
                 st.info("No lessons yet for this course.")
             else:
                 edited_l = st.data_editor(
-                    dfl[["lesson_id", "title", "sort_order"]].reset_index(drop=True),
+                    dfl[["lesson_id", "title", "instructions", "sort_order"]].reset_index(drop=True),
                     use_container_width=True,
                     hide_index=True,
                     key="td2_lessons_editor",
                     column_config={
                         "lesson_id": st.column_config.NumberColumn("ID", disabled=True),
                         "title": st.column_config.TextColumn("Title"),
+                        "instructions": st.column_config.TextColumn(
+                            "Instructions",
+                            help="Short guidance shown to students",
+                            max_chars=200,
+                        ),
                         "sort_order": st.column_config.NumberColumn("Order", min_value=0, step=1),
                     }
                 )
@@ -2504,7 +2526,7 @@ if st.session_state["auth"]["role"] == "student":
                 lesson_df = pd.read_sql(
                     text(
                         """
-                        SELECT lesson_id, title
+                        SELECT lesson_id, title, COALESCE(instructions,'') AS instructions
                         FROM lessons
                         WHERE course_id = :c
                         ORDER BY sort_order
@@ -2887,6 +2909,24 @@ if st.session_state["auth"]["role"] == "student":
 
     lid = int(selected_lesson_id)
 
+    lesson_row = lessons[lessons["lesson_id"] == lid].iloc[0]
+    lesson_title = str(lesson_row.get("title", "Lesson"))
+    lesson_instruction = str(lesson_row.get("instructions") or "").strip()
+    if not lesson_instruction:
+        lesson_instruction = DEFAULT_LESSON_INSTRUCTION
+    st.markdown(
+        """
+        <div class="lesson-header">
+            <h2>{title}</h2>
+            <p class="lesson-instruction">{instruction}</p>
+        </div>
+        """.format(
+            title=html.escape(lesson_title),
+            instruction=html.escape(lesson_instruction),
+        ),
+        unsafe_allow_html=True,
+    )
+
     # NEW: lesson-level progress and question count
     total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
     basis = mastered_q if mastered_q > 0 else attempted_q
@@ -3015,7 +3055,7 @@ if st.session_state["auth"]["role"] == "student":
                 unsafe_allow_html=True,
             )
             st.markdown(
-                "<p class='quiz-instructions'>Pick every option that matches the meaning of the word.</p>",
+                f"<p class='quiz-instructions'>{html.escape(lesson_instruction)}</p>",
                 unsafe_allow_html=True,
             )
 
