@@ -81,7 +81,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe!123")
 # Feature flags (define early!)
 TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
 
-DEFAULT_LESSON_INSTRUCTION = "Pick every option that matches the meaning of the word."
+#DEFAULT_LESSON_INSTRUCTION = "Pick every option that matches the meaning of the word."
 
 # Gamification constants (declared early so helper functions can use them)
 LEVEL_BANDS: list[dict[str, object]] = [
@@ -3210,10 +3210,10 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        "<p class='quiz-instructions'>Review the breakdown below, then choose your next step.</p>",
-        unsafe_allow_html=True,
-    )
+   # st.markdown(
+   #     "<p class='quiz-instructions'>Review the breakdown below, then choose your next step.</p>",
+   #     unsafe_allow_html=True,
+   # )
 
     xp_gain = int(st.session_state.get("last_xp_gain", 0) or 0)
     if xp_gain:
