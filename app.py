@@ -640,6 +640,19 @@ def mark_pending_registration_processed(
             {"st": status, "uid": created_user_id, "pid": int(pending_id)},
         )
 
+
+def delete_pending_registration(pending_id: int) -> None:
+    """Remove a pending registration entirely."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """DELETE FROM pending_registrations
+                      WHERE pending_id=:pid"""
+            ),
+            {"pid": int(pending_id)},
+        )
+
+
 def get_classes_for_student(user_id: int, include_archived: bool = True) -> pd.DataFrame:
     sql = """
         SELECT c.class_id,
@@ -2443,7 +2456,19 @@ if st.session_state["auth"]["role"] == "admin":
                     key="pending_registration_select",
                 )
 
-                if st.button("Create Student", type="primary", key="pending_create_student"):
+                action_col_create, action_col_disregard = st.columns(2)
+
+                with action_col_create:
+                    create_student_clicked = st.button(
+                        "Create Student", type="primary", key="pending_create_student"
+                    )
+
+                with action_col_disregard:
+                    disregard_clicked = st.button(
+                        "Disregard", key="pending_disregard_student"
+                    )
+
+                if create_student_clicked:
                     pending_row = pending_df[pending_df["pending_id"] == selection].iloc[0]
                     email_lc = pending_row["email"].strip().lower()
                     existing = user_by_email(email_lc)
@@ -2465,6 +2490,14 @@ if st.session_state["auth"]["role"] == "admin":
                             st.rerun()
                         except Exception as ex:
                             st.error(f"Failed to create student: {ex}")
+
+                if disregard_clicked:
+                    try:
+                        delete_pending_registration(int(selection))
+                        st.success("Pending registration removed.")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Failed to remove registration: {ex}")
 
             st.markdown("### ➕ Add / Enroll Student")
             with st.form("adm_add_student"):
