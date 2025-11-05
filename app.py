@@ -1442,85 +1442,85 @@ def build_question_payload(
     random.shuffle(choices)
     return {"headword": headword, "choices": choices, "correct": set(correct)}
 
-def gpt_feedback_examples(headword: str, correct_word: str):
-    """
-    Returns (why, [ex1, ex2]) with kid-friendly, spoken-English sentences.
-    Uses GPT when enabled; otherwise a simple fallback.
-    """
-    def _fallback():
-        why = f"'{correct_word}' is a good synonym for '{headword}' because they mean almost the same thing."
-        return why, [
-            f"I felt {correct_word} when I won the game.",
-            f"Our teacher was {correct_word} about our project."
-        ]
+#def gpt_feedback_examples(headword: str, correct_word: str):
+#   """
+#    Returns (why, [ex1, ex2]) with kid-friendly, spoken-English sentences.
+#    Uses GPT when enabled; otherwise a simple fallback.
+#    """
+#    def _fallback():
+#        why = f"'{correct_word}' is a good synonym for '{headword}' because they mean almost the same thing."
+#        return why, [
+#            f"I felt {correct_word} when I won the game.",
+#            f"Our teacher was {correct_word} about our project."
+#        ]
 
-    if not (ENABLE_GPT and gpt_client):
-        return _fallback()
+#    if not (ENABLE_GPT and gpt_client):
+#        return _fallback()
 
-    try:
-        prompt = f"""
-You are a tutor for ages 7–10. Write natural, spoken-English output.
+#    try:
+#        prompt = f"""
+# You are a tutor for ages 7–10. Write natural, spoken-English output.
 
-HEADWORD: "{headword}"
-CORRECT SYNONYM (use this in examples): "{correct_word}"
+# HEADWORD: "{headword}"
+# CORRECT SYNONYM (use this in examples): "{correct_word}"
 
-Output JSON only: {{"why": "...", "examples": ["...", "..."]}}
+# Output JSON only: {{"why": "...", "examples": ["...", "..."]}}
 
-Rules:
-- "why": 1 short sentence (≤ 16 words) in kid-friendly language explaining why "{correct_word}" matches "{headword}".
-- "examples": Act as a english teacher teaching children age group of 7 to 11. Create TWO different sentences that is often used by english speaking people and that makes perfect gramatical sense.
-- Use "{correct_word}" **exactly once** in each example. Prefer NOT to use "{headword}" unless it sounds natural.
-- 8–12 words each, simple present/past, no semicolons/dashes/quotes. Avoid rare words and odd pairings.
-- No proper names, brands, profanity, bias or metaphors. Keep it positive and clear.
-- Return valid JSON only. No extra text.
-"""
-        resp = gpt_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "Be concise, clear, and age-appropriate. Return only JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=220,
-        )
+# Rules:
+#- "why": 1 short sentence (≤ 16 words) in kid-friendly language explaining why "{correct_word}" matches "{headword}".
+#- "examples": Act as a english teacher teaching children age group of 7 to 11. Create TWO different sentences that is often used by english speaking people and that makes perfect gramatical sense.
+#- Use "{correct_word}" **exactly once** in each example. Prefer NOT to use "{headword}" unless it sounds natural.
+#- 8–12 words each, simple present/past, no semicolons/dashes/quotes. Avoid rare words and odd pairings.
+#- No proper names, brands, profanity, bias or metaphors. Keep it positive and clear.
+#- Return valid JSON only. No extra text.
+#"""
+#        resp = gpt_client.chat.completions.create(
+#            model=OPENAI_MODEL,
+#            messages=[
+#                {"role": "system", "content": "Be concise, clear, and age-appropriate. Return only JSON."},
+#                {"role": "user", "content": prompt},
+#            ],
+#            temperature=0.2,
+#            max_tokens=220,
+#        )
 
-        import json
-        payload = json.loads(resp.choices[0].message.content)
+#        import json
+#        payload = json.loads(resp.choices[0].message.content)
 
-        why = (payload.get("why") or "").strip()
-        examples = [str(x).strip() for x in (payload.get("examples") or []) if str(x).strip()]
+#        why = (payload.get("why") or "").strip()
+#        examples = [str(x).strip() for x in (payload.get("examples") or []) if str(x).strip()]
 
-        def _clean(s: str) -> str:
-            s = s.replace("—", "-").replace(";", ",").replace('"', "").replace("'", "")
-            s = " ".join(s.split())
-            if s and s[0].islower():
-                s = s[0].upper() + s[1:]
-            if s and s[-1] not in ".!?":
-                s += "."
-            return s
+ #       def _clean(s: str) -> str:
+ #           s = s.replace("—", "-").replace(";", ",").replace('"', "").replace("'", "")
+ #           s = " ".join(s.split())
+ #           if s and s[0].islower():
+ #               s = s[0].upper() + s[1:]
+ #           if s and s[-1] not in ".!?":
+ #               s += "."
+ #           return s
 
-        ok_examples = []
-        for s in examples[:2]:
-            w = s.lower().split()
-            if (correct_word.lower() in w) and (7 <= len(w) <= 13) and (headword.lower() not in w):
-                ok_examples.append(_clean(s))
-        while len(ok_examples) < 2:
-            ok_examples.append(_clean(
-                random.choice([
-                    f"I feel {correct_word} when my team wins.",
-                    f"My friend was {correct_word} after the good news.",
-                    f"The class grew {correct_word} during the fun activity.",
-                    f"Dad looked {correct_word} when he saw my drawing.",
-                ])
-            ))
+ #       ok_examples = []
+ #       for s in examples[:2]:
+ #           w = s.lower().split()
+ #           if (correct_word.lower() in w) and (7 <= len(w) <= 13) and (headword.lower() not in w):
+ #               ok_examples.append(_clean(s))
+ #       while len(ok_examples) < 2:
+ #           ok_examples.append(_clean(
+ #               random.choice([
+ #                   f"I feel {correct_word} when my team wins.",
+ #                   f"My friend was {correct_word} after the good news.",
+ #                   f"The class grew {correct_word} during the fun activity.",
+ #                   f"Dad looked {correct_word} when he saw my drawing.",
+ #               ])
+ #           ))
 
-        if not why:
-            why = f"'{correct_word}' means nearly the same as '{headword}', so it fits here."
-
-        return why, ok_examples[:2]
-
-    except Exception:
-        return _fallback()
+#        if not why:
+#            why = f"'{correct_word}' means nearly the same as '{headword}', so it fits here."
+#
+#        return why, ok_examples[:2]
+#
+#    except Exception:
+#        return _fallback()
 
 # Ensure a default admin exists
 ensure_admin()
