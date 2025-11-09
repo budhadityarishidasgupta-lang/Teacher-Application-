@@ -93,6 +93,8 @@ DEFAULT_HEADER_COPY = (
     "knowledge, close learning gaps, and achieve lasting progress — a proven method to boost "
     "confidence and results."
 )
+DEFAULT_HEADER_MAIN_COPY = "Welcome to Learning English Made Easy!"
+DEFAULT_HEADER_DRAFT_COPY = DEFAULT_HEADER_COPY
 DEFAULT_INSTRUCTIONS_COPY = ""
 DEFAULT_NEW_REG_COPY = ""
 
@@ -155,6 +157,30 @@ BADGE_DEFINITIONS = {
         "milestone": "100% accuracy in a lesson",
     },
 }
+
+
+def enable_textarea_spellcheck() -> None:
+    """Ensure all Streamlit text areas have browser spell checking enabled."""
+
+    st.markdown(
+        """
+        <script>
+        (function() {
+            const setSpellcheck = () => {
+                document.querySelectorAll('textarea').forEach((el) => {
+                    el.setAttribute('spellcheck', 'true');
+                    el.setAttribute('autocorrect', 'on');
+                    el.setAttribute('autocapitalize', 'sentences');
+                });
+            };
+            setSpellcheck();
+            const observer = new MutationObserver(setSpellcheck);
+            observer.observe(document.body, { childList: true, subtree: true });
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ─────────────────────────────────────────────────────────────────────
 # Database (Postgres via SQLAlchemy)
@@ -2043,16 +2069,32 @@ def render_teacher_dashboard_v2():
         st.caption("Update the copy that appears on the student login portal.")
 
         portal_copy = get_all_portal_content()
-        header_default = portal_copy.get("header", DEFAULT_HEADER_COPY)
+        header_main_default = portal_copy.get("header_main")
+        header_draft_default = portal_copy.get("header_draft")
+        legacy_header_default = portal_copy.get("header")
         instructions_default = portal_copy.get("instructions", DEFAULT_INSTRUCTIONS_COPY)
         new_reg_default = portal_copy.get("new_registration", DEFAULT_NEW_REG_COPY)
 
+        if header_main_default is None:
+            header_main_default = DEFAULT_HEADER_MAIN_COPY
+        if header_draft_default is None:
+            if legacy_header_default is not None:
+                header_draft_default = legacy_header_default
+            else:
+                header_draft_default = DEFAULT_HEADER_DRAFT_COPY
+
         with st.form("portal_copy_form"):
-            header_text = st.text_area(
+            header_main_text = st.text_area(
                 "Header",
-                value=header_default,
+                value=header_main_default,
                 height=220,
-                help="Appears above the student portal. Leave blank to hide.",
+                help="Appears at the very top of the student portal welcome page.",
+            )
+            header_draft_text = st.text_area(
+                "Header draft",
+                value=header_draft_default,
+                height=220,
+                help="Shown underneath the welcome message on the student portal.",
             )
             instructions_text = st.text_area(
                 "Instructions",
@@ -2068,8 +2110,12 @@ def render_teacher_dashboard_v2():
             )
             submitted = st.form_submit_button("Save messaging", type="primary")
 
+        enable_textarea_spellcheck()
+
         if submitted:
-            set_portal_content("header", header_text)
+            set_portal_content("header_main", header_main_text)
+            set_portal_content("header_draft", header_draft_text)
+            set_portal_content("header", header_draft_text)
             set_portal_content("instructions", instructions_text)
             set_portal_content("new_registration", new_registration_text)
             st.success("Saved portal messaging.")
@@ -2172,23 +2218,48 @@ def login_form():
 if "auth" not in st.session_state:
     login_form()
     portal_copy = get_all_portal_content()
-    header_text = portal_copy.get("header")
+    header_main_text = portal_copy.get("header_main")
+    header_draft_text = portal_copy.get("header_draft")
+    legacy_header_text = portal_copy.get("header")
     instructions_text = portal_copy.get("instructions")
     new_registration_text = portal_copy.get("new_registration")
 
-    if header_text is None:
-        header_text = DEFAULT_HEADER_COPY
+    if header_main_text is None:
+        header_main_text = DEFAULT_HEADER_MAIN_COPY
+    if header_draft_text is None:
+        header_draft_text = legacy_header_text
+    if header_draft_text is None:
+        header_draft_text = DEFAULT_HEADER_DRAFT_COPY
     if instructions_text is None:
         instructions_text = DEFAULT_INSTRUCTIONS_COPY
     if new_registration_text is None:
         new_registration_text = DEFAULT_NEW_REG_COPY
 
-    header_text = header_text or ""
+    header_main_text = header_main_text or ""
+    header_draft_text = header_draft_text or ""
     instructions_text = instructions_text or ""
     new_registration_text = new_registration_text or ""
 
-    if header_text.strip():
-        st.markdown(header_text)
+    if header_main_text.strip():
+        st.markdown(
+            """
+            <style>
+            .portal-welcome-message {
+                font-size: 20px;
+                font-weight: 600;
+                margin-bottom: 1rem;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='portal-welcome-message'>{header_main_text}</div>",
+            unsafe_allow_html=True,
+        )
+
+    if header_draft_text.strip():
+        st.markdown(header_draft_text)
 
     col_instructions, col_registration = st.columns([3, 2])
     with col_instructions:
