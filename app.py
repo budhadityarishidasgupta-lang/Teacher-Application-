@@ -591,6 +591,271 @@ def set_class_archived(class_id: int, archive: bool):
             )
 
 
+def _build_in_clause(column: str, values: list[int], prefix: str) -> tuple[str, dict[str, object]]:
+    """Utility to build an ``IN`` clause with unique bind parameters."""
+    cleaned = [int(v) for v in values if v is not None]
+    if not cleaned:
+        return "1=0", {}
+    unique_values = sorted(set(cleaned))
+    params = {f"{prefix}_{idx}": int(v) for idx, v in enumerate(unique_values)}
+    placeholders = ", ".join(f":{name}" for name in params)
+    return f"{column} IN ({placeholders})", params
+
+
+def _format_duration_ms(total_ms: float) -> str:
+    if not total_ms or total_ms <= 0:
+        return "0s"
+    seconds = float(total_ms) / 1000.0
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f} min"
+    hours = minutes / 60.0
+    if hours < 24:
+        return f"{hours:.1f} hr"
+    days = hours / 24.0
+    return f"{days:.1f} d"
+
+
+def class_student_lesson_snapshot(user_ids: list[int]) -> pd.DataFrame:
+    """Return per-student lesson progress metrics for classroom snapshots."""
+    if not user_ids:
+        return pd.DataFrame(
+            columns=[
+                "user_id",
+                "enrollment_summary",
+                "courses_completed",
+                "lessons_completed",
+                "time_on_lessons",
+                "lesson_score",
+            ]
+        )
+
+    uids = sorted({int(uid) for uid in user_ids if uid is not None})
+    if not uids:
+        return pd.DataFrame(
+            columns=[
+                "user_id",
+                "enrollment_summary",
+                "courses_completed",
+                "lessons_completed",
+                "time_on_lessons",
+                "lesson_score",
+            ]
+        )
+
+    attempt_clause, attempt_params = _build_in_clause("user_id", uids, "at")
+    attempts_sql = text(
+        f"""
+        SELECT user_id,
+               course_id,
+               lesson_id,
+               COUNT(*) AS total_attempts,
+               SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) AS correct_attempts,
+               SUM(COALESCE(response_ms, 0)) AS total_time_ms
+        FROM attempts
+        WHERE {attempt_clause}
+        GROUP BY user_id, course_id, lesson_id
+        """
+    )
+    attempts_df = pd.read_sql(attempts_sql, con=engine, params=attempt_params)
+
+    enroll_clause, enroll_params = _build_in_clause("e.user_id", uids, "en")
+    enroll_sql = text(
+        f"""
+        SELECT e.user_id,
+               c.course_id,
+               c.title       AS course_title,
+               l.lesson_id,
+               l.title       AS lesson_title,
+               COALESCE(l.sort_order, 0) AS lesson_order
+        FROM enrollments e
+        JOIN courses c ON c.course_id = e.course_id
+        LEFT JOIN lessons l ON l.course_id = c.course_id
+        WHERE {enroll_clause}
+        ORDER BY e.user_id, c.title, COALESCE(l.sort_order, 0), l.lesson_id
+        """
+    )
+    enroll_df = pd.read_sql(enroll_sql, con=engine, params=enroll_params)
+
+    course_ids = set(int(c) for c in attempts_df.get("course_id", []).tolist() if pd.notna(c))
+    course_ids.update(int(c) for c in enroll_df.get("course_id", []).tolist() if pd.notna(c))
+
+    if course_ids:
+        lesson_clause, lesson_params = _build_in_clause("course_id", list(course_ids), "lc")
+        lessons_sql = text(
+            f"""
+            SELECT lesson_id,
+                   course_id,
+                   title,
+                   COALESCE(sort_order, 0) AS sort_order
+            FROM lessons
+            WHERE {lesson_clause}
+            """
+        )
+        lessons_df = pd.read_sql(lessons_sql, con=engine, params=lesson_params)
+    else:
+        lessons_df = pd.DataFrame(columns=["lesson_id", "course_id", "title", "sort_order"])
+
+    lesson_course_map = {
+        int(row["lesson_id"]): int(row["course_id"])
+        for _, row in lessons_df.iterrows()
+        if pd.notna(row.get("lesson_id")) and pd.notna(row.get("course_id"))
+    }
+    lesson_ids = set(lesson_course_map.keys())
+    lesson_ids.update(int(lid) for lid in attempts_df.get("lesson_id", []).tolist() if pd.notna(lid))
+
+    if lesson_ids:
+        lw_clause, lw_params = _build_in_clause("lesson_id", list(lesson_ids), "lw")
+        lw_sql = text(
+            f"""
+            SELECT lesson_id, COUNT(DISTINCT word_id) AS total_words
+            FROM lesson_words
+            WHERE {lw_clause}
+            GROUP BY lesson_id
+            """
+        )
+        lesson_word_df = pd.read_sql(lw_sql, con=engine, params=lw_params)
+        lesson_word_counts = {
+            int(row["lesson_id"]): int(row["total_words"])
+            for _, row in lesson_word_df.iterrows()
+        }
+    else:
+        lesson_word_counts = {}
+
+    master_clause, master_params = _build_in_clause("ws.user_id", uids, "ws")
+    if lesson_ids and master_params:
+        lesson_filter, lesson_filter_params = _build_in_clause("lw.lesson_id", list(lesson_ids), "wsl")
+        master_params.update(lesson_filter_params)
+        master_sql = text(
+            f"""
+            SELECT ws.user_id,
+                   lw.lesson_id,
+                   SUM(CASE WHEN ws.mastered THEN 1 ELSE 0 END) AS mastered_words,
+                   SUM(CASE WHEN COALESCE(ws.total_attempts, 0) > 0 THEN 1 ELSE 0 END) AS attempted_words
+            FROM word_stats ws
+            JOIN words w ON w.headword = ws.headword
+            JOIN lesson_words lw ON lw.word_id = w.word_id
+            WHERE {master_clause} AND {lesson_filter}
+            GROUP BY ws.user_id, lw.lesson_id
+            """
+        )
+        master_df = pd.read_sql(master_sql, con=engine, params=master_params)
+    else:
+        master_df = pd.DataFrame(columns=["user_id", "lesson_id", "mastered_words", "attempted_words"])
+
+    if not master_df.empty:
+        master_df["course_id"] = master_df["lesson_id"].map(lesson_course_map).astype("Int64")
+
+    if attempts_df.empty:
+        attempts_df = pd.DataFrame(
+            columns=["user_id", "course_id", "lesson_id", "total_attempts", "correct_attempts", "total_time_ms"]
+        )
+
+    lesson_summary = attempts_df.merge(
+        master_df,
+        on=["user_id", "lesson_id", "course_id"],
+        how="outer",
+    )
+
+    if lesson_summary.empty:
+        lesson_summary = pd.DataFrame(
+            columns=[
+                "user_id",
+                "course_id",
+                "lesson_id",
+                "total_attempts",
+                "correct_attempts",
+                "total_time_ms",
+                "mastered_words",
+                "attempted_words",
+            ]
+        )
+
+    lesson_summary["course_id"] = lesson_summary["course_id"].fillna(
+        lesson_summary["lesson_id"].map(lesson_course_map)
+    )
+
+    for col in ["total_attempts", "correct_attempts", "total_time_ms", "mastered_words", "attempted_words"]:
+        if col in lesson_summary:
+            lesson_summary[col] = lesson_summary[col].fillna(0)
+
+    lesson_summary["total_words"] = lesson_summary["lesson_id"].map(lesson_word_counts).fillna(0)
+    lesson_summary["is_completed"] = (
+        (lesson_summary["total_words"] > 0)
+        & (lesson_summary.get("mastered_words", 0) >= lesson_summary["total_words"])
+    )
+    lesson_summary["accuracy"] = np.where(
+        lesson_summary["total_attempts"] > 0,
+        lesson_summary["correct_attempts"] / lesson_summary["total_attempts"],
+        np.nan,
+    )
+
+    lessons_per_course = (
+        lessons_df.groupby("course_id")["lesson_id"].nunique().to_dict()
+        if not lessons_df.empty
+        else {}
+    )
+
+    enrollment_map = {uid: "No enrolments" for uid in uids}
+    enrolled_courses_map: dict[int, set[int]] = {uid: set() for uid in uids}
+
+    if not enroll_df.empty:
+        for uid, group in enroll_df.groupby("user_id"):
+            course_parts: list[str] = []
+            for (course_id, course_title), cgroup in group.groupby(["course_id", "course_title"], dropna=False):
+                if pd.isna(course_id):
+                    continue
+                course_id_int = int(course_id)
+                enrolled_courses_map.setdefault(int(uid), set()).add(course_id_int)
+                lesson_titles = [str(t) for t in cgroup["lesson_title"].dropna().unique().tolist()]
+                if lesson_titles:
+                    lesson_titles.sort()
+                    course_parts.append(f"{course_title}: {', '.join(lesson_titles)}")
+                else:
+                    course_parts.append(f"{course_title}: (no lessons)")
+            if course_parts:
+                enrollment_map[int(uid)] = "; ".join(course_parts)
+
+    rows: list[dict[str, object]] = []
+    for uid in uids:
+        user_lessons = (
+            lesson_summary[lesson_summary["user_id"] == uid]
+            if not lesson_summary.empty
+            else pd.DataFrame(columns=lesson_summary.columns)
+        )
+        completed_lessons = user_lessons[user_lessons.get("is_completed", False)]
+        lessons_completed = int(completed_lessons["lesson_id"].nunique()) if not completed_lessons.empty else 0
+        total_time_ms = float(completed_lessons["total_time_ms"].sum() or 0.0)
+        score_series = user_lessons["accuracy"].dropna() if not user_lessons.empty else pd.Series(dtype=float)
+        score_label = f"{score_series.mean() * 100:.0f}%" if not score_series.empty else "—"
+
+        courses_completed = 0
+        for course_id in enrolled_courses_map.get(uid, set()):
+            total_lessons = int(lessons_per_course.get(course_id, 0) or 0)
+            if total_lessons <= 0:
+                continue
+            user_course_completed = completed_lessons[completed_lessons["course_id"] == course_id][
+                "lesson_id"
+            ].nunique()
+            if int(user_course_completed) >= total_lessons:
+                courses_completed += 1
+
+        rows.append(
+            {
+                "user_id": uid,
+                "enrollment_summary": enrollment_map.get(uid, "No enrolments"),
+                "courses_completed": int(courses_completed),
+                "lessons_completed": lessons_completed,
+                "time_on_lessons": _format_duration_ms(total_time_ms),
+                "lesson_score": score_label,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def get_portal_content(section: str) -> str:
     sql = text(
         "SELECT content FROM portal_content WHERE section=:s"
@@ -2594,7 +2859,7 @@ if st.session_state["auth"]["role"] == "admin":
                     df_students["user_id"].tolist(),
                     format_func=lambda x: f"{df_students.loc[df_students['user_id']==x,'name'].values[0]}"
                 )
-                action = st.selectbox("Action", ["Deactivate", "Reactivate", "Delete"])
+                action = st.selectbox("Action", ["Deactivate", "Reactivate", "Delete", "Reset Password"])
                 if st.button("Apply Action", type="primary"):
                     with engine.begin() as conn:
                         for sid in selected_ids:
@@ -2604,6 +2869,12 @@ if st.session_state["auth"]["role"] == "admin":
                                 conn.execute(text("UPDATE users SET is_active=TRUE WHERE user_id=:u"), {"u": sid})
                             elif action == "Delete":
                                 conn.execute(text("DELETE FROM users WHERE user_id=:u AND role='student'"), {"u": sid})
+                            elif action == "Reset Password":
+                                new_hash = bcrypt.hash("Learn123!")
+                                conn.execute(
+                                    text("UPDATE users SET password_hash=:p WHERE user_id=:u AND role='student'"),
+                                    {"p": new_hash, "u": sid},
+                                )
                     st.success(f"{action} applied to {len(selected_ids)} student(s).")
                     st.rerun()
             else:
@@ -2762,18 +3033,6 @@ if st.session_state["auth"]["role"] == "admin":
 
     # Student Dashboard — admin visibility
     with tab_student:
-        st.subheader("Student Overview")
-        attempts = pd.read_sql(
-            text("""
-                SELECT U.name, A.course_id, A.lesson_id, A.headword, A.is_correct, A.response_ms, A.ts
-                FROM attempts A JOIN users U ON U.user_id=A.user_id
-                ORDER BY A.id DESC LIMIT 500
-            """),
-            con=engine
-        )
-        st.dataframe(attempts, use_container_width=True)
-        st.caption("Latest attempts across students. Filter/export via table menu.")
-
         st.markdown("### 🏫 Classrooms Snapshot")
         classes_overview = get_classrooms(include_archived=True)
         if classes_overview.empty:
@@ -2795,7 +3054,48 @@ if st.session_state["auth"]["role"] == "admin":
                 st.info("This classroom has no students assigned yet.")
             else:
                 roster_df["assigned_at"] = roster_df["assigned_at"].astype(str)
-                st.dataframe(roster_df[["name", "email", "is_active", "assigned_at"]], use_container_width=True)
+                progress_df = class_student_lesson_snapshot(roster_df["user_id"].tolist())
+                merged = roster_df.merge(progress_df, on="user_id", how="left")
+                if "courses_completed" in merged:
+                    merged["courses_completed"] = merged["courses_completed"].fillna(0).astype(int)
+                if "lessons_completed" in merged:
+                    merged["lessons_completed"] = merged["lessons_completed"].fillna(0).astype(int)
+                defaults = {
+                    "enrollment_summary": "No enrolments",
+                    "time_on_lessons": "0s",
+                    "lesson_score": "—",
+                }
+                for col, default in defaults.items():
+                    if col in merged:
+                        merged[col] = merged[col].fillna(default)
+
+                display_df = merged.rename(
+                    columns={
+                        "name": "Student",
+                        "email": "Email",
+                        "is_active": "Active",
+                        "assigned_at": "Assigned At",
+                        "enrollment_summary": "Courses & Lessons",
+                        "courses_completed": "Courses Completed",
+                        "lessons_completed": "Lessons Completed",
+                        "time_on_lessons": "Time to Complete Lessons",
+                        "lesson_score": "Lesson Score",
+                    }
+                )
+
+                columns_order = [
+                    "Student",
+                    "Email",
+                    "Active",
+                    "Assigned At",
+                    "Courses & Lessons",
+                    "Courses Completed",
+                    "Lessons Completed",
+                    "Time to Complete Lessons",
+                    "Lesson Score",
+                ]
+                available_columns = [c for c in columns_order if c in display_df.columns]
+                st.dataframe(display_df[available_columns], use_container_width=True)
 
 # Student experience
 if st.session_state["auth"]["role"] == "student":
