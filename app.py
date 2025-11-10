@@ -3821,6 +3821,9 @@ if st.session_state["auth"]["role"] == "student":
             lesson_scorecard = list(st.session_state.scorecards.get(lesson_key, []))
             lesson_scorecard.append(
                 {
+                    "question_number": int(
+                        st.session_state.q_index_per_lesson.get(lesson_key, len(lesson_scorecard) + 1)
+                    ),
                     "word": active,
                     "correct": ", ".join(sorted(correct_set)) or "",
                 }
@@ -4012,19 +4015,24 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 #    st.markdown("</div>", unsafe_allow_html=True)
 
 
-    # ─────────────────────────────────────────────────────────────────────
-    # REVIEW TAB — retry past mistakes (manual)
-    # ─────────────────────────────────────────────────────────────────────
-    with tab_scorecard:
-        lesson_entries = st.session_state.scorecards.get(int(lid), [])
+# ─────────────────────────────────────────────────────────────────────
+# SCORECARD TAB — running log of answered questions
+# ─────────────────────────────────────────────────────────────────────
+with tab_scorecard:
+    lesson_entries = st.session_state.scorecards.get(int(lid), [])
 
-        if not lesson_entries:
-            st.info("No answers recorded yet. Complete questions to build your scorecard.")
+    if not lesson_entries:
+        st.info("No answers recorded yet. Complete questions to build your scorecard.")
+    else:
+        df = pd.DataFrame(lesson_entries)
+        if "question_number" in df.columns:
+            df = df.sort_values("question_number")
+            df = df.rename(columns={"question_number": "Question #"})
         else:
-            df = pd.DataFrame(lesson_entries)
             df.insert(0, "Question #", range(1, len(df) + 1))
-            df = df.rename(columns={"word": "Question Word", "correct": "Correct Answer"})
-            st.dataframe(df, use_container_width=True)
+        df = df.rename(columns={"word": "Question Word", "correct": "Correct Answer"})
+        df = df[[col for col in ["Question #", "Question Word", "Correct Answer"] if col in df.columns]]
+        st.dataframe(df, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
