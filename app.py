@@ -2585,6 +2585,9 @@ for _k, _v in _defaults.items():
 if "q_index_per_lesson" not in st.session_state:
     st.session_state.q_index_per_lesson = {}   # {lesson_id: current_index_int}
 
+if "scorecards" not in st.session_state:
+    st.session_state.scorecards = {}
+
 if "review_queue" not in st.session_state:
     from collections import deque
     st.session_state.review_queue = deque()    # list of headwords to retry soon
@@ -3591,6 +3594,10 @@ if st.session_state["auth"]["role"] == "student":
     lesson_instruction = str(lesson_row.get("instructions") or "").strip()
     if not lesson_instruction:
         lesson_instruction = DEFAULT_LESSON_INSTRUCTION
+
+    if int(lid) not in st.session_state.scorecards:
+        st.session_state.scorecards[int(lid)] = []
+
     st.markdown(
         """
         <div class="lesson-header">
@@ -3710,7 +3717,7 @@ if st.session_state["auth"]["role"] == "student":
     st.session_state.badges_recent = []
 
 # Tabs for Practice vs Review (header stays ABOVE)
-    tab_practice, tab_review = st.tabs(["Practice", "Review Mistakes"])
+    tab_practice, tab_scorecard = st.tabs(["Practice", "Scorecard"])
 
 # ─────────────────────────────────────────────────────────────────────
 # PRACTICE TAB — quiz form + after-submit feedback + Next
@@ -3810,6 +3817,16 @@ if st.session_state["auth"]["role"] == "student":
                 "choices": list(choices)
             }
 
+            lesson_key = int(lid)
+            lesson_scorecard = list(st.session_state.scorecards.get(lesson_key, []))
+            lesson_scorecard.append(
+                {
+                    "word": active,
+                    "correct": ", ".join(sorted(correct_set)) or "",
+                }
+            )
+            st.session_state.scorecards[lesson_key] = lesson_scorecard
+
             # If wrong, push this headword to the front of the review queue
             if not is_correct:
                 from collections import deque
@@ -3834,18 +3851,10 @@ def feedback_text(headword: str, correct_word: str, lesson_kind: str):
     h, c = (headword or "").strip(), (correct_word or "").strip()
     if lesson_kind == "antonym":
         why = f"'{c}' is an opposite of '{h}'. They mean very different things."
-        examples = [
-            f"I felt {h} in the sunshine, but {c} when plans were canceled.",
-            f"A warm day feels {h}; a stormy day can feel {c}."
-        ]
     else:
         # default = synonym
         why = f"'{c}' means almost the same as '{h}', so it fits here."
-        examples = [
-            f"I felt {c} when I finished my project.",
-            f"Our class was {c} after we won the match."
-        ]
-    return why, examples[:2]
+    return why, []
 
 # Override: route old call sites to the new dynamic generator
 def gpt_feedback_examples(headword: str, correct_word: str):
@@ -3935,9 +3944,9 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
     # GPT feedback (optional)
     try:
         correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
-        why, examples = gpt_feedback_examples(st.session_state.active_word, correct_choice_for_text)
-        st.info(f"**Why:** {why}")
-        st.markdown(f"**Examples:**\n\n- {examples[0]}\n- {examples[1]}")
+        why, _examples = gpt_feedback_examples(st.session_state.active_word, correct_choice_for_text)
+        if why:
+            st.info(f"**Why:** {why}")
     except Exception:
         pass
 
@@ -3948,13 +3957,33 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
     if st.button("◀ Back", key="btn_back_feedback"):
         _go_back_to_prev_word(lid, words_df)
     if st.button("Next ▶", key="btn_next_feedback", type="primary"):
-        st.session_state.asked_history.append(st.session_state.active_word)
+        lesson_entries = st.session_state.scorecards.get(int(lid), [])
+        total_questions = int(total_q or len(words_df))
+        restart_needed = total_questions > 0 and len(lesson_entries) >= total_questions
 
-        # Serve from review queue first
-        if st.session_state.review_queue:
-            next_word = st.session_state.review_queue.popleft()
+        if restart_needed:
+            first_word = lesson_entries[0]["word"] if lesson_entries else st.session_state.active_word
+            st.session_state.scorecards[int(lid)] = []
+            st.session_state.asked_history = []
+            try:
+                st.session_state.review_queue.clear()
+            except Exception:
+                from collections import deque
+                st.session_state.review_queue = deque()
+            st.session_state.q_index_per_lesson[int(lid)] = 1
+            available_words = set(words_df["headword"].tolist())
+            next_word = first_word if first_word in available_words else choose_next_word(USER_ID, cid, lid, words_df)
         else:
-            next_word = choose_next_word(USER_ID, cid, lid, words_df)
+            st.session_state.asked_history.append(st.session_state.active_word)
+
+            # Serve from review queue first
+            if st.session_state.review_queue:
+                next_word = st.session_state.review_queue.popleft()
+            else:
+                next_word = choose_next_word(USER_ID, cid, lid, words_df)
+
+            st.session_state.q_index_per_lesson[int(lid)] = \
+                st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
 
         # Load next word
         st.session_state.active_word = next_word
@@ -3977,10 +4006,6 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         st.session_state.answered = False
         st.session_state.eval = None
 
-        # Bump lesson question index
-        st.session_state.q_index_per_lesson[int(lid)] = \
-            st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
-
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -3990,45 +4015,16 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
     # ─────────────────────────────────────────────────────────────────────
     # REVIEW TAB — retry past mistakes (manual)
     # ─────────────────────────────────────────────────────────────────────
-    with tab_review:
-        st.write("Click a word you missed to retry it now:")
+    with tab_scorecard:
+        lesson_entries = st.session_state.scorecards.get(int(lid), [])
 
-        missed = get_missed_words(USER_ID, int(lid))
-
-        if not missed:
-            n_queue = len(st.session_state.review_queue) if "review_queue" in st.session_state else 0
-            if n_queue > 0:
-                st.info(f"No recent wrong answers, but {n_queue} item(s) are queued for quick retry.")
-            else:
-                st.success("Nice! No mistakes to review for this lesson.")
+        if not lesson_entries:
+            st.info("No answers recorded yet. Complete questions to build your scorecard.")
         else:
-            cols = st.columns(3)
-            for i, hw in enumerate(missed):
-                with cols[i % 3]:
-                    if st.button(f"Retry: {hw}", key=f"retry_{int(lid)}_{hw}"):
-                        # load this headword immediately into the quiz
-                        st.session_state.active_lid = lid
-                        st.session_state.active_word = hw
-                        st.session_state.q_started_at = time.time()
-
-                        row_retry = words_df[words_df["headword"] == hw].iloc[0]
-                        st.session_state.qdata = build_question_payload(
-                            hw,
-                            row_retry["synonyms"],
-                            lesson_df=words_df,
-                        )
-                        st.session_state.grid_for_word = hw
-                        st.session_state.grid_keys = [
-                            f"opt_{hw}_{j}" for j in range(len(st.session_state.qdata["choices"]))
-                        ]
-                        for _k in st.session_state.grid_keys:
-                            if _k in st.session_state:
-                                del st.session_state[_k]
-                        st.session_state.selection = set()
-                        st.session_state.answered = False
-                        st.session_state.eval = None
-
-                        st.rerun()
+            df = pd.DataFrame(lesson_entries)
+            df.insert(0, "Question #", range(1, len(df) + 1))
+            df = df.rename(columns={"word": "Question Word", "correct": "Correct Answer"})
+            st.dataframe(df, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
