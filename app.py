@@ -2588,6 +2588,9 @@ if "q_index_per_lesson" not in st.session_state:
 if "scorecards" not in st.session_state:
     st.session_state.scorecards = {}
 
+if "scorecard_question_numbers" not in st.session_state:
+    st.session_state.scorecard_question_numbers = {}
+
 if "review_queue" not in st.session_state:
     from collections import deque
     st.session_state.review_queue = deque()    # list of headwords to retry soon
@@ -3598,6 +3601,9 @@ if st.session_state["auth"]["role"] == "student":
     if int(lid) not in st.session_state.scorecards:
         st.session_state.scorecards[int(lid)] = []
 
+    if int(lid) not in st.session_state.scorecard_question_numbers:
+        st.session_state.scorecard_question_numbers[int(lid)] = {}
+
     st.markdown(
         """
         <div class="lesson-header">
@@ -3819,13 +3825,21 @@ if st.session_state["auth"]["role"] == "student":
 
             lesson_key = int(lid)
             lesson_scorecard = list(st.session_state.scorecards.get(lesson_key, []))
+            question_numbers = st.session_state.scorecard_question_numbers.setdefault(lesson_key, {})
+            question_number = question_numbers.get(active)
+            if question_number is None:
+                question_number = len(question_numbers) + 1
+                question_numbers[active] = question_number
+
+            answer_selected = ", ".join(sorted(picked_set)) if picked_set else "—"
             lesson_scorecard.append(
                 {
-                    "question_number": int(
-                        st.session_state.q_index_per_lesson.get(lesson_key, len(lesson_scorecard) + 1)
-                    ),
+                    "sequence": len(lesson_scorecard) + 1,
+                    "question_number": question_number,
                     "word": active,
-                    "correct": ", ".join(sorted(correct_set)) or "",
+                    "answer_selected": answer_selected,
+                    "result": "Correct" if is_correct else "Incorrect",
+                    "correct_answer": ", ".join(sorted(correct_set)) or "",
                 }
             )
             st.session_state.scorecards[lesson_key] = lesson_scorecard
@@ -3967,6 +3981,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         if restart_needed:
             first_word = lesson_entries[0]["word"] if lesson_entries else st.session_state.active_word
             st.session_state.scorecards[int(lid)] = []
+            st.session_state.scorecard_question_numbers.pop(int(lid), None)
             st.session_state.asked_history = []
             try:
                 st.session_state.review_queue.clear()
@@ -4025,14 +4040,36 @@ with tab_scorecard:
         st.info("No answers recorded yet. Complete questions to build your scorecard.")
     else:
         df = pd.DataFrame(lesson_entries)
-        if "question_number" in df.columns:
+        if "sequence" in df.columns:
+            df = df.sort_values("sequence")
+        elif "question_number" in df.columns:
             df = df.sort_values("question_number")
-            df = df.rename(columns={"question_number": "Question #"})
-        else:
+
+        if "answer_selected" not in df.columns and "correct" in df.columns:
+            df["answer_selected"] = df["correct"]
+
+        if "result" not in df.columns:
+            df["result"] = ["Correct"] * len(df)
+
+        rename_map = {
+            "question_number": "Question #",
+            "word": "Question Word",
+            "answer_selected": "Answer Selected",
+            "result": "Result",
+        }
+        df = df.rename(columns=rename_map)
+
+        if "Question #" not in df.columns:
             df.insert(0, "Question #", range(1, len(df) + 1))
-        df = df.rename(columns={"word": "Question Word", "correct": "Correct Answer"})
-        df = df[[col for col in ["Question #", "Question Word", "Correct Answer"] if col in df.columns]]
-        st.dataframe(df, use_container_width=True)
+
+        drop_cols = [col for col in ["sequence", "correct_answer", "correct"] if col in df.columns]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+
+        display_cols = [
+            col for col in ["Question #", "Question Word", "Answer Selected", "Result"] if col in df.columns
+        ]
+        st.dataframe(df[display_cols], use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
