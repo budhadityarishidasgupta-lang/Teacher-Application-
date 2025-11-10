@@ -557,6 +557,30 @@ def assign_students_to_class(class_id: int, student_ids: list[int]):
                 {"c": int(class_id), "s": int(sid)},
             )
 
+def assign_course_to_students(course_id: int, student_ids: list[int]) -> int:
+    """Enroll each student into a course, ignoring existing enrollments."""
+
+    cleaned = [int(sid) for sid in student_ids if sid is not None]
+    if not cleaned:
+        return 0
+
+    inserted = 0
+    with engine.begin() as conn:
+        for sid in cleaned:
+            result = conn.execute(
+                text(
+                    """INSERT INTO enrollments(user_id, course_id)
+                            VALUES(:u, :c)
+                            ON CONFLICT (user_id, course_id) DO NOTHING"""
+                ),
+                {"u": int(sid), "c": int(course_id)},
+            )
+            if getattr(result, "rowcount", 0):
+                inserted += 1
+
+    return inserted
+
+
 def unassign_students_from_class(class_id: int, student_ids: list[int]):
     if not student_ids:
         return
@@ -2234,63 +2258,125 @@ def teacher_manage_ui():
         if dfc.empty:
             st.info("Create a course first.")
         else:
+            course_ids = dfc["course_id"].tolist()
             cid_assign = st.selectbox(
                 "Course",
-                dfc["course_id"].tolist(),
+                course_ids,
                 format_func=lambda x: dfc.loc[dfc["course_id"] == x, "title"].values[0],
-                key="td2_assign_course_sel"
-        )
-
-        # Now we are INSIDE the same 'else:' block ↓
-        df_students = td2_get_active_students()
-        df_enrolled = pd.DataFrame()  # default to avoid NameError
-
-        if df_students.empty:
-            st.caption("No active students.")
-        else:
-            sid_assign = st.selectbox(
-                "Student",
-                df_students["user_id"].tolist(),
-                format_func=lambda x: f"{df_students.loc[df_students['user_id'] == x, 'name'].values[0]} "
-                                      f"({df_students.loc[df_students['user_id'] == x, 'email'].values[0]})",
-                key="td2_assign_student_sel"
+                key="td2_assign_course_sel",
             )
 
-            if st.button("Enroll", key="td2_assign_enroll_btn"):
-                with engine.begin() as conn:
-                    conn.execute(text("""
-                        INSERT INTO enrollments(user_id, course_id)
-                        VALUES(:u, :c)
-                        ON CONFLICT (user_id, course_id) DO NOTHING
-                    """), {"u": int(sid_assign), "c": int(cid_assign)})
-                td2_invalidate()
-                st.success("Enrolled.")
+            df_students = td2_get_active_students()
+            df_enrolled = pd.DataFrame()
+
+            if df_students.empty:
+                st.caption("No active students.")
+            else:
+                sid_assign = st.selectbox(
+                    "Student",
+                    df_students["user_id"].tolist(),
+                    format_func=lambda x: f"{df_students.loc[df_students['user_id'] == x, 'name'].values[0]} "
+                                          f"({df_students.loc[df_students['user_id'] == x, 'email'].values[0]})",
+                    key="td2_assign_student_sel",
+                )
+
+                if st.button("Enroll", key="td2_assign_enroll_btn"):
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "INSERT INTO enrollments(user_id, course_id)\n"
+                                "        VALUES(:u, :c)\n"
+                                "        ON CONFLICT (user_id, course_id) DO NOTHING"
+                            ),
+                            {"u": int(sid_assign), "c": int(cid_assign)},
+                        )
+                    td2_invalidate()
+                    st.success("Enrolled.")
 
             st.markdown("**Currently enrolled**")
             df_enrolled = td2_get_enrollments_for_course(cid_assign)
 
-        # Safe checks for enrolled list
-        if df_enrolled.empty:
-            st.caption("None yet.")
-        else:
-            to_remove = st.multiselect(
-                "Remove students",
-                df_enrolled["user_id"].tolist(),
-                format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id'] == x, 'name'].values[0]} "
-                                      f"({df_enrolled.loc[df_enrolled['user_id'] == x, 'email'].values[0]})",
-                key="td2_assign_remove"
-            )
-            if st.button("Remove selected", key="td2_assign_remove_btn"):
-                with engine.begin() as conn:
-                    for sid in to_remove:
-                        conn.execute(
-                            text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
-                            {"u": int(sid), "c": int(cid_assign)}
-                        )
-                td2_invalidate()
-                st.success("Removed.")
-                st.rerun()
+            if df_enrolled.empty:
+                st.caption("None yet.")
+            else:
+                to_remove = st.multiselect(
+                    "Remove students",
+                    df_enrolled["user_id"].tolist(),
+                    format_func=lambda x: f"{df_enrolled.loc[df_enrolled['user_id'] == x, 'name'].values[0]} "
+                                          f"({df_enrolled.loc[df_enrolled['user_id'] == x, 'email'].values[0]})",
+                    key="td2_assign_remove",
+                )
+                if st.button("Remove selected", key="td2_assign_remove_btn"):
+                    with engine.begin() as conn:
+                        for sid in to_remove:
+                            conn.execute(
+                                text("DELETE FROM enrollments WHERE user_id=:u AND course_id=:c"),
+                                {"u": int(sid), "c": int(cid_assign)},
+                            )
+                    td2_invalidate()
+                    st.success("Removed.")
+                    st.rerun()
 
+            st.divider()
+            st.markdown("**Assign class**")
+
+            df_classes = get_classrooms()
+            if df_classes.empty:
+                st.caption("No active classes.")
+            else:
+                default_course_index = 0
+                if cid_assign in course_ids:
+                    try:
+                        default_course_index = course_ids.index(cid_assign)
+                    except ValueError:
+                        default_course_index = 0
+
+                cid_assign_class = st.selectbox(
+                    "Course",
+                    course_ids,
+                    index=default_course_index,
+                    format_func=lambda x: dfc.loc[dfc["course_id"] == x, "title"].values[0],
+                    key="td2_assign_course_class_sel",
+                )
+
+                class_ids = df_classes["class_id"].tolist()
+
+                def _format_class_option(class_id: int) -> str:
+                    row = df_classes.loc[df_classes["class_id"] == class_id].iloc[0]
+                    label = str(row.get("name") or f"Class {class_id}")
+                    start_date = row.get("start_date")
+                    if pd.notna(start_date):
+                        try:
+                            date_str = pd.to_datetime(start_date).date().isoformat()
+                        except Exception:
+                            date_str = str(start_date)
+                        label = f"{label} ({date_str})"
+                    return label
+
+                class_id = st.selectbox(
+                    "Class",
+                    class_ids,
+                    format_func=_format_class_option,
+                    key="td2_assign_class_sel",
+                )
+
+                if st.button("Assign course to class", key="td2_assign_class_btn"):
+                    roster = get_class_students(class_id)
+                    if roster.empty:
+                        st.warning("This class has no students yet.")
+                    else:
+                        assigned = assign_course_to_students(
+                            cid_assign_class,
+                            roster["user_id"].tolist(),
+                        )
+                        if assigned:
+                            td2_invalidate()
+                            st.success(
+                                f"Assigned course to {assigned} student{'s' if assigned != 1 else ''}."
+                            )
+                            st.rerun()
+                        else:
+                            st.info("All students in this class are already enrolled in the course.")
 
 def render_teacher_dashboard_v2():
     """Render the teacher dashboard experience using the v2 helper routines."""
