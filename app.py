@@ -1987,7 +1987,8 @@ def td2_import_words_csv(lesson_id: int, df_csv: pd.DataFrame, replace: bool):
             wid = conn.execute(text("""
                 INSERT INTO words(headword, synonyms, difficulty)
                 VALUES(:h,:s,:d)
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (headword, synonyms) DO UPDATE
+                SET difficulty = EXCLUDED.difficulty
                 RETURNING word_id
             """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
             if wid is None:
@@ -2086,7 +2087,8 @@ def td2_import_course_csv(course_id: int, df_csv: pd.DataFrame,
             wid = conn.execute(text("""
                 INSERT INTO words(headword, synonyms, difficulty)
                 VALUES(:h,:s,:d)
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (headword, synonyms) DO UPDATE
+                SET difficulty = EXCLUDED.difficulty
                 RETURNING word_id
             """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
 
