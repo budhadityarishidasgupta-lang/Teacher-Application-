@@ -101,7 +101,7 @@ DEFAULT_NEW_REG_COPY = ""
 # Feature flags (define early!)
 TEACHER_UI_V2 = os.getenv("TEACHER_UI_V2", "0") == "1"
 
-#DEFAULT_LESSON_INSTRUCTION = "Pick every option that matches the meaning of the word."
+DEFAULT_LESSON_INSTRUCTION = "Pick every option that matches the meaning of the word."
 
 # Gamification constants (declared early so helper functions can use them)
 LEVEL_BANDS: list[dict[str, object]] = [
@@ -2630,7 +2630,7 @@ def login_form():
             "email": u["email"],
             "role": u["role"],
         }
-        st.sidebar.success(f"Welcome {u['name']}!")
+        st.rerun()
 
     mode = "Student" if FORCE_STUDENT else st.sidebar.radio(
         "Login as", ["Admin", "Student"], horizontal=True, key="login_mode"
@@ -2660,99 +2660,6 @@ def login_form():
 # Gate: not logged in yet
 if "auth" not in st.session_state:
     login_form()
-    portal_copy = get_all_portal_content()
-    header_main_text = portal_copy.get("header_main")
-    header_draft_text = portal_copy.get("header_draft")
-    legacy_header_text = portal_copy.get("header")
-    instructions_text = portal_copy.get("instructions")
-    new_registration_text = portal_copy.get("new_registration")
-
-    if header_main_text is None:
-        header_main_text = DEFAULT_HEADER_MAIN_COPY
-    if header_draft_text is None:
-        header_draft_text = legacy_header_text
-    if header_draft_text is None:
-        header_draft_text = DEFAULT_HEADER_DRAFT_COPY
-    if instructions_text is None:
-        instructions_text = DEFAULT_INSTRUCTIONS_COPY
-    if new_registration_text is None:
-        new_registration_text = DEFAULT_NEW_REG_COPY
-
-    header_main_text = header_main_text or ""
-    header_draft_text = header_draft_text or ""
-    instructions_text = instructions_text or ""
-    new_registration_text = new_registration_text or ""
-
-    if header_main_text.strip():
-        st.markdown(
-            """
-            <style>
-            .portal-welcome-message {
-                font-size: 20px;
-                font-weight: 600;
-                margin-bottom: 1rem;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='portal-welcome-message'>{header_main_text}</div>",
-            unsafe_allow_html=True,
-        )
-
-    if header_draft_text.strip():
-        st.markdown(header_draft_text)
-
-    col_instructions, col_registration = st.columns([3, 2])
-    with col_instructions:
-        st.subheader("Instructions")
-        if instructions_text.strip():
-            st.markdown(instructions_text)
-
-    with col_registration:
-        st.subheader("New registration")
-        if new_registration_text.strip():
-            st.markdown(new_registration_text)
-
-        back_clicked = False
-        with st.form("student_self_registration"):
-            reg_name = st.text_input("Name", key="portal_reg_name")
-            reg_email = st.text_input("Email address", key="portal_reg_email")
-            button_cols = st.columns(2)
-            with button_cols[0]:
-                back_clicked = st.form_submit_button("Back", type="secondary")
-            with button_cols[1]:
-                submit_registration = st.form_submit_button("Submit", type="primary")
-
-        if back_clicked:
-            st.session_state["portal_reg_name"] = ""
-            st.session_state["portal_reg_email"] = ""
-            st.rerun()
-
-        if submit_registration:
-            name_clean = reg_name.strip()
-            email_clean = reg_email.strip()
-            if not name_clean or not email_clean:
-                st.warning("Please provide both name and email address.")
-            elif "@" not in email_clean or "." not in email_clean.split("@")[-1]:
-                st.warning("Please provide a valid email address.")
-            else:
-                try:
-                    add_pending_registration(name_clean, email_clean, DEFAULT_STUDENT_PASSWORD)
-                    st.success("Thank you! Your registration request has been sent.")
-                    st.session_state["portal_reg_name"] = ""
-                    st.session_state["portal_reg_email"] = ""
-                except Exception as exc:
-                    st.error(f"Could not submit registration: {exc}")
-   # st.sidebar.header("Health")
-   # if st.sidebar.button("DB ping"):
-   #     try:
-   #         with engine.connect() as conn:
-   #             one = conn.execute(text("SELECT 1")).scalar()
-   #         st.sidebar.success(f"DB OK (result={one})")
-   #     except Exception as e:
-   #         st.sidebar.error(f"DB error: {e}")
     st.stop()
 
 # Session basics
