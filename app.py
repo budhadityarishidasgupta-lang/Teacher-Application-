@@ -3408,11 +3408,11 @@ def lesson_progress(user_id: int, lesson_id: int):
 # ─────────────────────────────────────────────────────────────────────
 # UI Helper: compact question header with inline progress bar (theme-agnostic)
 # ─────────────────────────────────────────────────────────────────────
-DIFFICULTY_THEME = {
-    1: {"emoji": "🟢", "label": "Easy", "class": "difficulty-easy"},
-    2: {"emoji": "🟠", "label": "Medium", "class": "difficulty-medium"},
-    3: {"emoji": "🔴", "label": "Hard", "class": "difficulty-hard"},
-}
+# DIFFICULTY_THEME = {
+#     1: {"emoji": "🟢", "label": "Easy", "class": "difficulty-easy"},
+#     2: {"emoji": "🟠", "label": "Medium", "class": "difficulty-medium"},
+#     3: {"emoji": "🔴", "label": "Hard", "class": "difficulty-hard"},
+# }
 
 
 BADGE_CHIME_BASE64 = (
@@ -3827,13 +3827,17 @@ if st.session_state["auth"]["role"] == "student":
         submitted = False
 
         if not st.session_state.answered:
-            difficulty_level = int(row.get("difficulty", 2) or 2)
-            diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
             safe_word = html.escape(active)
+#            difficulty_level = int(row.get("difficulty", 2) or 2)
+#            diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
+#            st.markdown(
+#                f"<div class='quiz-heading'><h3>Word: <strong>{safe_word}</strong></h3>"
+#                f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
+#                unsafe_allow_html=True,
+#            )
 
             st.markdown(
-                f"<div class='quiz-heading'><h3>Word: <strong>{safe_word}</strong></h3>"
-                f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
+                f"<div class='quiz-heading'><h3>Word: <strong>{safe_word}</strong></h3></div>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -3990,14 +3994,19 @@ def gpt_feedback_examples(headword: str, correct_word: str):
 # AFTER-SUBMIT feedback + Back & Next buttons
 if st.session_state.get("answered") and st.session_state.get("eval"):
     ev = st.session_state.eval
-    difficulty_level = int(row.get("difficulty", 2) or 2)
-    diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
     safe_word_feedback = html.escape(st.session_state.active_word)
 
+#    difficulty_level = int(row.get("difficulty", 2) or 2)
+#    diff = DIFFICULTY_THEME.get(difficulty_level, DIFFICULTY_THEME[2])
 #    st.markdown(f"<div class='quiz-surface {diff['class']}'>", unsafe_allow_html=True)
+#    st.markdown(
+#        f"<div class='quiz-heading'><h3>Word: <strong>{safe_word_feedback}</strong></h3>"
+#        f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
+#        unsafe_allow_html=True,
+#    )
+
     st.markdown(
-        f"<div class='quiz-heading'><h3>Word: <strong>{safe_word_feedback}</strong></h3>"
-        f"<span class='difficulty-badge'>{diff['emoji']} {diff['label']}</span></div>",
+        f"<div class='quiz-heading'><h3>Word: <strong>{safe_word_feedback}</strong></h3></div>",
         unsafe_allow_html=True,
     )
 
