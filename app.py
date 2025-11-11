@@ -2556,7 +2556,13 @@ def login_form():
             "email": u["email"],
             "role": u["role"],
         }
-        st.sidebar.success(f"Welcome {u['name']}!")
+
+        # Immediately refresh the app so the user lands on the lessons view without
+        # requiring a second click.
+        try:
+            st.rerun()
+        except AttributeError:
+            st.experimental_rerun()
 
     # Forgot password — email flow disabled for this release
     # with st.sidebar.expander("Forgot password?"):
