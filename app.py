@@ -4017,41 +4017,19 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
         st.info(f"New badge unlocked: {badge_list}")
         st.session_state.badge_details_recent = []
 
-    # Show explanation of options
-    with st.expander("Why are these the best choices?", expanded=True):
-        lines = []
-        for opt in ev["choices"]:
-            if opt in ev["correct_set"] and opt in ev["picked_set"]:
-                tag = "✅ correct (you picked)"
-            elif opt in ev["correct_set"]:
-                tag = "✅ correct"
-            elif opt in ev["picked_set"]:
-                tag = "❌ your pick"
-            else:
-                tag = ""
-            lines.append(f"- **{opt}** {tag}")
-        st.markdown("\n".join(lines))
-
-    # NEW: dynamic tip text based on lesson kind
-        try:
-            lesson_kind = detect_lesson_kind(selected_label, l_map[lid])
-        except Exception:
-            lesson_kind = "synonym"
-        tip = (
-            "Tip: pick all the options that **mean almost the same** as the main word."
-            if lesson_kind == "synonym"
-            else "Tip: pick the options that are **opposites** of the main word."
-        )
-        st.caption(tip)
-
-    # GPT feedback (optional)
-    try:
-        correct_choice_for_text = sorted(list(ev["correct_set"]))[0]
-        why, _examples = gpt_feedback_examples(st.session_state.active_word, correct_choice_for_text)
-        if why:
-            st.info(f"**Why:** {why}")
-    except Exception:
-        pass
+    # Summary of the player's selections
+    lines = []
+    for opt in ev["choices"]:
+        if opt in ev["correct_set"] and opt in ev["picked_set"]:
+            tag = "✅ correct (you picked)"
+        elif opt in ev["correct_set"]:
+            tag = "✅ correct"
+        elif opt in ev["picked_set"]:
+            tag = "❌ your pick"
+        else:
+            tag = ""
+        lines.append(f"- **{opt}** {tag}")
+    st.markdown("\n".join(lines))
 
     # ───────────────────────────────────────────────────────────────
     # Buttons: Back and Next
