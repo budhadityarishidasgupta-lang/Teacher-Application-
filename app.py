@@ -1918,6 +1918,45 @@ def td2_delete_lesson(lesson_id: int):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM lessons WHERE lesson_id=:l"), {"l": int(lesson_id)})
 
+def _infer_difficulty_from_word(headword: str, synonyms: list[str]) -> int:
+    """
+    Fallback heuristic for difficulty when no explicit score is available.
+    Mirrors the previous length/synonym-count logic so imports remain backwards compatible.
+    """
+
+    if not headword:
+        return 2
+
+    headword = headword.strip()
+    syn_list = [s for s in synonyms if s]
+
+    if len(headword) <= 6 and len(syn_list) <= 3:
+        return 1
+    if len(headword) <= 8 and len(syn_list) <= 5:
+        return 2
+    return 3
+
+
+def _difficulty_from_score(value, fallback: int) -> int:
+    """Map a numeric difficulty score (1-10) to the 1-3 band used by the app."""
+
+    try:
+        if pd.isna(value):
+            raise ValueError
+        score = float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+    score_int = int(round(score))
+    if score_int <= 4:
+        return 1
+    if score_int <= 8:
+        return 2
+    if score_int >= 9:
+        return 3
+    return fallback
+
+
 def td2_import_words_csv(lesson_id: int, df_csv: pd.DataFrame, replace: bool):
     with engine.begin() as conn:
         if replace:
@@ -1930,12 +1969,26 @@ def td2_import_words_csv(lesson_id: int, df_csv: pd.DataFrame, replace: bool):
             if not hw or not syns:
                 continue
             syn_list = [s.strip() for s in syns.split(",") if s.strip()]
-            diff = 1 if (len(hw) <= 6 and len(syn_list) <= 3) else (2 if len(hw) <= 8 and len(syn_list) <= 5 else 3)
+            fallback_diff = _infer_difficulty_from_word(hw, syn_list)
+
+            explicit_diff = r.get("difficulty")
+            diff = None
+            if explicit_diff is not None and not pd.isna(explicit_diff):
+                try:
+                    explicit_int = int(explicit_diff)
+                except (TypeError, ValueError):
+                    explicit_int = None
+                if explicit_int in (1, 2, 3):
+                    diff = explicit_int
+
+            if diff is None:
+                diff = _difficulty_from_score(r.get("difficulty_score"), fallback_diff)
 
             wid = conn.execute(text("""
                 INSERT INTO words(headword, synonyms, difficulty)
                 VALUES(:h,:s,:d)
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (headword, synonyms) DO UPDATE
+                SET difficulty = EXCLUDED.difficulty
                 RETURNING word_id
             """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
             if wid is None:
@@ -2016,12 +2069,26 @@ def td2_import_course_csv(course_id: int, df_csv: pd.DataFrame,
                 continue
 
             syn_list = [s.strip() for s in syns.split(",") if s.strip()]
-            diff = 1 if (len(hw) <= 6 and len(syn_list) <= 3) else (2 if len(hw) <= 8 and len(syn_list) <= 5 else 3)
+            fallback_diff = _infer_difficulty_from_word(hw, syn_list)
+
+            explicit_diff = r.get("difficulty")
+            diff = None
+            if explicit_diff is not None and not pd.isna(explicit_diff):
+                try:
+                    explicit_int = int(explicit_diff)
+                except (TypeError, ValueError):
+                    explicit_int = None
+                if explicit_int in (1, 2, 3):
+                    diff = explicit_int
+
+            if diff is None:
+                diff = _difficulty_from_score(r.get("difficulty_score"), fallback_diff)
 
             wid = conn.execute(text("""
                 INSERT INTO words(headword, synonyms, difficulty)
                 VALUES(:h,:s,:d)
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (headword, synonyms) DO UPDATE
+                SET difficulty = EXCLUDED.difficulty
                 RETURNING word_id
             """), {"h": hw, "s": ", ".join(syn_list), "d": int(diff)}).scalar()
 
@@ -2623,10 +2690,20 @@ if "auth" not in st.session_state:
         if new_registration_text.strip():
             st.markdown(new_registration_text)
 
+        back_clicked = False
         with st.form("student_self_registration"):
             reg_name = st.text_input("Name", key="portal_reg_name")
             reg_email = st.text_input("Email address", key="portal_reg_email")
-            submit_registration = st.form_submit_button("Submit", type="primary")
+            button_cols = st.columns(2)
+            with button_cols[0]:
+                back_clicked = st.form_submit_button("Back", type="secondary")
+            with button_cols[1]:
+                submit_registration = st.form_submit_button("Submit", type="primary")
+
+        if back_clicked:
+            st.session_state["portal_reg_name"] = ""
+            st.session_state["portal_reg_email"] = ""
+            st.rerun()
 
         if submit_registration:
             name_clean = reg_name.strip()
@@ -3729,6 +3806,7 @@ if st.session_state["auth"]["role"] == "student":
     new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
     if new_word_needed:
         st.session_state.active_lid = lid
+        st.session_state.asked_history = []
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
@@ -3843,6 +3921,7 @@ if st.session_state["auth"]["role"] == "student":
                     st.session_state[state_key] = opt in temp_selection
 
             form_id = f"quiz_form_{st.session_state.active_word}"
+            back_pressed = False
             with st.form(form_id):
                 st.markdown("<div class='quiz-options-grid'>", unsafe_allow_html=True)
                 # Render options in a responsive 3-column grid
@@ -3856,14 +3935,25 @@ if st.session_state["auth"]["role"] == "student":
                 st.markdown("</div>", unsafe_allow_html=True)
 
                 st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
-                submitted = st.form_submit_button("Submit")
+                current_position = int(
+                    st.session_state.q_index_per_lesson.get(int(lid), 1) or 1
+                )
+                back_allowed = bool(st.session_state.get("asked_history")) and current_position > 1
+                action_cols = st.columns(2)
+                with action_cols[0]:
+                    back_pressed = st.form_submit_button(
+                        "◀ Back",
+                        type="secondary",
+                        disabled=not back_allowed,
+                    )
+                with action_cols[1]:
+                    submitted = st.form_submit_button("Submit", type="primary")
                 st.markdown("</div>", unsafe_allow_html=True)
 
     #        st.markdown("</div>", unsafe_allow_html=True)
 
-        # Allow going back even before submitting
-        #if st.button("◀ Back", key="btn_back_form"):
-        #    _go_back_to_prev_word(lid, words_df)
+        if back_pressed:
+            _go_back_to_prev_word(lid, words_df)
 
         # Always persist selection each render
         st.session_state.selection = {
