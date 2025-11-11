@@ -2585,25 +2585,32 @@ def login_form():
     # reset_email = (_first(qp.get("reset_email")) or "").strip().lower()
     # reset_token = (_first(qp.get("reset_token")) or "").strip()
 
-    mode = "Student" if FORCE_STUDENT else st.sidebar.radio(
-        "Login as", ["Admin", "Student"], horizontal=True, key="login_mode"
-    )
-    email = st.sidebar.text_input("Email", key="login_email")
-    pwd   = st.sidebar.text_input("Password", type="password", key="login_pwd")
+    if "login_submit_pending" not in st.session_state:
+        st.session_state.login_submit_pending = False
 
-    if st.sidebar.button("Login", type="primary", key="btn_login"):
-        u = user_by_email(email.strip().lower())
+    def _queue_login_attempt():
+        st.session_state.login_submit_pending = True
+
+    def _attempt_login(selected_mode: str, email_value: str, password_value: str) -> None:
+        email_value = (email_value or "").strip().lower()
+        password_value = password_value or ""
+
+        if not email_value or not password_value:
+            st.sidebar.error("Please enter both email and password.")
+            return
+
+        u = user_by_email(email_value)
         if not u:
             st.sidebar.error("User not found."); return
         if not u["is_active"]:
             st.sidebar.error("Account disabled."); return
-        if not bcrypt.verify(pwd, u["password_hash"]):
+        if not bcrypt.verify(password_value, u["password_hash"]):
             st.sidebar.error("Wrong password."); return
 
         # Role enforcement
-        if mode == "Admin" and u["role"] != "admin":
+        if selected_mode == "Admin" and u["role"] != "admin":
             st.sidebar.error("Not an admin account."); return
-        if mode == "Student" and u["role"] != "student":
+        if selected_mode == "Student" and u["role"] != "student":
             if FORCE_STUDENT:
                 st.sidebar.error("This is a student-only link. Please use the admin URL."); return
             st.sidebar.error("Not a student account."); return
@@ -2624,6 +2631,24 @@ def login_form():
             "role": u["role"],
         }
         st.sidebar.success(f"Welcome {u['name']}!")
+
+    mode = "Student" if FORCE_STUDENT else st.sidebar.radio(
+        "Login as", ["Admin", "Student"], horizontal=True, key="login_mode"
+    )
+    email = st.sidebar.text_input("Email", key="login_email")
+    pwd   = st.sidebar.text_input(
+        "Password",
+        type="password",
+        key="login_pwd",
+        on_change=_queue_login_attempt,
+    )
+
+    submit_clicked = st.sidebar.button("Login", type="primary", key="btn_login")
+    should_attempt_login = st.session_state.get("login_submit_pending", False) or submit_clicked
+
+    if should_attempt_login:
+        st.session_state.login_submit_pending = False
+        _attempt_login(mode, email, pwd)
 
     # Forgot password — email flow disabled for this release
     # with st.sidebar.expander("Forgot password?"):
@@ -3897,6 +3922,7 @@ if st.session_state["auth"]["role"] == "student":
         temp_selection = set(st.session_state.get("selection", set()))
 
         submitted = False
+        back_pressed = False
 
         if not st.session_state.answered:
             difficulty_level = int(row.get("difficulty", 2) or 2)
@@ -3921,7 +3947,6 @@ if st.session_state["auth"]["role"] == "student":
                     st.session_state[state_key] = opt in temp_selection
 
             form_id = f"quiz_form_{st.session_state.active_word}"
-            back_pressed = False
             with st.form(form_id):
                 st.markdown("<div class='quiz-options-grid'>", unsafe_allow_html=True)
                 # Render options in a responsive 3-column grid
