@@ -3869,10 +3869,10 @@ if st.session_state["auth"]["role"] == "student":
 
         # Allow going back even before submitting so students can revisit
         # any earlier question without needing to answer the current one.
-        st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
-        if st.button("◀ Back", key="btn_back_form"):
-            _go_back_to_prev_word(lid, words_df)
-        st.markdown("</div>", unsafe_allow_html=True)
+        # st.markdown("<div class='quiz-actions'>", unsafe_allow_html=True)
+        # if st.button("◀ Back", key="btn_back_form"):
+        #     _go_back_to_prev_word(lid, words_df)
+        # st.markdown("</div>", unsafe_allow_html=True)
 
         # Always persist selection each render
         st.session_state.selection = {
