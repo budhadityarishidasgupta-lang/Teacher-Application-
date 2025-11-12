@@ -274,7 +274,8 @@ def init_db():
           response_ms    INTEGER,
           chosen         TEXT,
           correct_choice TEXT,
-          ts             TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+          ts             TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          archived_at    TIMESTAMPTZ
         );
         """,
         """
@@ -389,6 +390,10 @@ def patch_courses_table():
         conn.execute(text("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS instructions TEXT"))
         conn.execute(text("ALTER TABLE words   ADD COLUMN IF NOT EXISTS difficulty INTEGER DEFAULT 2"))
 
+def patch_attempts_table():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE attempts ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ"))
+
 def patch_gamification_tables():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE word_stats ADD COLUMN IF NOT EXISTS xp_points INTEGER DEFAULT 0"))
@@ -410,6 +415,7 @@ def patch_gamification_tables():
 init_db()
 patch_users_table()
 patch_courses_table()
+patch_attempts_table()
 patch_gamification_tables()
 
 def get_missed_words(user_id: int, lesson_id: int):
@@ -4113,45 +4119,126 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Lesson restart helpers (student portal)
+# ─────────────────────────────────────────────────────────────────────
+def archive_lesson_attempts(user_id: int, course_id: int, lesson_id: int) -> int:
+    """Mark existing attempts for this lesson as archived and return affected count."""
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE attempts
+                   SET archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP)
+                 WHERE user_id=:u
+                   AND course_id=:c
+                   AND lesson_id=:l
+                   AND archived_at IS NULL
+                """
+            ),
+            {"u": int(user_id), "c": int(course_id), "l": int(lesson_id)},
+        )
+
+    try:
+        return int(result.rowcount or 0)
+    except Exception:
+        return 0
+
+
+def reset_lesson_state_for_restart(lesson_id: int):
+    """Clear session-level lesson state so the student restarts from question 1."""
+
+    lesson_key = int(lesson_id)
+    st.session_state.scorecards.pop(lesson_key, None)
+    st.session_state.scorecard_question_numbers.pop(lesson_key, None)
+    st.session_state.q_index_per_lesson[lesson_key] = 1
+
+    st.session_state.selection = set()
+    st.session_state.answered = False
+    st.session_state.eval = None
+    st.session_state.last_xp_gain = 0
+    st.session_state.badges_recent = []
+    st.session_state.badge_details_recent = []
+    st.session_state.q_started_at = time.time()
+    st.session_state.asked_history = []
+
+    review_queue = st.session_state.get("review_queue")
+    if review_queue is not None:
+        try:
+            review_queue.clear()
+        except Exception:
+            from collections import deque
+
+            st.session_state.review_queue = deque()
+    else:
+        from collections import deque
+
+        st.session_state.review_queue = deque()
+
+    for key in st.session_state.pop("grid_keys", []):
+        st.session_state.pop(key, None)
+
+    st.session_state.pop("grid_for_word", None)
+    st.session_state.pop("active_word", None)
+    st.session_state.active_lid = None
+
+
+# ─────────────────────────────────────────────────────────────────────
 # SCORECARD TAB — running log of answered questions
 # ─────────────────────────────────────────────────────────────────────
 with tab_scorecard:
-    lesson_entries = st.session_state.scorecards.get(int(lid), [])
+    col_table, col_actions = st.columns([0.7, 0.3])
 
-    if not lesson_entries:
-        st.info("No answers recorded yet. Complete questions to build your scorecard.")
-    else:
-        df = pd.DataFrame(lesson_entries)
-        if "sequence" in df.columns:
-            df = df.sort_values("sequence")
-        elif "question_number" in df.columns:
-            df = df.sort_values("question_number")
+    with col_table:
+        lesson_entries = st.session_state.scorecards.get(int(lid), [])
 
-        if "answer_selected" not in df.columns and "correct" in df.columns:
-            df["answer_selected"] = df["correct"]
+        if not lesson_entries:
+            st.info("No answers recorded yet. Complete questions to build your scorecard.")
+        else:
+            df = pd.DataFrame(lesson_entries)
+            if "sequence" in df.columns:
+                df = df.sort_values("sequence")
+            elif "question_number" in df.columns:
+                df = df.sort_values("question_number")
 
-        if "result" not in df.columns:
-            df["result"] = ["Correct"] * len(df)
+            if "answer_selected" not in df.columns and "correct" in df.columns:
+                df["answer_selected"] = df["correct"]
 
-        rename_map = {
-            "question_number": "Question #",
-            "word": "Question Word",
-            "answer_selected": "Answer Selected",
-            "result": "Result",
-        }
-        df = df.rename(columns=rename_map)
+            if "result" not in df.columns:
+                df["result"] = ["Correct"] * len(df)
 
-        if "Question #" not in df.columns:
-            df.insert(0, "Question #", range(1, len(df) + 1))
+            rename_map = {
+                "question_number": "Question #",
+                "word": "Question Word",
+                "answer_selected": "Answer Selected",
+                "result": "Result",
+            }
+            df = df.rename(columns=rename_map)
 
-        drop_cols = [col for col in ["sequence", "correct_answer", "correct"] if col in df.columns]
-        if drop_cols:
-            df = df.drop(columns=drop_cols)
+            if "Question #" not in df.columns:
+                df.insert(0, "Question #", range(1, len(df) + 1))
 
-        display_cols = [
-            col for col in ["Question #", "Question Word", "Answer Selected", "Result"] if col in df.columns
-        ]
-        st.dataframe(df[display_cols], use_container_width=True)
+            drop_cols = [col for col in ["sequence", "correct_answer", "correct"] if col in df.columns]
+            if drop_cols:
+                df = df.drop(columns=drop_cols)
+
+            display_cols = [
+                col for col in ["Question #", "Question Word", "Answer Selected", "Result"] if col in df.columns
+            ]
+            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+    with col_actions:
+        st.markdown("### Lesson actions")
+        st.markdown(
+            "<p style='font-size:0.9rem;'>Restart to begin this lesson again from question 1."
+            " Your previous answers will be archived.</p>",
+            unsafe_allow_html=True,
+        )
+
+        if st.button("Restart Lesson", key="btn_restart_lesson", type="primary"):
+            archive_lesson_attempts(USER_ID, cid, lid)
+            reset_lesson_state_for_restart(lid)
+            st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
