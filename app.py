@@ -3717,11 +3717,12 @@ if st.session_state["auth"]["role"] == "student":
 
     # NEW: lesson-level progress and question count
     total_q, mastered_q, attempted_q = lesson_progress(USER_ID, int(lid))
-    basis = mastered_q if mastered_q > 0 else attempted_q
-    pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
+
+    lesson_entries = st.session_state.scorecards.get(int(lid), [])
+    answered_count = len(lesson_entries)
 
     if st.session_state.q_index_per_lesson.get(int(lid)) is None:
-        baseline = max(1, min(int(total_q or 1), int(attempted_q or 0) + 1))
+        baseline = max(1, min(int(total_q or 1), answered_count + 1))
         st.session_state.q_index_per_lesson[int(lid)] = baseline
 
     # Ensure a counter exists
@@ -3732,6 +3733,10 @@ if st.session_state["auth"]["role"] == "student":
     if words_df.empty:
         st.info("This lesson has no words yet.")
         st.stop()
+
+    total_questions = int(total_q or len(words_df))
+    answered_progress = min(answered_count, total_questions) if total_questions else 0
+    pct = int(round(100 * answered_progress / total_questions)) if total_questions else 0
 
     # ensure history state (must NOT be inside the 'words_df.empty' block)
     if "asked_history" not in st.session_state:
@@ -3813,7 +3818,7 @@ if st.session_state["auth"]["role"] == "student":
 
     render_q_header(
         q_now,
-        total_q,
+        total_questions,
         pct,
         login_streak=st.session_state.gamification.get("login_streak", 0),
         badge_strip=header_badges,
