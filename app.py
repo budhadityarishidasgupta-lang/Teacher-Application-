@@ -2636,8 +2636,8 @@ if "auth" not in st.session_state:
             st.markdown(new_registration_text)
 
         with st.form("student_self_registration"):
-            reg_name = st.text_input("Name", key="portal_reg_name")
-            reg_email = st.text_input("Email address", key="portal_reg_email")
+            reg_name = st.text_input("Name")
+            reg_email = st.text_input("Email address")
             submit_registration = st.form_submit_button("Submit", type="primary")
 
         if submit_registration:
@@ -2651,8 +2651,6 @@ if "auth" not in st.session_state:
                 try:
                     add_pending_registration(name_clean, email_clean, DEFAULT_STUDENT_PASSWORD)
                     st.success("Thank you! Your registration request has been sent.")
-                    st.session_state["portal_reg_name"] = ""
-                    st.session_state["portal_reg_email"] = ""
                 except Exception as exc:
                     st.error(f"Could not submit registration: {exc}")
    # st.sidebar.header("Health")
