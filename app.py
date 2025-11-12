@@ -1,4 +1,4 @@
-import os, time, random, sqlite3, html, base64, json
+import os, time, random, sqlite3, html, base64, json, re
 from contextlib import closing
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -1895,6 +1895,32 @@ def td2_get_enrollments_for_course(course_id: int):
         WHERE E.course_id=:c ORDER BY U.name
     """), con=engine, params={"c": int(course_id)})
 
+@st.cache_data(ttl=10)
+def td2_get_lesson_words_export(course_id: int, lesson_id: int):
+    return pd.read_sql(
+        text(
+            """
+            SELECT
+              L.lesson_id,
+              L.title         AS lesson_title,
+              L.sort_order    AS lesson_sort_order,
+              COALESCE(L.instructions, '') AS lesson_instructions,
+              LW.sort_order   AS word_sort_order,
+              W.word_id,
+              W.headword,
+              W.synonyms,
+              W.difficulty
+            FROM lessons L
+            JOIN lesson_words LW ON LW.lesson_id = L.lesson_id
+            JOIN words W        ON W.word_id    = LW.word_id
+            WHERE L.course_id = :cid AND L.lesson_id = :lid
+            ORDER BY LW.sort_order, W.headword
+            """
+        ),
+        con=engine,
+        params={"cid": int(course_id), "lid": int(lesson_id)},
+    )
+
 def td2_invalidate():
     st.cache_data.clear()
 
@@ -2237,26 +2263,38 @@ def teacher_manage_ui():
                         except Exception as e:
                             st.error(f"Import failed: {e}")
 
-            # --- Bulk import for entire course (multi-lesson) ---
-            with st.form("td2_course_bulk_import"):
-                st.markdown("**Bulk import entire course (multi-lesson CSV)**")
-                st.caption("CSV columns: lesson_title, headword, synonyms  (optional: sort_order)")
-                f2 = st.file_uploader("Course CSV", type=["csv"], key="td2_course_csv")
-                refresh_course = st.checkbox("Refresh matching lessons (clear words first)", value=False, key="td2_course_refresh")
-                create_missing = st.checkbox("Create missing lessons automatically", value=True, key="td2_course_create")
-                go2 = st.form_submit_button("Import course CSV")
-                if go2:
-                    if f2 is None:
-                        st.error("Choose a CSV file.")
+            st.divider()
+            st.markdown("**Download lesson CSV**")
+            dfl_download = td2_get_lessons(cid_sel)
+            if dfl_download.empty:
+                st.caption("No lessons available to download.")
+            else:
+                lid_download = st.selectbox(
+                    "Lesson",
+                    dfl_download["lesson_id"].tolist(),
+                    format_func=lambda x: dfl_download.loc[dfl_download["lesson_id"] == x, "title"].values[0],
+                    key="td2_download_lesson_sel",
+                )
+
+                if lid_download is not None:
+                    df_export = td2_get_lesson_words_export(int(cid_sel), int(lid_download))
+                    lesson_title = dfl_download.loc[dfl_download["lesson_id"] == lid_download, "title"].values[0]
+                    safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", lesson_title.strip()) or f"lesson_{int(lid_download)}"
+
+                    if df_export.empty:
+                        st.info("The selected lesson has no words to export yet.")
                     else:
-                        try:
-                            df_bulk = pd.read_csv(f2)
-                            n_words, n_lessons = td2_import_course_csv(int(cid_sel), df_bulk, refresh_course, create_missing)
-                            td2_invalidate()
-                            st.success(f"Imported {n_words} words; created {n_lessons} new lessons.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Bulk import failed: {e}")
+                        csv_bytes = df_export.to_csv(index=False).encode("utf-8")
+                        st.caption(
+                            "Includes lesson metadata, word order, headwords, synonyms, and difficulty levels from the database."
+                        )
+                        st.download_button(
+                            "Download lesson CSV",
+                            data=csv_bytes,
+                            file_name=f"{safe_title}_words.csv",
+                            mime="text/csv",
+                            key="td2_download_lesson_btn",
+                        )
 
 # COL 3 — Assign / remove students for selected course
     with c3:
