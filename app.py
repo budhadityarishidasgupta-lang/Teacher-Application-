@@ -1699,6 +1699,15 @@ def build_question_payload(
 
     seen_lower = {c.lower() for c in correct}
 
+    current_lesson = st.session_state.get("active_lid")
+    if (
+        "used_distractors" not in st.session_state
+        or st.session_state.get("_used_distractors_lesson") != current_lesson
+    ):
+        st.session_state["used_distractors"] = set()
+        st.session_state["_used_distractors_lesson"] = current_lesson
+
+    used_distractors = st.session_state["used_distractors"]
     distractors: list[str] = []
     if lesson_df is not None and not lesson_df.empty:
         candidates: list[str] = []
@@ -1719,10 +1728,11 @@ def build_question_payload(
         random.shuffle(candidates)
         for cand in candidates:
             cand_l = cand.lower()
-            if cand_l in seen_lower:
+            if cand_l in seen_lower or cand_l in used_distractors:
                 continue
             distractors.append(cand)
             seen_lower.add(cand_l)
+            used_distractors.add(cand_l)
             if len(distractors) >= 4:
                 break
 
@@ -1752,10 +1762,11 @@ def build_question_payload(
         random.shuffle(fallback_pool)
         for cand in fallback_pool:
             cand_l = cand.lower()
-            if cand_l in seen_lower:
+            if cand_l in seen_lower or cand_l in used_distractors:
                 continue
             distractors.append(cand)
             seen_lower.add(cand_l)
+            used_distractors.add(cand_l)
             if len(distractors) >= 4:
                 break
 
