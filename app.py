@@ -4397,61 +4397,366 @@ def reset_lesson_state_for_restart(lesson_id: int):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# SCORECARD TAB — running log of answered questions
+# SCORECARD TAB — Dynamic lesson navigator & actions
 # ─────────────────────────────────────────────────────────────────────
-with tab_scorecard:
-    col_table, col_actions = st.columns([0.7, 0.3])
 
-    with col_table:
-        lesson_entries = st.session_state.scorecards.get(int(lid), [])
+def fetch_lesson_navigator_rows(user_id: int, course_id: int, lesson_id: int) -> pd.DataFrame:
+    """Return every headword in the lesson with the learner's latest attempt status."""
 
-        if not lesson_entries:
-            st.info("No answers recorded yet. Complete questions to build your scorecard.")
-        else:
-            df = pd.DataFrame(lesson_entries)
-            if "sequence" in df.columns:
-                df = df.sort_values("sequence")
-            elif "question_number" in df.columns:
-                df = df.sort_values("question_number")
-
-            if "answer_selected" not in df.columns and "correct" in df.columns:
-                df["answer_selected"] = df["correct"]
-
-            if "result" not in df.columns:
-                df["result"] = ["Correct"] * len(df)
-
-            rename_map = {
-                "question_number": "Question #",
-                "word": "Question Word",
-                "answer_selected": "Answer Selected",
-                "result": "Result",
-            }
-            df = df.rename(columns=rename_map)
-
-            if "Question #" not in df.columns:
-                df.insert(0, "Question #", range(1, len(df) + 1))
-
-            drop_cols = [col for col in ["sequence", "correct_answer", "correct"] if col in df.columns]
-            if drop_cols:
-                df = df.drop(columns=drop_cols)
-
-            display_cols = [
-                col for col in ["Question #", "Question Word", "Answer Selected", "Result"] if col in df.columns
-            ]
-            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-
-    with col_actions:
-        st.markdown("### Lesson actions")
-        st.markdown(
-            "<p style='font-size:0.9rem;'>Restart to begin this lesson again from question 1."
-            " Your previous answers will be archived.</p>",
-            unsafe_allow_html=True,
+    sql = text(
+        """
+        WITH ordered_words AS (
+            SELECT
+                ROW_NUMBER() OVER (ORDER BY lw.sort_order, w.headword) AS question_number,
+                w.headword
+            FROM lesson_words lw
+            JOIN lessons l ON l.lesson_id = lw.lesson_id
+            JOIN words w    ON w.word_id = lw.word_id
+            WHERE lw.lesson_id = :lid
+              AND l.course_id = :cid
+        ),
+        latest_attempt AS (
+            SELECT DISTINCT ON (a.headword)
+                a.headword,
+                a.is_correct,
+                a.ts
+            FROM attempts a
+            WHERE a.user_id   = :uid
+              AND a.course_id = :cid
+              AND a.lesson_id = :lid
+              AND a.archived_at IS NULL
+            ORDER BY a.headword, a.ts DESC
         )
+        SELECT
+            ow.question_number,
+            ow.headword,
+            la.is_correct
+        FROM ordered_words ow
+        LEFT JOIN latest_attempt la ON la.headword = ow.headword
+        ORDER BY ow.question_number
+        """
+    )
 
-        if st.button("Restart Lesson", key="btn_restart_lesson", type="primary"):
-            archive_lesson_attempts(USER_ID, cid, lid)
-            reset_lesson_state_for_restart(lid)
-            st.rerun()
+    try:
+        df = pd.read_sql(
+            sql,
+            con=engine,
+            params={"uid": int(user_id), "cid": int(course_id), "lid": int(lesson_id)},
+        )
+    except Exception:
+        df = pd.DataFrame(columns=["question_number", "headword", "is_correct"])
+
+    if df.empty:
+        return df.assign(status="unanswered")
+
+    def _status(row) -> str:
+        if pd.isna(row["is_correct"]):
+            return "unanswered"
+        return "correct" if bool(row["is_correct"]) else "incorrect"
+
+    df["status"] = df.apply(_status, axis=1)
+    return df
+
+
+def jump_to_lesson_question(
+    headword: str,
+    question_number: int,
+    lesson_df: pd.DataFrame,
+    lesson_id: int,
+    course_id: int,
+) -> None:
+    """Load the selected headword into the Practice tab and rerun the app."""
+
+    if not headword:
+        return
+
+    target = lesson_df[lesson_df["headword"] == headword]
+    if target.empty:
+        # Refresh the cache in case the lesson changed mid-session
+        refreshed = lesson_words(int(course_id), int(lesson_id))
+        target = refreshed[refreshed["headword"] == headword]
+        if target.empty:
+            st.warning("That question is no longer part of this lesson.")
+            return
+        lesson_df = refreshed
+
+    target_row = target.iloc[0]
+
+    # Clear any lingering checkbox state from the previous word
+    for key in list(st.session_state.get("grid_keys", [])):
+        st.session_state.pop(key, None)
+
+    st.session_state.active_word = headword
+    st.session_state.active_lid = int(lesson_id)
+    st.session_state.q_started_at = time.time()
+    st.session_state.qdata = build_question_payload(
+        headword,
+        target_row["synonyms"],
+        lesson_df=lesson_df,
+    )
+    st.session_state.grid_for_word = headword
+    st.session_state.grid_keys = [
+        f"opt_{headword}_{i}"
+        for i in range(len(st.session_state.qdata["choices"]))
+    ]
+    st.session_state.selection = set()
+    st.session_state.answered = False
+    st.session_state.eval = None
+    st.session_state.q_index_per_lesson[int(lesson_id)] = max(1, int(question_number))
+    st.session_state.current_question_index = int(question_number)
+    st.session_state.mode = "practice"
+
+    # Jump back to the Practice tab with the selected question loaded
+    st.rerun()
+
+
+with tab_scorecard:
+    st.markdown(
+        """
+        <style>
+        .lesson-nav-table {
+            background: rgba(15, 23, 42, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 14px;
+            padding: 0.5rem 0.75rem 1.25rem;
+            position: relative;
+            overflow: visible;
+        }
+        .lesson-nav-header {
+            display: grid;
+            grid-template-columns: 0.5fr 2.4fr 1.6fr 1.1fr;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #94a3b8;
+            padding: 0.35rem 0.75rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+            background: linear-gradient(90deg, rgba(30, 41, 59, 0.85), rgba(15, 23, 42, 0.85));
+            position: sticky;
+            top: 0;
+            z-index: 5;
+        }
+        .lesson-nav-row {
+            padding: 0.55rem 0.5rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 10px;
+            margin: 0.15rem 0;
+        }
+        .lesson-nav-row:last-child {
+            border-bottom: none;
+        }
+        .lesson-nav-cell {
+            font-size: 0.95rem;
+            color: #e2e8f0;
+        }
+        .lesson-nav-cell.cell-word {
+            font-weight: 600;
+        }
+        .lesson-nav-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-weight: 600;
+            padding: 0.1rem 0.6rem;
+            border-radius: 999px;
+            font-size: 0.85rem;
+        }
+        .lesson-nav-status.correct {
+            color: #4ade80;
+            background: rgba(74, 222, 128, 0.12);
+        }
+        .lesson-nav-status.incorrect {
+            color: #f87171;
+            background: rgba(248, 113, 113, 0.12);
+        }
+        .lesson-nav-status.unanswered {
+            color: #cbd5f5;
+            background: rgba(148, 163, 184, 0.18);
+        }
+        .lesson-nav-actions .stButton>button {
+            width: 100%;
+            background: linear-gradient(135deg, rgba(59,130,246,0.25), rgba(59,130,246,0.45));
+            border: 1px solid rgba(59,130,246,0.55);
+            color: #f8fafc;
+            font-weight: 600;
+        }
+        .lesson-nav-actions .stButton>button:hover {
+            border-color: rgba(96, 165, 250, 0.9);
+            box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.35);
+        }
+        .lesson-nav-filter .stRadio>div {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .lesson-nav-filter label {
+            font-size: 0.82rem !important;
+        }
+        .lesson-nav-filter [role="radio"] {
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            color: #cbd5f5;
+            padding: 0.35rem 0.85rem;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+        }
+        .lesson-nav-filter [role="radio"][aria-checked="true"] {
+            border-color: rgba(59, 130, 246, 0.85);
+            background: rgba(37, 99, 235, 0.35);
+            color: #f8fafc;
+        }
+        @media (max-width: 900px) {
+            .lesson-nav-table {
+                padding: 0.5rem 0.35rem 1rem;
+            }
+            .lesson-nav-header {
+                display: none;
+            }
+            .lesson-nav-row {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                grid-template-areas:
+                    "num status"
+                    "word word"
+                    "action action";
+                gap: 0.45rem 0.65rem;
+                padding: 0.75rem 0.85rem;
+                background: rgba(15, 23, 42, 0.8);
+                border: 1px solid rgba(148, 163, 184, 0.18);
+            }
+            .lesson-nav-cell {
+                font-size: 0.9rem;
+            }
+            .lesson-nav-cell[data-label]::before {
+                content: attr(data-label);
+                display: block;
+                font-size: 0.65rem;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                color: rgba(148, 163, 184, 0.8);
+                margin-bottom: 0.15rem;
+            }
+            .lesson-nav-cell.cell-num {
+                grid-area: num;
+            }
+            .lesson-nav-cell.cell-word {
+                grid-area: word;
+            }
+            .lesson-nav-cell.cell-status {
+                grid-area: status;
+                justify-self: flex-end;
+            }
+            .lesson-nav-actions {
+                grid-area: action;
+            }
+            .lesson-nav-actions .stButton>button {
+                width: 100%;
+            }
+        }
+        """,
+        unsafe_allow_html=True,
+    )
+
+    navigator_df = fetch_lesson_navigator_rows(USER_ID, cid, lid)
+
+    if navigator_df.empty:
+        st.info("This lesson has no questions yet. Once words are assigned, they will appear here.")
+    else:
+        options = ["All", "Correct", "Incorrect", "Unanswered"]
+        default_choice = st.session_state.get(f"lesson_nav_filter_{lid}", "All")
+        with st.container():
+            st.markdown("<div class='lesson-nav-filter'>", unsafe_allow_html=True)
+            filter_choice = st.radio(
+                "Show questions",
+                options,
+                horizontal=True,
+                index=options.index(default_choice) if default_choice in options else 0,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+        st.session_state[f"lesson_nav_filter_{lid}"] = filter_choice
+
+        status_map = {
+            "All": None,
+            "Correct": "correct",
+            "Incorrect": "incorrect",
+            "Unanswered": "unanswered",
+        }
+
+        if status_map[filter_choice]:
+            display_df = navigator_df[navigator_df["status"] == status_map[filter_choice]]
+        else:
+            display_df = navigator_df
+
+        if display_df.empty:
+            st.info("No questions match this filter yet. Keep practicing to unlock more data!")
+        else:
+            st.markdown("<div class='lesson-nav-table'>", unsafe_allow_html=True)
+            st.markdown(
+                """
+                <div class="lesson-nav-header">
+                    <span>#</span>
+                    <span>Word</span>
+                    <span>Status</span>
+                    <span>Action</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            status_labels = {
+                "correct": ("lesson-nav-status correct", "✅ Correct"),
+                "incorrect": ("lesson-nav-status incorrect", "❌ Incorrect"),
+                "unanswered": ("lesson-nav-status unanswered", "⚪ Unanswered"),
+            }
+
+            for row in display_df.itertuples():
+                status_class, status_label = status_labels.get(row.status, status_labels["unanswered"])
+                with st.container():
+                    st.markdown("<div class='lesson-nav-row'>", unsafe_allow_html=True)
+                    col_num, col_word, col_status, col_action = st.columns([0.6, 3.0, 1.9, 1.2], gap="small")
+                    with col_num:
+                        st.markdown(
+                            f"<div class='lesson-nav-cell cell-num' data-label='#'>{int(row.question_number)}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with col_word:
+                        st.markdown(
+                            f"<div class='lesson-nav-cell cell-word' data-label='Word'>{html.escape(row.headword)}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with col_status:
+                        st.markdown(
+                            f"<div class='lesson-nav-cell cell-status' data-label='Status'><span class='{status_class}'>{status_label}</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                    with col_action:
+                        btn_key = f"go_to_{lid}_{int(row.question_number)}"
+                        st.markdown("<div class='lesson-nav-actions'>", unsafe_allow_html=True)
+                        if st.button("Go →", key=btn_key, use_container_width=True):
+                            jump_to_lesson_question(
+                                row.headword,
+                                int(row.question_number),
+                                words_df,
+                                lid,
+                                cid,
+                            )
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### Lesson actions")
+    st.markdown(
+        "<p style='font-size:0.9rem;'>Restart to begin this lesson again from question 1. Your previous answers will be archived.</p>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Restart Lesson", key="btn_restart_lesson", type="primary"):
+        archive_lesson_attempts(USER_ID, cid, lid)
+        reset_lesson_state_for_restart(lid)
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
