@@ -1563,11 +1563,23 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
     xp_for_word = 0
     new_badges: list[dict] = []
 
+    # Guarantee the mastery column exists for both existing and future tenants.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """ALTER TABLE word_stats
+                           ADD COLUMN IF NOT EXISTS mastery_score DOUBLE PRECISION DEFAULT 0.5"""
+                )
+            )
+    except Exception:
+        pass
+
     with engine.begin() as conn:
         row = conn.execute(
             text(
                 """
-                SELECT correct_streak, streak_count, mastered, xp_points
+                SELECT correct_streak, streak_count, mastered, xp_points, mastery_score
                 FROM word_stats
                 WHERE user_id=:u AND headword=:h
                 """
@@ -1577,10 +1589,18 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
 
         prior_streak = int((row or {}).get("streak_count") or (row or {}).get("correct_streak") or 0)
         prior_mastered = bool((row or {}).get("mastered"))
+        prior_mastery = float((row or {}).get("mastery_score") or 0.5)
 
         new_streak = prior_streak + 1 if is_correct else 0
-        became_mastered = is_correct and new_streak >= 3 and not prior_mastered
-        mastered_flag = prior_mastered or (is_correct and new_streak >= 3)
+
+        # Hidden mastery engine: exponential moving average with strong memory.
+        alpha = 0.8
+        observation = 1.0 if is_correct else 0.0
+        new_mastery = (alpha * observation) + ((1 - alpha) * prior_mastery)
+        new_mastery = max(0.0, min(1.0, new_mastery))
+
+        became_mastered = (new_mastery >= 0.85) and not prior_mastered
+        mastered_flag = prior_mastered or (new_mastery >= 0.85)
 
         attempt_xp = 10 if is_correct else 0
         mastery_bonus = 50 if became_mastered else 0
@@ -1593,8 +1613,8 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
         conn.execute(
             text(
                 """
-                INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, xp_points, streak_count, last_seen, mastered, difficulty, due_date)
-                VALUES (:u, :h, :cs, 1, :ca, :xp, :sc, CURRENT_TIMESTAMP, :m, :d, :due)
+                INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, xp_points, streak_count, last_seen, mastered, difficulty, due_date, mastery_score)
+                VALUES (:u, :h, :cs, 1, :ca, :xp, :sc, CURRENT_TIMESTAMP, :m, :d, :due, :ms)
                 ON CONFLICT (user_id, headword) DO UPDATE SET
                     correct_streak   = EXCLUDED.correct_streak,
                     total_attempts   = word_stats.total_attempts + 1,
@@ -1604,7 +1624,8 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
                     last_seen        = CURRENT_TIMESTAMP,
                     mastered         = CASE WHEN :m THEN TRUE ELSE word_stats.mastered END,
                     difficulty       = :d,
-                    due_date         = :due
+                    due_date         = :due,
+                    mastery_score    = :ms
                 """
             ),
             {
@@ -1617,6 +1638,7 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
                 "m": mastered_flag,
                 "d": int(difficulty),
                 "due": due,
+                "ms": new_mastery,
             },
         )
 
@@ -1666,6 +1688,20 @@ def recent_stats(user_id, course_id, lesson_id, n=10):
 
 def choose_next_word(user_id, course_id, lesson_id, df_words):
     """Adaptive next word (simple rule: recent accuracy & speed)."""
+
+    # Maintain schema lazily so existing deployments keep working without manual migrations.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """ALTER TABLE word_stats
+                           ADD COLUMN IF NOT EXISTS mastery_score DOUBLE PRECISION DEFAULT 0.5"""
+                )
+            )
+    except Exception:
+        # If the column already exists or the ALTER fails, continue with the existing schema.
+        pass
+
     stats = recent_stats(user_id, course_id, lesson_id, n=10)
     acc, avg = stats["accuracy"], stats["avg_ms"]
     if acc >= 0.75 and avg <= 8000:
@@ -1674,9 +1710,72 @@ def choose_next_word(user_id, course_id, lesson_id, df_words):
         tgt = 1
     else:
         tgt = 2
-    candidates = df_words[df_words["difficulty"] == tgt]["headword"].tolist() or df_words["headword"].tolist()
+
+    # Build the base candidate list using the adaptive difficulty target.
+    candidates = (
+        df_words[df_words["difficulty"] == tgt]["headword"].tolist()
+        or df_words["headword"].tolist()
+    )
+
+    # Session-derived filters: avoid repeating words that have already been
+    # answered correctly in this lesson or that are waiting in the delayed
+    # review queue.
+    lesson_key = int(lesson_id)
+    completed_words = set(
+        st.session_state.get("lesson_correct_words", {}).get(lesson_key, set())
+    )
+    review_pending = set(st.session_state.get("review_queue", []) or [])
+
+    # Pull mastery scores in bulk and keep high-mastery headwords for later.
+    mastery_map: dict[str, float] = {}
+    try:
+        mastery_df = pd.read_sql(
+            text(
+                """
+                SELECT headword, mastery_score
+                FROM word_stats
+                WHERE user_id = :u
+                """
+            ),
+            con=engine,
+            params={"u": int(user_id)},
+        )
+        mastery_map = {
+            str(row.headword): float(row.mastery_score)
+            for row in mastery_df.itertuples()
+            if row.mastery_score is not None
+        }
+    except Exception:
+        mastery_map = {}
+
+    high_mastery_words = {
+        hw for hw, score in mastery_map.items() if score >= 0.85
+    }
+
+    # Filter the candidate pool while preserving fallbacks in case we filter everything out.
+    filtered = [
+        w
+        for w in candidates
+        if w not in completed_words and w not in review_pending
+    ]
+    if not filtered:
+        filtered = [w for w in candidates if w not in completed_words]
+    if not filtered:
+        filtered = [w for w in df_words["headword"].tolist() if w not in completed_words]
+
+    # Only drop high-mastery words if other choices remain.
+    non_mastered = [w for w in filtered if w not in high_mastery_words]
+    if non_mastered:
+        filtered = non_mastered
+
     hist = st.session_state.get("asked_history", [])
-    pool = [w for w in candidates if w not in hist[-3:]] or candidates
+    pool = [w for w in filtered if w not in hist[-3:]] or filtered
+
+    if not pool:
+        fallback = df_words["headword"].tolist()
+        if fallback:
+            pool = fallback
+
     return random.choice(pool)
 
 def build_question_payload(
@@ -3767,6 +3866,12 @@ if st.session_state["auth"]["role"] == "student":
     basis = mastered_q if mastered_q > 0 else attempted_q
     pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
 
+    override_pct_map = st.session_state.get("lesson_progress_pct", {})
+    if override_pct_map:
+        override_pct = override_pct_map.get(int(lid))
+        if override_pct is not None:
+            pct = int(override_pct)
+
     if st.session_state.q_index_per_lesson.get(int(lid)) is None:
         baseline = max(1, min(int(total_q or 1), int(attempted_q or 0) + 1))
         st.session_state.q_index_per_lesson[int(lid)] = baseline
@@ -3945,6 +4050,21 @@ if st.session_state["auth"]["role"] == "student":
             picked_set = set(list(st.session_state.selection))
             is_correct = (picked_set == correct_set)
 
+            from collections import deque
+
+            lesson_key = int(lid)
+            total_words_in_lesson = int(len(words_df))
+
+            # Ensure per-lesson structures exist before we mutate them.
+            if "lesson_correct_words" not in st.session_state:
+                st.session_state.lesson_correct_words = {}
+            if "lesson_progress_pct" not in st.session_state:
+                st.session_state.lesson_progress_pct = {}
+            if "normal_question_counter" not in st.session_state:
+                st.session_state.normal_question_counter = 0
+            if "review_queue" not in st.session_state or st.session_state.review_queue is None:
+                st.session_state.review_queue = deque()
+
             correct_choice_for_log = list(correct_set)[0]
             result = update_after_attempt(
                 USER_ID,
@@ -3975,7 +4095,6 @@ if st.session_state["auth"]["role"] == "student":
                 "choices": list(choices)
             }
 
-            lesson_key = int(lid)
             lesson_scorecard = list(st.session_state.scorecards.get(lesson_key, []))
             question_numbers = st.session_state.scorecard_question_numbers.setdefault(lesson_key, {})
             question_number = question_numbers.get(active)
@@ -3996,13 +4115,37 @@ if st.session_state["auth"]["role"] == "student":
             )
             st.session_state.scorecards[lesson_key] = lesson_scorecard
 
-            # If wrong, push this headword to the front of the review queue
-            if not is_correct:
-                from collections import deque
-                if "review_queue" not in st.session_state or st.session_state.review_queue is None:
-                    st.session_state.review_queue = deque()
-                if st.session_state.active_word not in st.session_state.review_queue:
-                    st.session_state.review_queue.appendleft(st.session_state.active_word)
+            review_queue = st.session_state.review_queue
+            correct_words = st.session_state.lesson_correct_words.setdefault(lesson_key, set())
+
+            if is_correct:
+                # Remove from the delayed review queue and treat as permanently completed.
+                try:
+                    review_queue.remove(active)
+                except ValueError:
+                    pass
+                if active not in correct_words:
+                    correct_words.add(active)
+                # Advance the visible counters only when we gain a new correct headword.
+                correct_count = len(correct_words)
+                st.session_state.lesson_correct_words[lesson_key] = correct_words
+                denom = max(1, total_words_in_lesson)
+                if correct_count >= denom:
+                    next_index = denom
+                else:
+                    next_index = min(denom, correct_count + 1)
+                st.session_state.q_index_per_lesson[lesson_key] = max(1, next_index)
+                progress_pct = int(round((correct_count / denom) * 100))
+                st.session_state.lesson_progress_pct[lesson_key] = progress_pct
+            else:
+                # Place the word in the tail of the queue for a spaced retry.
+                if active not in review_queue:
+                    review_queue.append(active)
+                    while len(review_queue) > 5:
+                        review_queue.popleft()
+                # Keep the visible question index anchored.
+                current_index = st.session_state.q_index_per_lesson.get(lesson_key, 1)
+                st.session_state.q_index_per_lesson[lesson_key] = max(1, current_index)
 
             st.rerun()
 
@@ -4123,20 +4266,43 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
             except Exception:
                 from collections import deque
                 st.session_state.review_queue = deque()
+            if "lesson_correct_words" in st.session_state:
+                st.session_state.lesson_correct_words.pop(int(lid), None)
+            if "lesson_progress_pct" in st.session_state:
+                st.session_state.lesson_progress_pct.pop(int(lid), None)
+            st.session_state.normal_question_counter = 0
             st.session_state.q_index_per_lesson[int(lid)] = 1
             available_words = set(words_df["headword"].tolist())
             next_word = first_word if first_word in available_words else choose_next_word(USER_ID, cid, lid, words_df)
         else:
             st.session_state.asked_history.append(st.session_state.active_word)
 
-            # Serve from review queue first
-            if st.session_state.review_queue:
-                next_word = st.session_state.review_queue.popleft()
+            lesson_key = int(lid)
+            review_queue = st.session_state.review_queue
+            correct_words = st.session_state.get("lesson_correct_words", {}).get(lesson_key, set())
+            remaining_words = [
+                w for w in words_df["headword"].tolist()
+                if w not in correct_words
+            ]
+
+            normal_counter = int(st.session_state.get("normal_question_counter", 0))
+            next_word = None
+            if review_queue and (normal_counter >= 10 or not remaining_words):
+                review_choices = list(review_queue)
+                chosen_review = random.choice(review_choices)
+                try:
+                    review_queue.remove(chosen_review)
+                except ValueError:
+                    pass
+                next_word = chosen_review
+                st.session_state.normal_question_counter = 0
             else:
                 next_word = choose_next_word(USER_ID, cid, lid, words_df)
+                st.session_state.normal_question_counter = normal_counter + 1
 
-            st.session_state.q_index_per_lesson[int(lid)] = \
-                st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
+            # Keep the visible index stable unless a new correct word advances it.
+            current_index = st.session_state.q_index_per_lesson.get(lesson_key, 1)
+            st.session_state.q_index_per_lesson[lesson_key] = max(1, current_index)
 
         # Load next word
         st.session_state.active_word = next_word
