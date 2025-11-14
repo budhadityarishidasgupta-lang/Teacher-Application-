@@ -1,4 +1,4 @@
-import os, time, random, sqlite3, html, base64, json, re
+import os, time, random, sqlite3, html, base64, json, re, uuid
 from contextlib import closing
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -4744,9 +4744,13 @@ with tab_scorecard:
                             unsafe_allow_html=True,
                         )
                     with col_action:
-                        btn_key = f"go_to_{lid}_{int(row.question_number)}"
+                        # Use a dynamically generated UUID so each button instance is always unique across reruns.
+                        btn_key = f"go_to_{lid}_{int(row.question_number)}_{uuid.uuid4()}"
                         st.markdown("<div class='lesson-nav-actions'>", unsafe_allow_html=True)
                         if st.button("Go →", key=btn_key, use_container_width=True):
+                            # Prime the lesson context before rerunning so Practice loads the expected word immediately.
+                            st.session_state.active_word = row.headword
+                            st.session_state.current_question_index = int(row.question_number)
                             jump_to_lesson_question(
                                 row.headword,
                                 int(row.question_number),
@@ -4754,9 +4758,13 @@ with tab_scorecard:
                                 lid,
                                 cid,
                             )
-                            st.session_state.mode = "practice"  # ensure mode stays in sync with Practice view
-                            st.session_state.active_tab = "Practice"  # immediately flip to the Practice tab
-                            st.experimental_rerun()  # force rerun so the tab change is reflected right away
+                            # Explicitly sync the view back to Practice every time the action is triggered.
+                            st.session_state.mode = "practice"
+                            st.session_state.active_tab = "Practice"
+                            # Flip a throwaway flag so Streamlit always detects a state change for consecutive clicks.
+                            st.session_state["rerun_flag"] = not st.session_state.get("rerun_flag", False)
+                            # Hard rerun ensures the Practice tab renders straight away with the new selection.
+                            st.experimental_rerun()
                         st.markdown("</div>", unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
