@@ -1,4 +1,4 @@
-import os, time, random, sqlite3, html, base64, json, re, uuid
+import os, time, random, sqlite3, html, base64, json, re
 from contextlib import closing
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -3904,7 +3904,7 @@ if st.session_state["auth"]["role"] == "student":
         st.session_state.active_lid = lid
         st.session_state.force_refresh = True  # force regeneration when switching lessons
 
-    # Only choose a new word if none has been manually set via Go → or an explicit refresh is requested.
+    # Only choose a new word if none has been manually set via state overrides or an explicit refresh is requested.
     if ("active_word" not in st.session_state) or st.session_state.get("force_refresh", False):
         st.session_state.active_lid = lid
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
@@ -4457,13 +4457,27 @@ def fetch_lesson_navigator_rows(user_id: int, course_id: int, lesson_id: int) ->
               AND a.lesson_id = :lid
               AND a.archived_at IS NULL
             ORDER BY a.headword, a.ts DESC
+        ),
+        attempt_stats AS (
+            SELECT
+                a.headword,
+                COUNT(*) FILTER (WHERE a.archived_at IS NULL) AS attempt_count,
+                MAX(a.ts) FILTER (WHERE a.archived_at IS NULL) AS last_attempt_ts
+            FROM attempts a
+            WHERE a.user_id   = :uid
+              AND a.course_id = :cid
+              AND a.lesson_id = :lid
+            GROUP BY a.headword
         )
         SELECT
             ow.question_number,
             ow.headword,
-            la.is_correct
+            la.is_correct,
+            COALESCE(ast.attempt_count, 0) AS attempt_count,
+            ast.last_attempt_ts
         FROM ordered_words ow
         LEFT JOIN latest_attempt la ON la.headword = ow.headword
+        LEFT JOIN attempt_stats ast ON ast.headword = ow.headword
         ORDER BY ow.question_number
         """
     )
@@ -4486,6 +4500,8 @@ def fetch_lesson_navigator_rows(user_id: int, course_id: int, lesson_id: int) ->
         return "correct" if bool(row["is_correct"]) else "incorrect"
 
     df["status"] = df.apply(_status, axis=1)
+    if "attempt_count" in df.columns:
+        df["attempt_count"] = df["attempt_count"].fillna(0).astype(int)
     return df
 
 
@@ -4544,78 +4560,8 @@ def jump_to_lesson_question(
 
 with tab_scorecard:
     st.markdown(
-        """
+        '''
         <style>
-        .lesson-nav-table {
-            background: rgba(15, 23, 42, 0.55);
-            border: 1px solid rgba(148, 163, 184, 0.2);
-            border-radius: 14px;
-            padding: 0.5rem 0.75rem 1.25rem;
-            position: relative;
-            overflow: visible;
-        }
-        .lesson-nav-header {
-            display: grid;
-            grid-template-columns: 0.5fr 2.4fr 1.6fr 1.1fr;
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: #94a3b8;
-            padding: 0.35rem 0.75rem;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.15);
-            background: linear-gradient(90deg, rgba(30, 41, 59, 0.85), rgba(15, 23, 42, 0.85));
-            position: sticky;
-            top: 0;
-            z-index: 5;
-        }
-        .lesson-nav-row {
-            padding: 0.55rem 0.5rem;
-            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-            border-radius: 10px;
-            margin: 0.15rem 0;
-        }
-        .lesson-nav-row:last-child {
-            border-bottom: none;
-        }
-        .lesson-nav-cell {
-            font-size: 0.95rem;
-            color: #e2e8f0;
-        }
-        .lesson-nav-cell.cell-word {
-            font-weight: 600;
-        }
-        .lesson-nav-status {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.4rem;
-            font-weight: 600;
-            padding: 0.1rem 0.6rem;
-            border-radius: 999px;
-            font-size: 0.85rem;
-        }
-        .lesson-nav-status.correct {
-            color: #4ade80;
-            background: rgba(74, 222, 128, 0.12);
-        }
-        .lesson-nav-status.incorrect {
-            color: #f87171;
-            background: rgba(248, 113, 113, 0.12);
-        }
-        .lesson-nav-status.unanswered {
-            color: #cbd5f5;
-            background: rgba(148, 163, 184, 0.18);
-        }
-        .lesson-nav-actions .stButton>button {
-            width: 100%;
-            background: linear-gradient(135deg, rgba(59,130,246,0.25), rgba(59,130,246,0.45));
-            border: 1px solid rgba(59,130,246,0.55);
-            color: #f8fafc;
-            font-weight: 600;
-        }
-        .lesson-nav-actions .stButton>button:hover {
-            border-color: rgba(96, 165, 250, 0.9);
-            box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.35);
-        }
         .lesson-nav-filter .stRadio>div {
             display: flex;
             gap: 0.5rem;
@@ -4638,55 +4584,88 @@ with tab_scorecard:
             background: rgba(37, 99, 235, 0.35);
             color: #f8fafc;
         }
-        @media (max-width: 900px) {
-            .lesson-nav-table {
-                padding: 0.5rem 0.35rem 1rem;
+        .scorecard-table-container {
+            margin-top: 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 12px;
+            background: rgba(15, 23, 42, 0.7);
+            overflow: hidden;
+        }
+        .scorecard-table-wrapper {
+            overflow-x: auto;
+        }
+        .scorecard-table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 340px;
+        }
+        .scorecard-table thead th {
+            text-align: left;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.72rem;
+            color: rgba(203, 213, 225, 0.9);
+            padding: 0.45rem 0.75rem;
+            background: rgba(15, 23, 42, 0.9);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+        }
+        .scorecard-table tbody td {
+            padding: 0.38rem 0.75rem;
+            font-size: 0.85rem;
+            color: #e2e8f0;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+        }
+        .scorecard-table tbody tr:nth-child(odd) {
+            background: rgba(15, 23, 42, 0.6);
+        }
+        .scorecard-table tbody tr:last-child td {
+            border-bottom: none;
+        }
+        .scorecard-table tbody td.num-cell {
+            width: 3rem;
+            text-align: center;
+            color: rgba(226, 232, 240, 0.85);
+        }
+        .scorecard-table tbody td.word-cell {
+            font-weight: 600;
+        }
+        .scorecard-table tbody td.attempts-cell {
+            text-align: center;
+        }
+        .scorecard-table tbody td.time-cell {
+            white-space: nowrap;
+            font-size: 0.78rem;
+            color: rgba(148, 163, 184, 0.95);
+        }
+        .scorecard-status-dot {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+        .scorecard-status-dot.correct {
+            color: #4ade80;
+        }
+        .scorecard-status-dot.incorrect {
+            color: #f87171;
+        }
+        .scorecard-status-dot.unanswered {
+            color: #cbd5f5;
+        }
+        @media (max-width: 768px) {
+            .scorecard-table thead th,
+            .scorecard-table tbody td {
+                padding: 0.35rem 0.6rem;
             }
-            .lesson-nav-header {
-                display: none;
+            .scorecard-table tbody td {
+                font-size: 0.8rem;
             }
-            .lesson-nav-row {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                grid-template-areas:
-                    "num status"
-                    "word word"
-                    "action action";
-                gap: 0.45rem 0.65rem;
-                padding: 0.75rem 0.85rem;
-                background: rgba(15, 23, 42, 0.8);
-                border: 1px solid rgba(148, 163, 184, 0.18);
-            }
-            .lesson-nav-cell {
-                font-size: 0.9rem;
-            }
-            .lesson-nav-cell[data-label]::before {
-                content: attr(data-label);
-                display: block;
-                font-size: 0.65rem;
-                letter-spacing: 0.08em;
-                text-transform: uppercase;
-                color: rgba(148, 163, 184, 0.8);
-                margin-bottom: 0.15rem;
-            }
-            .lesson-nav-cell.cell-num {
-                grid-area: num;
-            }
-            .lesson-nav-cell.cell-word {
-                grid-area: word;
-            }
-            .lesson-nav-cell.cell-status {
-                grid-area: status;
-                justify-self: flex-end;
-            }
-            .lesson-nav-actions {
-                grid-area: action;
-            }
-            .lesson-nav-actions .stButton>button {
-                width: 100%;
+            .scorecard-table tbody td.time-cell {
+                font-size: 0.72rem;
             }
         }
-        """,
+        </style>
+        ''',
         unsafe_allow_html=True,
     )
 
@@ -4720,76 +4699,74 @@ with tab_scorecard:
         else:
             display_df = navigator_df
 
+
+
         if display_df.empty:
             st.info("No questions match this filter yet. Keep practicing to unlock more data!")
         else:
-            st.markdown("<div class='lesson-nav-table'>", unsafe_allow_html=True)
-            st.markdown(
-                """
-                <div class="lesson-nav-header">
-                    <span>#</span>
-                    <span>Word</span>
-                    <span>Status</span>
-                    <span>Action</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            table_df = display_df.copy()  # Work on a copy so we keep the original join results intact.
 
-            status_labels = {
-                "correct": ("lesson-nav-status correct", "✅ Correct"),
-                "incorrect": ("lesson-nav-status incorrect", "❌ Incorrect"),
-                "unanswered": ("lesson-nav-status unanswered", "⚪ Unanswered"),
+            if "attempt_count" in table_df.columns:
+                table_df["attempt_count"] = table_df["attempt_count"].fillna(0).astype(int)
+            else:
+                table_df["attempt_count"] = 0
+
+            if "last_attempt_ts" in table_df.columns:
+                last_attempt_series = pd.to_datetime(table_df["last_attempt_ts"], errors="coerce")
+                table_df["last_attempt_display"] = last_attempt_series.dt.strftime("%d %b %Y %H:%M")
+                table_df.loc[last_attempt_series.isna(), "last_attempt_display"] = "—"
+            else:
+                table_df["last_attempt_display"] = "—"
+
+            status_icons = {
+                "correct": "<span class='scorecard-status-dot correct'>✅</span>",
+                "incorrect": "<span class='scorecard-status-dot incorrect'>❌</span>",
+                "unanswered": "<span class='scorecard-status-dot unanswered'>⚪</span>",
             }
+            table_df["status_icon"] = table_df["status"].map(lambda s: status_icons.get(s, status_icons["unanswered"]))
 
-            for row in display_df.itertuples():
-                status_class, status_label = status_labels.get(row.status, status_labels["unanswered"])
-                with st.container():
-                    st.markdown("<div class='lesson-nav-row'>", unsafe_allow_html=True)
-                    col_num, col_word, col_status, col_action = st.columns([0.6, 3.0, 1.9, 1.2], gap="small")
-                    with col_num:
-                        st.markdown(
-                            f"<div class='lesson-nav-cell cell-num' data-label='#'>{int(row.question_number)}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with col_word:
-                        st.markdown(
-                            f"<div class='lesson-nav-cell cell-word' data-label='Word'>{html.escape(row.headword)}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with col_status:
-                        st.markdown(
-                            f"<div class='lesson-nav-cell cell-status' data-label='Status'><span class='{status_class}'>{status_label}</span></div>",
-                            unsafe_allow_html=True,
-                        )
-                    with col_action:
-                        # Use a dynamically generated UUID so each button instance is always unique across reruns.
-                        btn_key = f"go_to_{lid}_{int(row.question_number)}_{uuid.uuid4()}"
-                        st.markdown("<div class='lesson-nav-actions'>", unsafe_allow_html=True)
-                        if st.button("Go →", key=btn_key, use_container_width=True):
-                            # Prime the lesson context before rerunning so Practice loads the expected word immediately.
-                            st.session_state.active_word = row.headword
-                            st.session_state.current_question_index = int(row.question_number)
-                            st.session_state.force_refresh = False  # tell Practice not to overwrite this word on rerun
-                            jump_to_lesson_question(
-                                row.headword,
-                                int(row.question_number),
-                                words_df,
-                                lid,
-                                cid,
-                            )
-                            # Explicitly sync the view back to Practice every time the action is triggered.
-                            st.session_state.mode = "practice"
-                            st.session_state.active_tab = "Practice"
-                            # Flip a throwaway flag so Streamlit always detects a state change for consecutive clicks.
-                            st.session_state["rerun_flag"] = not st.session_state.get("rerun_flag", False)
-                            # Hard rerun ensures the Practice tab renders straight away with the new selection.
-                            st.experimental_rerun()
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
+            rows_html = []  # Collect already-escaped HTML rows for compact rendering.
+            for row in table_df.itertuples():
+                last_attempt_display = getattr(row, "last_attempt_display", "—") or "—"
+                rows_html.append(
+                    "".join(
+                        [
+                            "<tr>",
+                            f"<td class='num-cell'>{int(row.question_number)}</td>",
+                            f"<td class='word-cell'>{html.escape(str(row.headword))}</td>",
+                            f"<td class='status-cell'>{row.status_icon}</td>",
+                            f"<td class='attempts-cell'>{int(getattr(row, 'attempt_count', 0))}</td>",
+                            f"<td class='time-cell'>{html.escape(str(last_attempt_display))}</td>",
+                            "</tr>",
+                        ]
+                    )
+                )
 
-            st.markdown("</div>", unsafe_allow_html=True)
-
+            table_html = (
+                """
+            <div class="scorecard-table-container">
+                <div class="scorecard-table-wrapper">
+                    <table class="scorecard-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Word</th>
+                                <th>Status</th>
+                                <th>Attempts</th>
+                                <th>Last Attempt</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                """
+                + "".join(rows_html)
+                + """
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+                """
+            )
+            st.markdown(table_html, unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("### Lesson actions")
     st.markdown(
