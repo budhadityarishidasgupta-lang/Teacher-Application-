@@ -1871,6 +1871,23 @@ def build_question_payload(
 
     choices = correct + distractors[:4]
     random.shuffle(choices)
+
+    # Ensure each question always displays at least five total options by
+    # backfilling from remaining lesson headwords when the distractor pool runs out.
+    if len(choices) < 5:
+        fallback_pool: list[str] = []
+        if lesson_df is not None and not lesson_df.empty and "headword" in lesson_df.columns:
+            fallback_pool = list(
+                set(lesson_df["headword"].astype(str))
+                - {str(headword)}
+                - set(choices)
+            )
+        while len(choices) < 5 and fallback_pool:
+            new_opt = random.choice(fallback_pool)
+            fallback_pool.remove(new_opt)
+            choices.append(new_opt)
+        random.shuffle(choices)
+
     return {"headword": headword, "choices": choices, "correct": set(correct)}
 
 #def gpt_feedback_examples(headword: str, correct_word: str):
@@ -4777,7 +4794,27 @@ with tab_scorecard:
     if st.button("Restart Lesson", key="btn_restart_lesson", type="primary"):
         archive_lesson_attempts(USER_ID, cid, lid)
         reset_lesson_state_for_restart(lid)
-        st.rerun()
+
+        # Clear progress-tracking session state so the lesson restarts from question 1.
+        for key in [
+            "question_index",
+            "correct_count",
+            "active_word",
+            "asked_history",
+            "review_queue",
+            "mastery_progress",
+            "force_refresh",
+        ]:
+            if key in st.session_state:
+                del st.session_state[key]
+
+        # Re-establish default practice view before reloading the lesson interface.
+        st.session_state.mode = "practice"
+        st.session_state.active_tab = "Practice"
+        try:
+            st.experimental_rerun()
+        except AttributeError:
+            st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────
 # Version footer (nice to show deployed tag)
