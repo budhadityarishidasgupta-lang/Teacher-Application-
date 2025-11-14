@@ -2818,9 +2818,18 @@ NAME   = st.session_state.auth["name"]
 st.sidebar.caption(f"Signed in as **{NAME}** ({ROLE})")
 
 _defaults = {
-    "answered": False, "eval": None, "active_word": None, "active_lid": None,
-    "q_started_at": 0.0, "selection": set(), "asked_history": [],
-    "gamification": {}, "badges_recent": [], "badge_details_recent": [], "last_xp_gain": 0,
+    "answered": False,
+    "eval": None,
+    "active_word": None,
+    "active_lid": None,
+    "force_refresh": False,
+    "q_started_at": 0.0,
+    "selection": set(),
+    "asked_history": [],
+    "gamification": {},
+    "badges_recent": [],
+    "badge_details_recent": [],
+    "last_xp_gain": 0,
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -3784,6 +3793,7 @@ def _go_back_to_prev_word(lid: int, words_df: pd.DataFrame):
 
     prev = hist.pop()  # take the last served word
     st.session_state.active_word = prev
+    st.session_state.force_refresh = False  # respect manual back navigation selection
     st.session_state.q_started_at = time.time()
 
     row_prev = words_df[words_df["headword"] == prev]
@@ -3889,11 +3899,16 @@ if st.session_state["auth"]["role"] == "student":
     if "asked_history" not in st.session_state:
         st.session_state.asked_history = []
 
-    # Active question state
-    new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
-    if new_word_needed:
+    # Track lesson changes so the next render can safely refresh the prompt.
+    if st.session_state.get("active_lid") != lid:
+        st.session_state.active_lid = lid
+        st.session_state.force_refresh = True  # force regeneration when switching lessons
+
+    # Only choose a new word if none has been manually set via Go → or an explicit refresh is requested.
+    if ("active_word" not in st.session_state) or st.session_state.get("force_refresh", False):
         st.session_state.active_lid = lid
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.force_refresh = False  # reset so manual selections persist across reruns
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
         st.session_state.qdata = build_question_payload(
@@ -3923,6 +3938,7 @@ if st.session_state["auth"]["role"] == "student":
     filtered = words_df[words_df["headword"] == active]
     if filtered.empty:
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.force_refresh = False  # ensure fallback behaves like a normal auto-selection
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
         st.session_state.qdata = build_question_payload(
@@ -4319,6 +4335,7 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
 
         # Load next word
         st.session_state.active_word = next_word
+        st.session_state.force_refresh = False  # next question is intentionally chosen, so preserve it on rerun
         st.session_state.q_started_at = time.time()
         next_row = words_df[words_df["headword"] == next_word].iloc[0]
         st.session_state.qdata = build_question_payload(
@@ -4407,6 +4424,7 @@ def reset_lesson_state_for_restart(lesson_id: int):
     st.session_state.pop("grid_for_word", None)
     st.session_state.pop("active_word", None)
     st.session_state.active_lid = None
+    st.session_state.force_refresh = True  # next visit should regenerate the starting question
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -4500,6 +4518,7 @@ def jump_to_lesson_question(
         st.session_state.pop(key, None)
 
     st.session_state.active_word = headword
+    st.session_state.force_refresh = False  # Preserve the targeted selection supplied by the scorecard
     st.session_state.active_lid = int(lesson_id)
     st.session_state.q_started_at = time.time()
     st.session_state.qdata = build_question_payload(
@@ -4751,6 +4770,7 @@ with tab_scorecard:
                             # Prime the lesson context before rerunning so Practice loads the expected word immediately.
                             st.session_state.active_word = row.headword
                             st.session_state.current_question_index = int(row.question_number)
+                            st.session_state.force_refresh = False  # tell Practice not to overwrite this word on rerun
                             jump_to_lesson_question(
                                 row.headword,
                                 int(row.question_number),
