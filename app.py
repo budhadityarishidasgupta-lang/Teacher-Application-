@@ -3973,7 +3973,20 @@ if st.session_state["auth"]["role"] == "student":
     st.session_state.badges_recent = []
 
 # Tabs for Practice vs Review (header stays ABOVE)
-    tab_practice, tab_scorecard = st.tabs(["Practice", "Scorecard"])
+    # Track which tab should be visible so reruns land on the expected view
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = "Practice"  # default new or returning users to Practice
+
+    # Keep the stored tab name aligned with the current mode selection
+    if st.session_state.get("mode") == "scorecard":
+        st.session_state.active_tab = "Scorecard"
+    elif st.session_state.get("mode") == "practice":
+        st.session_state.active_tab = "Practice"
+
+    tab_labels = ["Practice", "Scorecard"]
+    tab_index = 0 if st.session_state.active_tab == "Practice" else 1  # future-proof explicit index
+    tabs = st.tabs(tab_labels)
+    tab_practice, tab_scorecard = tabs
 
 # ─────────────────────────────────────────────────────────────────────
 # PRACTICE TAB — quiz form + after-submit feedback + Next
@@ -4505,9 +4518,9 @@ def jump_to_lesson_question(
     st.session_state.q_index_per_lesson[int(lesson_id)] = max(1, int(question_number))
     st.session_state.current_question_index = int(question_number)
     st.session_state.mode = "practice"
+    st.session_state.active_tab = "Practice"  # keep tab selection aligned with active mode
 
-    # Jump back to the Practice tab with the selected question loaded
-    st.rerun()
+    # The caller triggers the rerun so additional UI state (e.g. tabs) can be updated first.
 
 
 with tab_scorecard:
@@ -4741,6 +4754,9 @@ with tab_scorecard:
                                 lid,
                                 cid,
                             )
+                            st.session_state.mode = "practice"  # ensure mode stays in sync with Practice view
+                            st.session_state.active_tab = "Practice"  # immediately flip to the Practice tab
+                            st.experimental_rerun()  # force rerun so the tab change is reflected right away
                         st.markdown("</div>", unsafe_allow_html=True)
                     st.markdown("</div>", unsafe_allow_html=True)
 
