@@ -2805,6 +2805,13 @@ if "auth" not in st.session_state:
             reg_email = st.text_input("Email address")
             submit_registration = st.form_submit_button("Submit", type="primary")
 
+        st.markdown(
+            """
+            <a href="https://paypal.me/AppLabPay" target="_blank" style="display: inline-block; background-color: #0070ba; padding: 10px 20px; color: white; border-radius: 8px; font-weight: 600; text-align: center; margin-top: 10px; text-decoration: none;">Pay with PayPal</a>
+            """,
+            unsafe_allow_html=True,
+        )
+
         if submit_registration:
             name_clean = reg_name.strip()
             email_clean = reg_email.strip()
