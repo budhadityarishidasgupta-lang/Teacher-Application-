@@ -15,6 +15,16 @@ from sqlalchemy import create_engine, text
 import streamlit as st
 import builtins
 import hashlib
+import logging
+
+try:
+    from streamlit.web.server.server import Server
+    from streamlit.web.server.request_handler import RequestHandler
+except Exception:  # pragma: no cover - Streamlit internals may change
+    Server = None
+    RequestHandler = None
+
+logger = logging.getLogger(__name__)
 
 # Disable all help renderers (prevents the login_page methods panel)
 try:
@@ -972,6 +982,80 @@ def delete_pending_registration(pending_id: int) -> None:
             ),
             {"pid": int(pending_id)},
         )
+
+
+_custom_routes_registered = False
+
+
+def handle_pending_registrations(request):
+    """HTTP handler for GET /pending-registrations."""
+
+    status_code = 200
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+    try:
+        pending_df = list_pending_registrations()
+        if pending_df.empty:
+            payload = []
+        else:
+            export_df = pending_df[["name", "email", "created_at"]].copy()
+            export_df["created_at"] = export_df["created_at"].apply(
+                lambda value: value.isoformat() if hasattr(value, "isoformat") else (str(value) if value is not None else None)
+            )
+            payload = export_df.to_dict("records")
+    except Exception:
+        logger.exception("Failed to fetch pending registrations for API response")
+        status_code = 500
+        payload = {"error": "Unable to fetch pending registrations."}
+
+    body = json.dumps(payload)
+
+    set_header = getattr(request, "set_header", None)
+    write = getattr(request, "write", None)
+    set_status = getattr(request, "set_status", None)
+
+    if callable(set_header) and callable(write) and callable(set_status):
+        for key, value in headers.items():
+            set_header(key, value)
+        set_status(status_code)
+        write(body)
+        return None
+
+    return status_code, headers, body
+
+
+def register_routes():
+    """Register custom HTTP endpoints with Streamlit's internal server."""
+
+    global _custom_routes_registered
+    if _custom_routes_registered:
+        return
+
+    if Server is None or RequestHandler is None:
+        logger.debug("Streamlit Server or RequestHandler interfaces unavailable; skipping API route registration")
+        return
+
+    get_server = getattr(Server, "get_current", None)
+    if not callable(get_server):
+        logger.debug("Server.get_current is not available; cannot register custom routes")
+        return
+
+    server = get_server()
+    if not server:
+        return
+
+    handler = getattr(server, "_http_request_handler", None)
+    if handler is None:
+        return
+
+    handler.routes.update({
+        "/pending-registrations": ("GET", handle_pending_registrations),
+    })
+    _custom_routes_registered = True
 
 
 def get_classes_for_student(user_id: int, include_archived: bool = True) -> pd.DataFrame:
@@ -2655,6 +2739,8 @@ except Exception as _e:
 # ─────────────────────────────────────────────────────────────────────
 # Login / Session
 # ─────────────────────────────────────────────────────────────────────
+register_routes()
+
 def login_form():
     # Don't reference auth in a way that displays it
     # Just use it internally
