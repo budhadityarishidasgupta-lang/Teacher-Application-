@@ -222,7 +222,7 @@ if _api_param == "pending":
                 """
                 SELECT name, email, created_at
                 FROM pending_registrations
-                WHERE status='pending'
+                WHERE status='to be registered'
                 ORDER BY created_at DESC
                 """
             )
