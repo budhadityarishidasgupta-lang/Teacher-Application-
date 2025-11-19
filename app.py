@@ -211,6 +211,28 @@ def _normalize(url: str) -> str:
 DATABASE_URL = _normalize(_raw)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
+# --- API endpoint for Zapier: /?endpoint=pending ---
+params = st.query_params
+
+if params.get("endpoint") == "pending":
+    query = text("""
+        SELECT name, email, created_at
+        FROM pending_registrations
+        WHERE status = 'to be registered'
+        ORDER BY created_at DESC;
+    """)
+
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+
+    result = [
+        {"name": r[0], "email": r[1], "created_at": str(r[2])}
+        for r in rows
+    ]
+
+    st.write(json.dumps(result))   # return raw JSON
+    st.stop()
+
 # New API route for Zapier: /api/pending
 if hasattr(st, "request") and st.request.path == "/api/pending":
     query = text(
