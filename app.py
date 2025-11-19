@@ -211,6 +211,55 @@ def _normalize(url: str) -> str:
 DATABASE_URL = _normalize(_raw)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
+# New API route for Zapier: /api/pending
+if hasattr(st, "request") and st.request.path == "/api/pending":
+    query = text(
+        """
+            SELECT name, email, created_at
+            FROM pending_registrations
+            WHERE status = 'to be registered'
+            ORDER BY created_at DESC;
+        """
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+
+    result = [
+        {"name": r[0], "email": r[1], "created_at": str(r[2])}
+        for r in rows
+    ]
+
+    st.json(result)
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────
+# Lightweight API endpoint for pending registrations (Zapier hook)
+# ─────────────────────────────────────────────────────────────────────
+_api_param = (_first(qp.get("api")) or "").strip().lower()
+if _api_param == "pending":
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT name, email, created_at
+                FROM pending_registrations
+                WHERE status='to be registered'
+                ORDER BY created_at DESC
+                """
+            )
+        ).mappings().all()
+    pending_rows = [
+        {
+            "name": row["name"],
+            "email": row["email"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+    st.json(pending_rows)
+    st.stop()
+
 # ─────────────────────────────────────────────────────────────────────
 # Schema creation + tiny self-healing patches
 # ─────────────────────────────────────────────────────────────────────
