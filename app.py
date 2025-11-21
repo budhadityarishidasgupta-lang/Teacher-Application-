@@ -1025,6 +1025,13 @@ def get_all_portal_content() -> dict[str, str]:
     return {row["section"]: row["content"] or "" for _, row in df.iterrows()}
 
 
+def strip_paypal_cta(text: str) -> str:
+    """Remove any PayPal calls-to-action from portal copy."""
+
+    lines = [line for line in (text or "").splitlines() if "paypal" not in line.lower()]
+    return "\n".join(lines)
+
+
 def add_pending_registration(name: str, email: str, default_password: str) -> None:
     email_lc = email.strip().lower()
     with engine.begin() as conn:
@@ -2950,7 +2957,7 @@ if "auth" not in st.session_state:
     header_main_text = header_main_text or ""
     header_draft_text = header_draft_text or ""
     instructions_text = instructions_text or ""
-    new_registration_text = new_registration_text or ""
+    new_registration_text = strip_paypal_cta(new_registration_text or "")
 
     if header_main_text.strip():
         st.markdown(
