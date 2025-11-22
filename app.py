@@ -15,6 +15,16 @@ from sqlalchemy import create_engine, text
 import streamlit as st
 import builtins
 import hashlib
+import logging
+
+try:
+    from streamlit.web.server.server import Server
+    from streamlit.web.server.request_handler import RequestHandler
+except Exception:  # pragma: no cover - Streamlit internals may change
+    Server = None
+    RequestHandler = None
+
+logger = logging.getLogger(__name__)
 
 # Disable all help renderers (prevents the login_page methods panel)
 try:
@@ -200,6 +210,104 @@ def _normalize(url: str) -> str:
 
 DATABASE_URL = _normalize(_raw)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5)
+
+# --- API endpoint for Zapier: /?endpoint=pending ---
+params = st.query_params
+
+if params.get("endpoint") == "pending":
+    query = text("""
+        SELECT name, email, created_at
+        FROM pending_registrations
+        WHERE status = 'to be registered'
+        ORDER BY created_at DESC;
+    """)
+
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+
+    result = [
+        {"name": r[0], "email": r[1], "created_at": str(r[2])}
+        for r in rows
+    ]
+
+    st.write(json.dumps(result))   # return raw JSON
+    st.stop()
+
+# New API route for Zapier: /api/pending
+if hasattr(st, "request") and st.request.path == "/api/pending":
+    query = text(
+        """
+            SELECT name, email, created_at
+            FROM pending_registrations
+            WHERE status = 'to be registered'
+            ORDER BY created_at DESC;
+        """
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+
+    result = [
+        {"name": r[0], "email": r[1], "created_at": str(r[2])}
+        for r in rows
+    ]
+
+    st.json(result)
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────
+# Lightweight API endpoint for pending registrations (Zapier hook)
+# ─────────────────────────────────────────────────────────────────────
+_api_param = (_first(qp.get("api")) or "").strip().lower()
+if _api_param == "pending":
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT name, email, created_at
+                FROM pending_registrations
+                WHERE status='to be registered'
+                ORDER BY created_at DESC
+                """
+            )
+        ).mappings().all()
+    pending_rows = [
+        {
+            "name": row["name"],
+            "email": row["email"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+    st.json(pending_rows)
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────
+# Lightweight API endpoint for pending registrations (Zapier hook)
+# ─────────────────────────────────────────────────────────────────────
+_api_param = (_first(qp.get("api")) or "").strip().lower()
+if _api_param == "pending":
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT name, email, created_at
+                FROM pending_registrations
+                WHERE status='to be registered'
+                ORDER BY created_at DESC
+                """
+            )
+        ).mappings().all()
+    pending_rows = [
+        {
+            "name": row["name"],
+            "email": row["email"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        for row in rows
+    ]
+    st.json(pending_rows)
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────────────
 # Schema creation + tiny self-healing patches
@@ -917,6 +1025,13 @@ def get_all_portal_content() -> dict[str, str]:
     return {row["section"]: row["content"] or "" for _, row in df.iterrows()}
 
 
+def strip_paypal_cta(text: str) -> str:
+    """Remove any PayPal calls-to-action from portal copy."""
+
+    lines = [line for line in (text or "").splitlines() if "paypal" not in line.lower()]
+    return "\n".join(lines)
+
+
 def add_pending_registration(name: str, email: str, default_password: str) -> None:
     email_lc = email.strip().lower()
     with engine.begin() as conn:
@@ -972,6 +1087,80 @@ def delete_pending_registration(pending_id: int) -> None:
             ),
             {"pid": int(pending_id)},
         )
+
+
+_custom_routes_registered = False
+
+
+def handle_pending_registrations(request):
+    """HTTP handler for GET /pending-registrations."""
+
+    status_code = 200
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+    try:
+        pending_df = list_pending_registrations()
+        if pending_df.empty:
+            payload = []
+        else:
+            export_df = pending_df[["name", "email", "created_at"]].copy()
+            export_df["created_at"] = export_df["created_at"].apply(
+                lambda value: value.isoformat() if hasattr(value, "isoformat") else (str(value) if value is not None else None)
+            )
+            payload = export_df.to_dict("records")
+    except Exception:
+        logger.exception("Failed to fetch pending registrations for API response")
+        status_code = 500
+        payload = {"error": "Unable to fetch pending registrations."}
+
+    body = json.dumps(payload)
+
+    set_header = getattr(request, "set_header", None)
+    write = getattr(request, "write", None)
+    set_status = getattr(request, "set_status", None)
+
+    if callable(set_header) and callable(write) and callable(set_status):
+        for key, value in headers.items():
+            set_header(key, value)
+        set_status(status_code)
+        write(body)
+        return None
+
+    return status_code, headers, body
+
+
+def register_routes():
+    """Register custom HTTP endpoints with Streamlit's internal server."""
+
+    global _custom_routes_registered
+    if _custom_routes_registered:
+        return
+
+    if Server is None or RequestHandler is None:
+        logger.debug("Streamlit Server or RequestHandler interfaces unavailable; skipping API route registration")
+        return
+
+    get_server = getattr(Server, "get_current", None)
+    if not callable(get_server):
+        logger.debug("Server.get_current is not available; cannot register custom routes")
+        return
+
+    server = get_server()
+    if not server:
+        return
+
+    handler = getattr(server, "_http_request_handler", None)
+    if handler is None:
+        return
+
+    handler.routes.update({
+        "/pending-registrations": ("GET", handle_pending_registrations),
+    })
+    _custom_routes_registered = True
 
 
 def get_classes_for_student(user_id: int, include_archived: bool = True) -> pd.DataFrame:
@@ -1563,11 +1752,23 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
     xp_for_word = 0
     new_badges: list[dict] = []
 
+    # Guarantee the mastery column exists for both existing and future tenants.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """ALTER TABLE word_stats
+                           ADD COLUMN IF NOT EXISTS mastery_score DOUBLE PRECISION DEFAULT 0.5"""
+                )
+            )
+    except Exception:
+        pass
+
     with engine.begin() as conn:
         row = conn.execute(
             text(
                 """
-                SELECT correct_streak, streak_count, mastered, xp_points
+                SELECT correct_streak, streak_count, mastered, xp_points, mastery_score
                 FROM word_stats
                 WHERE user_id=:u AND headword=:h
                 """
@@ -1577,10 +1778,18 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
 
         prior_streak = int((row or {}).get("streak_count") or (row or {}).get("correct_streak") or 0)
         prior_mastered = bool((row or {}).get("mastered"))
+        prior_mastery = float((row or {}).get("mastery_score") or 0.5)
 
         new_streak = prior_streak + 1 if is_correct else 0
-        became_mastered = is_correct and new_streak >= 3 and not prior_mastered
-        mastered_flag = prior_mastered or (is_correct and new_streak >= 3)
+
+        # Hidden mastery engine: exponential moving average with strong memory.
+        alpha = 0.8
+        observation = 1.0 if is_correct else 0.0
+        new_mastery = (alpha * observation) + ((1 - alpha) * prior_mastery)
+        new_mastery = max(0.0, min(1.0, new_mastery))
+
+        became_mastered = (new_mastery >= 0.85) and not prior_mastered
+        mastered_flag = prior_mastered or (new_mastery >= 0.85)
 
         attempt_xp = 10 if is_correct else 0
         mastery_bonus = 50 if became_mastered else 0
@@ -1593,8 +1802,8 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
         conn.execute(
             text(
                 """
-                INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, xp_points, streak_count, last_seen, mastered, difficulty, due_date)
-                VALUES (:u, :h, :cs, 1, :ca, :xp, :sc, CURRENT_TIMESTAMP, :m, :d, :due)
+                INSERT INTO word_stats (user_id, headword, correct_streak, total_attempts, correct_attempts, xp_points, streak_count, last_seen, mastered, difficulty, due_date, mastery_score)
+                VALUES (:u, :h, :cs, 1, :ca, :xp, :sc, CURRENT_TIMESTAMP, :m, :d, :due, :ms)
                 ON CONFLICT (user_id, headword) DO UPDATE SET
                     correct_streak   = EXCLUDED.correct_streak,
                     total_attempts   = word_stats.total_attempts + 1,
@@ -1604,7 +1813,8 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
                     last_seen        = CURRENT_TIMESTAMP,
                     mastered         = CASE WHEN :m THEN TRUE ELSE word_stats.mastered END,
                     difficulty       = :d,
-                    due_date         = :due
+                    due_date         = :due,
+                    mastery_score    = :ms
                 """
             ),
             {
@@ -1617,6 +1827,7 @@ def update_after_attempt(user_id, course_id, lesson_id, headword, is_correct, re
                 "m": mastered_flag,
                 "d": int(difficulty),
                 "due": due,
+                "ms": new_mastery,
             },
         )
 
@@ -1666,6 +1877,20 @@ def recent_stats(user_id, course_id, lesson_id, n=10):
 
 def choose_next_word(user_id, course_id, lesson_id, df_words):
     """Adaptive next word (simple rule: recent accuracy & speed)."""
+
+    # Maintain schema lazily so existing deployments keep working without manual migrations.
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """ALTER TABLE word_stats
+                           ADD COLUMN IF NOT EXISTS mastery_score DOUBLE PRECISION DEFAULT 0.5"""
+                )
+            )
+    except Exception:
+        # If the column already exists or the ALTER fails, continue with the existing schema.
+        pass
+
     stats = recent_stats(user_id, course_id, lesson_id, n=10)
     acc, avg = stats["accuracy"], stats["avg_ms"]
     if acc >= 0.75 and avg <= 8000:
@@ -1674,9 +1899,72 @@ def choose_next_word(user_id, course_id, lesson_id, df_words):
         tgt = 1
     else:
         tgt = 2
-    candidates = df_words[df_words["difficulty"] == tgt]["headword"].tolist() or df_words["headword"].tolist()
+
+    # Build the base candidate list using the adaptive difficulty target.
+    candidates = (
+        df_words[df_words["difficulty"] == tgt]["headword"].tolist()
+        or df_words["headword"].tolist()
+    )
+
+    # Session-derived filters: avoid repeating words that have already been
+    # answered correctly in this lesson or that are waiting in the delayed
+    # review queue.
+    lesson_key = int(lesson_id)
+    completed_words = set(
+        st.session_state.get("lesson_correct_words", {}).get(lesson_key, set())
+    )
+    review_pending = set(st.session_state.get("review_queue", []) or [])
+
+    # Pull mastery scores in bulk and keep high-mastery headwords for later.
+    mastery_map: dict[str, float] = {}
+    try:
+        mastery_df = pd.read_sql(
+            text(
+                """
+                SELECT headword, mastery_score
+                FROM word_stats
+                WHERE user_id = :u
+                """
+            ),
+            con=engine,
+            params={"u": int(user_id)},
+        )
+        mastery_map = {
+            str(row.headword): float(row.mastery_score)
+            for row in mastery_df.itertuples()
+            if row.mastery_score is not None
+        }
+    except Exception:
+        mastery_map = {}
+
+    high_mastery_words = {
+        hw for hw, score in mastery_map.items() if score >= 0.85
+    }
+
+    # Filter the candidate pool while preserving fallbacks in case we filter everything out.
+    filtered = [
+        w
+        for w in candidates
+        if w not in completed_words and w not in review_pending
+    ]
+    if not filtered:
+        filtered = [w for w in candidates if w not in completed_words]
+    if not filtered:
+        filtered = [w for w in df_words["headword"].tolist() if w not in completed_words]
+
+    # Only drop high-mastery words if other choices remain.
+    non_mastered = [w for w in filtered if w not in high_mastery_words]
+    if non_mastered:
+        filtered = non_mastered
+
     hist = st.session_state.get("asked_history", [])
-    pool = [w for w in candidates if w not in hist[-3:]] or candidates
+    pool = [w for w in filtered if w not in hist[-3:]] or filtered
+
+    if not pool:
+        fallback = df_words["headword"].tolist()
+        if fallback:
+            pool = fallback
+
     return random.choice(pool)
 
 def build_question_payload(
@@ -1699,6 +1987,15 @@ def build_question_payload(
 
     seen_lower = {c.lower() for c in correct}
 
+    current_lesson = st.session_state.get("active_lid")
+    if (
+        "used_distractors" not in st.session_state
+        or st.session_state.get("_used_distractors_lesson") != current_lesson
+    ):
+        st.session_state["used_distractors"] = set()
+        st.session_state["_used_distractors_lesson"] = current_lesson
+
+    used_distractors = st.session_state["used_distractors"]
     distractors: list[str] = []
     if lesson_df is not None and not lesson_df.empty:
         candidates: list[str] = []
@@ -1719,10 +2016,11 @@ def build_question_payload(
         random.shuffle(candidates)
         for cand in candidates:
             cand_l = cand.lower()
-            if cand_l in seen_lower:
+            if cand_l in seen_lower or cand_l in used_distractors:
                 continue
             distractors.append(cand)
             seen_lower.add(cand_l)
+            used_distractors.add(cand_l)
             if len(distractors) >= 4:
                 break
 
@@ -1752,15 +2050,33 @@ def build_question_payload(
         random.shuffle(fallback_pool)
         for cand in fallback_pool:
             cand_l = cand.lower()
-            if cand_l in seen_lower:
+            if cand_l in seen_lower or cand_l in used_distractors:
                 continue
             distractors.append(cand)
             seen_lower.add(cand_l)
+            used_distractors.add(cand_l)
             if len(distractors) >= 4:
                 break
 
     choices = correct + distractors[:4]
     random.shuffle(choices)
+
+    # Ensure each question always displays at least five total options by
+    # backfilling from remaining lesson headwords when the distractor pool runs out.
+    if len(choices) < 5:
+        fallback_pool: list[str] = []
+        if lesson_df is not None and not lesson_df.empty and "headword" in lesson_df.columns:
+            fallback_pool = list(
+                set(lesson_df["headword"].astype(str))
+                - {str(headword)}
+                - set(choices)
+            )
+        while len(choices) < 5 and fallback_pool:
+            new_opt = random.choice(fallback_pool)
+            fallback_pool.remove(new_opt)
+            choices.append(new_opt)
+        random.shuffle(choices)
+
     return {"headword": headword, "choices": choices, "correct": set(correct)}
 
 #def gpt_feedback_examples(headword: str, correct_word: str):
@@ -2528,6 +2844,8 @@ except Exception as _e:
 # ─────────────────────────────────────────────────────────────────────
 # Login / Session
 # ─────────────────────────────────────────────────────────────────────
+register_routes()
+
 def login_form():
     # Don't reference auth in a way that displays it
     # Just use it internally
@@ -2639,7 +2957,7 @@ if "auth" not in st.session_state:
     header_main_text = header_main_text or ""
     header_draft_text = header_draft_text or ""
     instructions_text = instructions_text or ""
-    new_registration_text = new_registration_text or ""
+    new_registration_text = strip_paypal_cta(new_registration_text or "")
 
     if header_main_text.strip():
         st.markdown(
@@ -2708,9 +3026,18 @@ NAME   = st.session_state.auth["name"]
 st.sidebar.caption(f"Signed in as **{NAME}** ({ROLE})")
 
 _defaults = {
-    "answered": False, "eval": None, "active_word": None, "active_lid": None,
-    "q_started_at": 0.0, "selection": set(), "asked_history": [],
-    "gamification": {}, "badges_recent": [], "badge_details_recent": [], "last_xp_gain": 0,
+    "answered": False,
+    "eval": None,
+    "active_word": None,
+    "active_lid": None,
+    "force_refresh": False,
+    "q_started_at": 0.0,
+    "selection": set(),
+    "asked_history": [],
+    "gamification": {},
+    "badges_recent": [],
+    "badge_details_recent": [],
+    "last_xp_gain": 0,
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -3674,6 +4001,7 @@ def _go_back_to_prev_word(lid: int, words_df: pd.DataFrame):
 
     prev = hist.pop()  # take the last served word
     st.session_state.active_word = prev
+    st.session_state.force_refresh = False  # respect manual back navigation selection
     st.session_state.q_started_at = time.time()
 
     row_prev = words_df[words_df["headword"] == prev]
@@ -3756,6 +4084,12 @@ if st.session_state["auth"]["role"] == "student":
     basis = mastered_q if mastered_q > 0 else attempted_q
     pct = int(round(100 * (basis if total_q else 0) / (total_q or 1)))
 
+    override_pct_map = st.session_state.get("lesson_progress_pct", {})
+    if override_pct_map:
+        override_pct = override_pct_map.get(int(lid))
+        if override_pct is not None:
+            pct = int(override_pct)
+
     if st.session_state.q_index_per_lesson.get(int(lid)) is None:
         baseline = max(1, min(int(total_q or 1), int(attempted_q or 0) + 1))
         st.session_state.q_index_per_lesson[int(lid)] = baseline
@@ -3773,11 +4107,16 @@ if st.session_state["auth"]["role"] == "student":
     if "asked_history" not in st.session_state:
         st.session_state.asked_history = []
 
-    # Active question state
-    new_word_needed = ("active_word" not in st.session_state) or (st.session_state.get("active_lid") != lid)
-    if new_word_needed:
+    # Track lesson changes so the next render can safely refresh the prompt.
+    if st.session_state.get("active_lid") != lid:
+        st.session_state.active_lid = lid
+        st.session_state.force_refresh = True  # force regeneration when switching lessons
+
+    # Only choose a new word if none has been manually set via state overrides or an explicit refresh is requested.
+    if ("active_word" not in st.session_state) or st.session_state.get("force_refresh", False):
         st.session_state.active_lid = lid
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.force_refresh = False  # reset so manual selections persist across reruns
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
         st.session_state.qdata = build_question_payload(
@@ -3807,6 +4146,7 @@ if st.session_state["auth"]["role"] == "student":
     filtered = words_df[words_df["headword"] == active]
     if filtered.empty:
         st.session_state.active_word = choose_next_word(USER_ID, cid, lid, words_df)
+        st.session_state.force_refresh = False  # ensure fallback behaves like a normal auto-selection
         st.session_state.q_started_at = time.time()
         row_init = words_df[words_df["headword"] == st.session_state.active_word].iloc[0]
         st.session_state.qdata = build_question_payload(
@@ -3857,7 +4197,20 @@ if st.session_state["auth"]["role"] == "student":
     st.session_state.badges_recent = []
 
 # Tabs for Practice vs Review (header stays ABOVE)
-    tab_practice, tab_scorecard = st.tabs(["Practice", "Scorecard"])
+    # Track which tab should be visible so reruns land on the expected view
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = "Practice"  # default new or returning users to Practice
+
+    # Keep the stored tab name aligned with the current mode selection
+    if st.session_state.get("mode") == "scorecard":
+        st.session_state.active_tab = "Scorecard"
+    elif st.session_state.get("mode") == "practice":
+        st.session_state.active_tab = "Practice"
+
+    tab_labels = ["Practice", "Scorecard"]
+    tab_index = 0 if st.session_state.active_tab == "Practice" else 1  # future-proof explicit index
+    tabs = st.tabs(tab_labels)
+    tab_practice, tab_scorecard = tabs
 
 # ─────────────────────────────────────────────────────────────────────
 # PRACTICE TAB — quiz form + after-submit feedback + Next
@@ -3934,6 +4287,21 @@ if st.session_state["auth"]["role"] == "student":
             picked_set = set(list(st.session_state.selection))
             is_correct = (picked_set == correct_set)
 
+            from collections import deque
+
+            lesson_key = int(lid)
+            total_words_in_lesson = int(len(words_df))
+
+            # Ensure per-lesson structures exist before we mutate them.
+            if "lesson_correct_words" not in st.session_state:
+                st.session_state.lesson_correct_words = {}
+            if "lesson_progress_pct" not in st.session_state:
+                st.session_state.lesson_progress_pct = {}
+            if "normal_question_counter" not in st.session_state:
+                st.session_state.normal_question_counter = 0
+            if "review_queue" not in st.session_state or st.session_state.review_queue is None:
+                st.session_state.review_queue = deque()
+
             correct_choice_for_log = list(correct_set)[0]
             result = update_after_attempt(
                 USER_ID,
@@ -3964,7 +4332,6 @@ if st.session_state["auth"]["role"] == "student":
                 "choices": list(choices)
             }
 
-            lesson_key = int(lid)
             lesson_scorecard = list(st.session_state.scorecards.get(lesson_key, []))
             question_numbers = st.session_state.scorecard_question_numbers.setdefault(lesson_key, {})
             question_number = question_numbers.get(active)
@@ -3985,13 +4352,37 @@ if st.session_state["auth"]["role"] == "student":
             )
             st.session_state.scorecards[lesson_key] = lesson_scorecard
 
-            # If wrong, push this headword to the front of the review queue
-            if not is_correct:
-                from collections import deque
-                if "review_queue" not in st.session_state or st.session_state.review_queue is None:
-                    st.session_state.review_queue = deque()
-                if st.session_state.active_word not in st.session_state.review_queue:
-                    st.session_state.review_queue.appendleft(st.session_state.active_word)
+            review_queue = st.session_state.review_queue
+            correct_words = st.session_state.lesson_correct_words.setdefault(lesson_key, set())
+
+            if is_correct:
+                # Remove from the delayed review queue and treat as permanently completed.
+                try:
+                    review_queue.remove(active)
+                except ValueError:
+                    pass
+                if active not in correct_words:
+                    correct_words.add(active)
+                # Advance the visible counters only when we gain a new correct headword.
+                correct_count = len(correct_words)
+                st.session_state.lesson_correct_words[lesson_key] = correct_words
+                denom = max(1, total_words_in_lesson)
+                if correct_count >= denom:
+                    next_index = denom
+                else:
+                    next_index = min(denom, correct_count + 1)
+                st.session_state.q_index_per_lesson[lesson_key] = max(1, next_index)
+                progress_pct = int(round((correct_count / denom) * 100))
+                st.session_state.lesson_progress_pct[lesson_key] = progress_pct
+            else:
+                # Place the word in the tail of the queue for a spaced retry.
+                if active not in review_queue:
+                    review_queue.append(active)
+                    while len(review_queue) > 5:
+                        review_queue.popleft()
+                # Keep the visible question index anchored.
+                current_index = st.session_state.q_index_per_lesson.get(lesson_key, 1)
+                st.session_state.q_index_per_lesson[lesson_key] = max(1, current_index)
 
             st.rerun()
 
@@ -4112,23 +4503,47 @@ if st.session_state.get("answered") and st.session_state.get("eval"):
             except Exception:
                 from collections import deque
                 st.session_state.review_queue = deque()
+            if "lesson_correct_words" in st.session_state:
+                st.session_state.lesson_correct_words.pop(int(lid), None)
+            if "lesson_progress_pct" in st.session_state:
+                st.session_state.lesson_progress_pct.pop(int(lid), None)
+            st.session_state.normal_question_counter = 0
             st.session_state.q_index_per_lesson[int(lid)] = 1
             available_words = set(words_df["headword"].tolist())
             next_word = first_word if first_word in available_words else choose_next_word(USER_ID, cid, lid, words_df)
         else:
             st.session_state.asked_history.append(st.session_state.active_word)
 
-            # Serve from review queue first
-            if st.session_state.review_queue:
-                next_word = st.session_state.review_queue.popleft()
+            lesson_key = int(lid)
+            review_queue = st.session_state.review_queue
+            correct_words = st.session_state.get("lesson_correct_words", {}).get(lesson_key, set())
+            remaining_words = [
+                w for w in words_df["headword"].tolist()
+                if w not in correct_words
+            ]
+
+            normal_counter = int(st.session_state.get("normal_question_counter", 0))
+            next_word = None
+            if review_queue and (normal_counter >= 10 or not remaining_words):
+                review_choices = list(review_queue)
+                chosen_review = random.choice(review_choices)
+                try:
+                    review_queue.remove(chosen_review)
+                except ValueError:
+                    pass
+                next_word = chosen_review
+                st.session_state.normal_question_counter = 0
             else:
                 next_word = choose_next_word(USER_ID, cid, lid, words_df)
+                st.session_state.normal_question_counter = normal_counter + 1
 
-            st.session_state.q_index_per_lesson[int(lid)] = \
-                st.session_state.q_index_per_lesson.get(int(lid), 1) + 1
+            # Keep the visible index stable unless a new correct word advances it.
+            current_index = st.session_state.q_index_per_lesson.get(lesson_key, 1)
+            st.session_state.q_index_per_lesson[lesson_key] = max(1, current_index)
 
         # Load next word
         st.session_state.active_word = next_word
+        st.session_state.force_refresh = False  # next question is intentionally chosen, so preserve it on rerun
         st.session_state.q_started_at = time.time()
         next_row = words_df[words_df["headword"] == next_word].iloc[0]
         st.session_state.qdata = build_question_payload(
@@ -4217,63 +4632,379 @@ def reset_lesson_state_for_restart(lesson_id: int):
     st.session_state.pop("grid_for_word", None)
     st.session_state.pop("active_word", None)
     st.session_state.active_lid = None
+    st.session_state.force_refresh = True  # next visit should regenerate the starting question
 
 
 # ─────────────────────────────────────────────────────────────────────
-# SCORECARD TAB — running log of answered questions
+# SCORECARD TAB — Dynamic lesson navigator & actions
 # ─────────────────────────────────────────────────────────────────────
-with tab_scorecard:
-    col_table, col_actions = st.columns([0.7, 0.3])
 
-    with col_table:
-        lesson_entries = st.session_state.scorecards.get(int(lid), [])
+def fetch_lesson_navigator_rows(user_id: int, course_id: int, lesson_id: int) -> pd.DataFrame:
+    """Return every headword in the lesson with the learner's latest attempt status."""
 
-        if not lesson_entries:
-            st.info("No answers recorded yet. Complete questions to build your scorecard.")
-        else:
-            df = pd.DataFrame(lesson_entries)
-            if "sequence" in df.columns:
-                df = df.sort_values("sequence")
-            elif "question_number" in df.columns:
-                df = df.sort_values("question_number")
-
-            if "answer_selected" not in df.columns and "correct" in df.columns:
-                df["answer_selected"] = df["correct"]
-
-            if "result" not in df.columns:
-                df["result"] = ["Correct"] * len(df)
-
-            rename_map = {
-                "question_number": "Question #",
-                "word": "Question Word",
-                "answer_selected": "Answer Selected",
-                "result": "Result",
-            }
-            df = df.rename(columns=rename_map)
-
-            if "Question #" not in df.columns:
-                df.insert(0, "Question #", range(1, len(df) + 1))
-
-            drop_cols = [col for col in ["sequence", "correct_answer", "correct"] if col in df.columns]
-            if drop_cols:
-                df = df.drop(columns=drop_cols)
-
-            display_cols = [
-                col for col in ["Question #", "Question Word", "Answer Selected", "Result"] if col in df.columns
-            ]
-            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-
-    with col_actions:
-        st.markdown("### Lesson actions")
-        st.markdown(
-            "<p style='font-size:0.9rem;'>Restart to begin this lesson again from question 1."
-            " Your previous answers will be archived.</p>",
-            unsafe_allow_html=True,
+    sql = text(
+        """
+        WITH ordered_words AS (
+            SELECT
+                ROW_NUMBER() OVER (ORDER BY lw.sort_order, w.headword) AS question_number,
+                w.headword
+            FROM lesson_words lw
+            JOIN lessons l ON l.lesson_id = lw.lesson_id
+            JOIN words w    ON w.word_id = lw.word_id
+            WHERE lw.lesson_id = :lid
+              AND l.course_id = :cid
+        ),
+        latest_attempt AS (
+            SELECT DISTINCT ON (a.headword)
+                a.headword,
+                a.is_correct,
+                a.ts
+            FROM attempts a
+            WHERE a.user_id   = :uid
+              AND a.course_id = :cid
+              AND a.lesson_id = :lid
+              AND a.archived_at IS NULL
+            ORDER BY a.headword, a.ts DESC
+        ),
+        attempt_stats AS (
+            SELECT
+                a.headword,
+                COUNT(*) FILTER (WHERE a.archived_at IS NULL) AS attempt_count,
+                MAX(a.ts) FILTER (WHERE a.archived_at IS NULL) AS last_attempt_ts
+            FROM attempts a
+            WHERE a.user_id   = :uid
+              AND a.course_id = :cid
+              AND a.lesson_id = :lid
+            GROUP BY a.headword
         )
+        SELECT
+            ow.question_number,
+            ow.headword,
+            la.is_correct,
+            COALESCE(ast.attempt_count, 0) AS attempt_count,
+            ast.last_attempt_ts
+        FROM ordered_words ow
+        LEFT JOIN latest_attempt la ON la.headword = ow.headword
+        LEFT JOIN attempt_stats ast ON ast.headword = ow.headword
+        ORDER BY ow.question_number
+        """
+    )
 
-        if st.button("Restart Lesson", key="btn_restart_lesson", type="primary"):
-            archive_lesson_attempts(USER_ID, cid, lid)
-            reset_lesson_state_for_restart(lid)
+    try:
+        df = pd.read_sql(
+            sql,
+            con=engine,
+            params={"uid": int(user_id), "cid": int(course_id), "lid": int(lesson_id)},
+        )
+    except Exception:
+        df = pd.DataFrame(columns=["question_number", "headword", "is_correct"])
+
+    if df.empty:
+        return df.assign(status="unanswered")
+
+    def _status(row) -> str:
+        if pd.isna(row["is_correct"]):
+            return "unanswered"
+        return "correct" if bool(row["is_correct"]) else "incorrect"
+
+    df["status"] = df.apply(_status, axis=1)
+    if "attempt_count" in df.columns:
+        df["attempt_count"] = df["attempt_count"].fillna(0).astype(int)
+    return df
+
+
+def jump_to_lesson_question(
+    headword: str,
+    question_number: int,
+    lesson_df: pd.DataFrame,
+    lesson_id: int,
+    course_id: int,
+) -> None:
+    """Load the selected headword into the Practice tab and rerun the app."""
+
+    if not headword:
+        return
+
+    target = lesson_df[lesson_df["headword"] == headword]
+    if target.empty:
+        # Refresh the cache in case the lesson changed mid-session
+        refreshed = lesson_words(int(course_id), int(lesson_id))
+        target = refreshed[refreshed["headword"] == headword]
+        if target.empty:
+            st.warning("That question is no longer part of this lesson.")
+            return
+        lesson_df = refreshed
+
+    target_row = target.iloc[0]
+
+    # Clear any lingering checkbox state from the previous word
+    for key in list(st.session_state.get("grid_keys", [])):
+        st.session_state.pop(key, None)
+
+    st.session_state.active_word = headword
+    st.session_state.force_refresh = False  # Preserve the targeted selection supplied by the scorecard
+    st.session_state.active_lid = int(lesson_id)
+    st.session_state.q_started_at = time.time()
+    st.session_state.qdata = build_question_payload(
+        headword,
+        target_row["synonyms"],
+        lesson_df=lesson_df,
+    )
+    st.session_state.grid_for_word = headword
+    st.session_state.grid_keys = [
+        f"opt_{headword}_{i}"
+        for i in range(len(st.session_state.qdata["choices"]))
+    ]
+    st.session_state.selection = set()
+    st.session_state.answered = False
+    st.session_state.eval = None
+    st.session_state.q_index_per_lesson[int(lesson_id)] = max(1, int(question_number))
+    st.session_state.current_question_index = int(question_number)
+    st.session_state.mode = "practice"
+    st.session_state.active_tab = "Practice"  # keep tab selection aligned with active mode
+
+    # The caller triggers the rerun so additional UI state (e.g. tabs) can be updated first.
+
+
+with tab_scorecard:
+    st.markdown(
+        '''
+        <style>
+        .lesson-nav-filter .stRadio>div {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .lesson-nav-filter label {
+            font-size: 0.82rem !important;
+        }
+        .lesson-nav-filter [role="radio"] {
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            color: #cbd5f5;
+            padding: 0.35rem 0.85rem;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+        }
+        .lesson-nav-filter [role="radio"][aria-checked="true"] {
+            border-color: rgba(59, 130, 246, 0.85);
+            background: rgba(37, 99, 235, 0.35);
+            color: #f8fafc;
+        }
+        .scorecard-table-container {
+            margin-top: 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 12px;
+            background: rgba(15, 23, 42, 0.7);
+            overflow: hidden;
+        }
+        .scorecard-table-wrapper {
+            overflow-x: auto;
+        }
+        .scorecard-table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 340px;
+        }
+        .scorecard-table thead th {
+            text-align: left;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.72rem;
+            color: rgba(203, 213, 225, 0.9);
+            padding: 0.45rem 0.75rem;
+            background: rgba(15, 23, 42, 0.9);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+        }
+        .scorecard-table tbody td {
+            padding: 0.38rem 0.75rem;
+            font-size: 0.85rem;
+            color: #e2e8f0;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+        }
+        .scorecard-table tbody tr:nth-child(odd) {
+            background: rgba(15, 23, 42, 0.6);
+        }
+        .scorecard-table tbody tr:last-child td {
+            border-bottom: none;
+        }
+        .scorecard-table tbody td.num-cell {
+            width: 3rem;
+            text-align: center;
+            color: rgba(226, 232, 240, 0.85);
+        }
+        .scorecard-table tbody td.word-cell {
+            font-weight: 600;
+        }
+        .scorecard-table tbody td.attempts-cell {
+            text-align: center;
+        }
+        .scorecard-table tbody td.time-cell {
+            white-space: nowrap;
+            font-size: 0.78rem;
+            color: rgba(148, 163, 184, 0.95);
+        }
+        .scorecard-status-dot {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+        .scorecard-status-dot.correct {
+            color: #4ade80;
+        }
+        .scorecard-status-dot.incorrect {
+            color: #f87171;
+        }
+        .scorecard-status-dot.unanswered {
+            color: #cbd5f5;
+        }
+        @media (max-width: 768px) {
+            .scorecard-table thead th,
+            .scorecard-table tbody td {
+                padding: 0.35rem 0.6rem;
+            }
+            .scorecard-table tbody td {
+                font-size: 0.8rem;
+            }
+            .scorecard-table tbody td.time-cell {
+                font-size: 0.72rem;
+            }
+        }
+        </style>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+    navigator_df = fetch_lesson_navigator_rows(USER_ID, cid, lid)
+
+    if navigator_df.empty:
+        st.info("This lesson has no questions yet. Once words are assigned, they will appear here.")
+    else:
+        options = ["All", "Correct", "Incorrect", "Unanswered"]
+        default_choice = st.session_state.get(f"lesson_nav_filter_{lid}", "All")
+        with st.container():
+            st.markdown("<div class='lesson-nav-filter'>", unsafe_allow_html=True)
+            filter_choice = st.radio(
+                "Show questions",
+                options,
+                horizontal=True,
+                index=options.index(default_choice) if default_choice in options else 0,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+        st.session_state[f"lesson_nav_filter_{lid}"] = filter_choice
+
+        status_map = {
+            "All": None,
+            "Correct": "correct",
+            "Incorrect": "incorrect",
+            "Unanswered": "unanswered",
+        }
+
+        if status_map[filter_choice]:
+            display_df = navigator_df[navigator_df["status"] == status_map[filter_choice]]
+        else:
+            display_df = navigator_df
+
+
+
+        if display_df.empty:
+            st.info("No questions match this filter yet. Keep practicing to unlock more data!")
+        else:
+            table_df = display_df.copy()  # Work on a copy so we keep the original join results intact.
+
+            if "attempt_count" in table_df.columns:
+                table_df["attempt_count"] = table_df["attempt_count"].fillna(0).astype(int)
+            else:
+                table_df["attempt_count"] = 0
+
+            if "last_attempt_ts" in table_df.columns:
+                last_attempt_series = pd.to_datetime(table_df["last_attempt_ts"], errors="coerce")
+                table_df["last_attempt_display"] = last_attempt_series.dt.strftime("%d %b %Y %H:%M")
+                table_df.loc[last_attempt_series.isna(), "last_attempt_display"] = "—"
+            else:
+                table_df["last_attempt_display"] = "—"
+
+            status_icons = {
+                "correct": "<span class='scorecard-status-dot correct'>✅</span>",
+                "incorrect": "<span class='scorecard-status-dot incorrect'>❌</span>",
+                "unanswered": "<span class='scorecard-status-dot unanswered'>⚪</span>",
+            }
+            table_df["status_icon"] = table_df["status"].map(lambda s: status_icons.get(s, status_icons["unanswered"]))
+
+            rows_html = []  # Collect already-escaped HTML rows for compact rendering.
+            for row in table_df.itertuples():
+                last_attempt_display = getattr(row, "last_attempt_display", "—") or "—"
+                rows_html.append(
+                    "".join(
+                        [
+                            "<tr>",
+                            f"<td class='num-cell'>{int(row.question_number)}</td>",
+                            f"<td class='word-cell'>{html.escape(str(row.headword))}</td>",
+                            f"<td class='status-cell'>{row.status_icon}</td>",
+                            f"<td class='attempts-cell'>{int(getattr(row, 'attempt_count', 0))}</td>",
+                            f"<td class='time-cell'>{html.escape(str(last_attempt_display))}</td>",
+                            "</tr>",
+                        ]
+                    )
+                )
+
+            table_html = (
+                """
+            <div class="scorecard-table-container">
+                <div class="scorecard-table-wrapper">
+                    <table class="scorecard-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Word</th>
+                                <th>Status</th>
+                                <th>Attempts</th>
+                                <th>Last Attempt</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                """
+                + "".join(rows_html)
+                + """
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+                """
+            )
+            st.markdown(table_html, unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### Lesson actions")
+    st.markdown(
+        "<p style='font-size:0.9rem;'>Restart to begin this lesson again from question 1. Your previous answers will be archived.</p>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Restart Lesson", key="btn_restart_lesson", type="primary"):
+        archive_lesson_attempts(USER_ID, cid, lid)
+        reset_lesson_state_for_restart(lid)
+
+        # Clear progress-tracking session state so the lesson restarts from question 1.
+        for key in [
+            "question_index",
+            "correct_count",
+            "active_word",
+            "asked_history",
+            "review_queue",
+            "mastery_progress",
+            "force_refresh",
+        ]:
+            if key in st.session_state:
+                del st.session_state[key]
+
+        # Re-establish default practice view before reloading the lesson interface.
+        st.session_state.mode = "practice"
+        st.session_state.active_tab = "Practice"
+        try:
+            st.experimental_rerun()
+        except AttributeError:
             st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────
